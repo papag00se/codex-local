@@ -48,7 +48,7 @@ pub fn classify_request(
         if !ep.enabled {
             continue;
         }
-        if prompt_tokens <= ep.num_ctx {
+        if prompt_tokens <= ep.trim_budget {
             return RouteTarget::Local((*ep).clone());
         }
     }

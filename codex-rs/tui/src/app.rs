@@ -4303,6 +4303,12 @@ impl App {
             AppEvent::StatsResult(text) => {
                 self.chat_widget.add_info_message(text, None);
             }
+            AppEvent::RouteReadout(readout) => {
+                self.chat_widget.set_route_readout(readout);
+            }
+            AppEvent::RouteNotice(message) => {
+                self.chat_widget.add_route_notice(message);
+            }
             AppEvent::DiffResult(text) => {
                 // Clear the in-progress state in the bottom pane
                 self.chat_widget.on_diff_complete();

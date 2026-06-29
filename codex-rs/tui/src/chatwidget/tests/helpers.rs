@@ -220,6 +220,7 @@ pub(super) async fn make_chatwidget_manual(
         task_complete_pending: false,
         unified_exec_processes: Vec::new(),
         agent_turn_running: false,
+        route_readout_poll: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mcp_startup_status: None,
         mcp_startup_expected_servers: None,
         mcp_startup_ignore_updates_until_next_start: false,

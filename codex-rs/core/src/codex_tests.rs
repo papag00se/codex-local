@@ -2958,6 +2958,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         services,
         js_repl,
         next_internal_sub_id: AtomicU64::new(0),
+        tool_repetition: std::sync::Mutex::new(Default::default()),
+        loop_detector: std::sync::Mutex::new(codex_routing::loop_detector::LoopDetector::new()),
     };
 
     (session, turn_context)
@@ -3800,6 +3802,8 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         services,
         js_repl,
         next_internal_sub_id: AtomicU64::new(0),
+        tool_repetition: std::sync::Mutex::new(Default::default()),
+        loop_detector: std::sync::Mutex::new(codex_routing::loop_detector::LoopDetector::new()),
     });
 
     (session, turn_context, rx_event)
@@ -5668,4 +5672,28 @@ async fn unified_exec_rejects_escalated_permissions_when_policy_not_on_request()
     );
 
     pretty_assertions::assert_eq!(output, expected);
+}
+
+#[test]
+fn dangling_action_detects_announced_but_unfulfilled_intent() {
+    // The exact gpt-5.5 case the user hit, plus other action lead-ins.
+    assert!(ends_with_dangling_action(
+        "The real API uses `hex` instead of `asset_name`. Let me fix the handler:"
+    ));
+    assert!(ends_with_dangling_action("Now I'll run the tests:"));
+    assert!(ends_with_dangling_action("Next, I will update the config:"));
+    assert!(ends_with_dangling_action("Let me check the other file:\n"));
+}
+
+#[test]
+fn dangling_action_ignores_finished_turns() {
+    // No trailing colon → finished.
+    assert!(!ends_with_dangling_action("Done. All tests pass."));
+    // Sign-off uses "let me" but no trailing colon → not a dangling action.
+    assert!(!ends_with_dangling_action(
+        "Let me know if you need anything else."
+    ));
+    // Trailing colon but no action lead-in → a summary/list intro, not an intent.
+    assert!(!ends_with_dangling_action("The fix is complete:"));
+    assert!(!ends_with_dangling_action(""));
 }

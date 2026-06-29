@@ -244,7 +244,10 @@ mod tests {
     #[test]
     fn multi_word_markers_match() {
         assert_eq!(count_rumination_markers("But wait, let me think again."), 2);
-        assert_eq!(count_rumination_markers("on second thought, scratch that"), 2);
+        assert_eq!(
+            count_rumination_markers("on second thought, scratch that"),
+            2
+        );
     }
 
     #[test]

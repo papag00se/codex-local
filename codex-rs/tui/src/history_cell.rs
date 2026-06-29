@@ -1754,6 +1754,14 @@ pub(crate) fn new_warning_event(message: String) -> PrefixedWrappedHistoryCell {
     PrefixedWrappedHistoryCell::new(message.yellow(), "⚠ ".yellow(), "  ")
 }
 
+/// Dim, magenta-prefixed line announcing that a local-model guard ("nudge")
+/// fired — e.g. the repetition/rumination guards, quality gate, or completion
+/// verifier re-prompting the model. Surfaced so the user can see when the
+/// routing layer intervenes instead of it being buried in the logs.
+pub(crate) fn new_local_nudge_notice(message: String) -> PrefixedWrappedHistoryCell {
+    PrefixedWrappedHistoryCell::new(message.magenta().dim(), "⟳ ".magenta(), "  ")
+}
+
 #[derive(Debug)]
 pub(crate) struct DeprecationNoticeCell {
     summary: String,

@@ -46,9 +46,7 @@ pub fn inject_curl_user_agent_str(command: &str) -> String {
     curl_token_regex()
         .replace_all(command, |caps: &regex::Captures<'_>| {
             let prefix = &caps[1];
-            format!(
-                "{prefix}curl --user-agent '{DEFAULT_USER_AGENT}' ",
-            )
+            format!("{prefix}curl --user-agent '{DEFAULT_USER_AGENT}' ",)
         })
         .into_owned()
 }

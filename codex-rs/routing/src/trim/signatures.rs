@@ -154,3 +154,30 @@ pub fn path_from_signature(signature: &str) -> Option<&str> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_signature_stable_for_identical_and_distinct_for_different() {
+        // The loop guard blocks re-execution by comparing consecutive
+        // signatures, so byte-identical exec_command args MUST yield the same
+        // signature, and a changed command MUST yield a different one.
+        let a = signature_for_call("exec_command", r#"{"cmd":"python3 run.py"}"#);
+        let b = signature_for_call("exec_command", r#"{"cmd":"python3 run.py"}"#);
+        let c = signature_for_call("exec_command", r#"{"cmd":"python3 run.py --fix"}"#);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn write_stdin_signature_is_constant() {
+        // write_stdin's signature is intentionally constant — which is exactly
+        // why the dispatcher's loop guard exempts it (repeated stdin writes are
+        // legitimate, not a stuck loop).
+        let a = signature_for_call("write_stdin", r#"{"text":"yes\n"}"#);
+        let b = signature_for_call("write_stdin", r#"{"text":"no\n"}"#);
+        assert_eq!(a, b);
+    }
+}

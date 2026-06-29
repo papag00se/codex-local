@@ -806,6 +806,16 @@ pub(crate) fn session_loop_termination_from_handle(
     .shared()
 }
 
+/// Cross-turn tracker of consecutive byte-identical tool-call signatures.
+/// The soft repetition guard (trim prelude + fabricated tool result) asks a
+/// looping model to stop, but a weak local model can ignore it; this lets the
+/// tool dispatcher hard-block re-execution once a call has repeated too often.
+#[derive(Default)]
+struct ToolRepetitionGuard {
+    last_signature: Option<String>,
+    count: usize,
+}
+
 /// Context for an initialized model agent
 ///
 /// A session has at most 1 running task at a time, and can be interrupted by user input.
@@ -831,6 +841,12 @@ pub(crate) struct Session {
     pub(crate) services: SessionServices,
     js_repl: Arc<JsReplHandle>,
     next_internal_sub_id: AtomicU64,
+    /// Hard repetition-loop guard for tool dispatch — see [`ToolRepetitionGuard`].
+    tool_repetition: std::sync::Mutex<ToolRepetitionGuard>,
+    /// Detects agentic loops the consecutive-identical guard misses: cyclic
+    /// tool-call patterns, repeated near-identical edits to one file, and
+    /// repeated assistant preambles. See `codex_routing::loop_detector`.
+    loop_detector: std::sync::Mutex<codex_routing::loop_detector::LoopDetector>,
 }
 
 #[derive(Clone, Debug)]
@@ -1257,6 +1273,43 @@ pub(crate) struct AppServerClientMetadata {
 }
 
 impl Session {
+    /// Record a tool-call signature and return how many times it has now been
+    /// dispatched consecutively (resetting whenever the signature changes). The
+    /// tool dispatcher uses this to hard-block runaway repetition loops.
+    pub(crate) fn note_tool_call_repetition(&self, signature: String) -> usize {
+        let mut guard = self
+            .tool_repetition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.last_signature.as_deref() == Some(signature.as_str()) {
+            guard.count += 1;
+        } else {
+            guard.last_signature = Some(signature);
+            guard.count = 1;
+        }
+        guard.count
+    }
+
+    /// Feed a dispatched tool call to the loop detector; returns a model-facing
+    /// directive if a cyclic pattern or repeated near-identical edit is detected.
+    pub(crate) fn note_loop_tool_call(&self, tool_name: &str, args_raw: &str) -> Option<String> {
+        self.loop_detector
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .note_tool_call(tool_name, args_raw)
+            .map(|v| v.message)
+    }
+
+    /// Feed a turn-ending assistant message to the loop detector; returns a
+    /// directive if the model keeps emitting the same preamble.
+    pub(crate) fn note_loop_assistant_text(&self, text: &str) -> Option<String> {
+        self.loop_detector
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .note_assistant_text(text)
+            .map(|v| v.message)
+    }
+
     pub(crate) async fn app_server_client_metadata(&self) -> AppServerClientMetadata {
         let state = self.state.lock().await;
         AppServerClientMetadata {
@@ -2044,6 +2097,8 @@ impl Session {
             services,
             js_repl,
             next_internal_sub_id: AtomicU64::new(0),
+            tool_repetition: std::sync::Mutex::new(ToolRepetitionGuard::default()),
+            loop_detector: std::sync::Mutex::new(codex_routing::loop_detector::LoopDetector::new()),
         });
         if let Some(network_policy_decider_session) = network_policy_decider_session {
             let mut guard = network_policy_decider_session.write().await;
@@ -5851,6 +5906,34 @@ fn errors_to_info(errors: &[SkillError]) -> Vec<SkillErrorInfo> {
         .collect()
 }
 
+/// True when an assistant message ends by ANNOUNCING a next action it never
+/// performed — e.g. "Let me fix the handler:" — and then stops with no tool
+/// call. High precision by design: requires both a trailing colon (the place a
+/// tool call / code block was meant to follow) AND a first-person action
+/// lead-in on the final line, so genuine sign-offs ("Let me know if…") and
+/// summaries ("The fix is complete.") don't trigger a re-prompt.
+fn ends_with_dangling_action(msg: &str) -> bool {
+    let trimmed = msg.trim_end();
+    if !trimmed.ends_with(':') {
+        return false;
+    }
+    let last_line = trimmed
+        .lines()
+        .next_back()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    const ACTION_LEADINS: [&str; 7] = [
+        "let me",
+        "let's",
+        "i'll",
+        "i will",
+        "i am going to",
+        "i'm going to",
+        "next i",
+    ];
+    ACTION_LEADINS.iter().any(|lead| last_line.contains(lead))
+}
+
 /// Takes a user message as input and runs a loop where, at each sampling request, the model
 /// replies with either:
 ///
@@ -6086,6 +6169,18 @@ pub(crate) async fn run_turn(
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
     let mut server_model_warning_emitted_for_turn = false;
 
+    // Route-agnostic dangling-intent guard: how many times this turn we've
+    // re-prompted a model that announced a next action ("Let me fix X:") but
+    // ended without performing it. Bounded so a model that keeps announcing
+    // without acting still terminates the turn.
+    const MAX_DANGLING_INTENT_REPROMPTS: usize = 2;
+    let mut dangling_intent_reprompts: usize = 0;
+    // Bounds the repeated-assistant-text loop guard (a) so a stuck model gets a
+    // hard "stop repeating, change approach" nudge a couple of times, then the
+    // turn is allowed to end rather than re-prompting forever.
+    const MAX_LOOP_TEXT_REPROMPTS: usize = 2;
+    let mut loop_text_reprompts: usize = 0;
+
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
     let mut client_session =
@@ -6209,6 +6304,82 @@ pub(crate) async fn run_turn(
                 }
 
                 if !needs_follow_up {
+                    // Repeated-assistant-text loop guard (a): the model keeps ending
+                    // turns with the same preamble ("I see the issue… let me fix…")
+                    // without resolving it. Detected across turns; bounded re-prompts
+                    // then let the turn end rather than spin forever. Runs before the
+                    // dangling-intent guard so a looping announcement is caught here.
+                    if let Some(text) = sampling_request_last_agent_message.as_deref()
+                        && loop_text_reprompts < MAX_LOOP_TEXT_REPROMPTS
+                        && let Some(directive) = sess.note_loop_assistant_text(text)
+                    {
+                        loop_text_reprompts += 1;
+                        warn!(
+                            turn_id = %turn_context.sub_id,
+                            attempt = loop_text_reprompts,
+                            "Model is repeating itself without progress; re-prompting to change approach"
+                        );
+                        sess.send_event(
+                            &turn_context,
+                            EventMsg::Warning(WarningEvent {
+                                message: "↻ Model is repeating itself without progress — nudging it to change approach.".to_string(),
+                            }),
+                        )
+                        .await;
+                        let nudge = ResponseItem::Message {
+                            id: None,
+                            role: "user".to_string(),
+                            content: vec![ContentItem::InputText { text: directive }],
+                            end_turn: None,
+                            phase: None,
+                        };
+                        sess.record_conversation_items(&turn_context, std::slice::from_ref(&nudge))
+                            .await;
+                        last_agent_message = sampling_request_last_agent_message;
+                        continue;
+                    }
+
+                    // Dangling-intent guard: the model ended its turn by ANNOUNCING
+                    // a next action ("Let me fix the handler:") but produced no tool
+                    // call to carry it out. Don't silently complete — re-prompt it to
+                    // actually do the thing. Bounded by MAX_DANGLING_INTENT_REPROMPTS.
+                    // Runs before the stop/after-agent hooks because the turn isn't
+                    // really ending. Applies to every route — local and cloud.
+                    let is_dangling_intent = sampling_request_last_agent_message
+                        .as_deref()
+                        .is_some_and(ends_with_dangling_action);
+                    if is_dangling_intent
+                        && dangling_intent_reprompts < MAX_DANGLING_INTENT_REPROMPTS
+                    {
+                        dangling_intent_reprompts += 1;
+                        warn!(
+                            turn_id = %turn_context.sub_id,
+                            attempt = dangling_intent_reprompts,
+                            "Model announced an action but stopped without a tool call; re-prompting"
+                        );
+                        sess.send_event(
+                            &turn_context,
+                            EventMsg::Warning(WarningEvent {
+                                message:
+                                    "↻ Model announced an action but didn't perform it — re-prompting to follow through."
+                                        .to_string(),
+                            }),
+                        )
+                        .await;
+                        let nudge = ResponseItem::Message {
+                            id: None,
+                            role: "user".to_string(),
+                            content: vec![ContentItem::InputText {
+                                text: "You ended your last message by announcing the next action but did not perform it — no tool call followed, so nothing actually happened. Carry out that action NOW with a tool call. Do not just restate the plan.".to_string(),
+                            }],
+                            end_turn: None,
+                            phase: None,
+                        };
+                        sess.record_conversation_items(&turn_context, std::slice::from_ref(&nudge))
+                            .await;
+                        last_agent_message = sampling_request_last_agent_message;
+                        continue;
+                    }
                     last_agent_message = sampling_request_last_agent_message;
                     let stop_hook_permission_mode = match turn_context.approval_policy.value() {
                         AskForApproval::Never => "bypassPermissions",

@@ -171,6 +171,7 @@ impl ToolHandler for SupervisorHandler {
             turn: turn.clone(),
             routing_config,
             ollama_pool,
+            failover: project_config.failover.clone(),
         };
 
         let result = run_supervisor(&args.goal, &supervisor_config, &judge).await;
@@ -207,9 +208,44 @@ struct CodexJudge {
     turn: Arc<TurnContext>,
     routing_config: RoutingConfig,
     ollama_pool: Arc<OllamaClientPool>,
+    failover: codex_routing::project_config::FailoverChains,
 }
 
 impl CodexJudge {
+    /// Map a failover-chain role name to a local endpoint the supervisor can
+    /// call directly. Cloud roles return `None` — the supervisor reaches cloud
+    /// via `spawn_and_wait` (the complex-goal branch), not these local chains.
+    fn local_endpoint_for_role(
+        &self,
+        role: &str,
+    ) -> Option<&codex_routing::config::OllamaEndpoint> {
+        let rc = &self.routing_config;
+        let ep = match role {
+            "light_reasoner" => &rc.reasoner,
+            "light_reasoner_backup" => &rc.reasoner_backup,
+            "light_coder" => &rc.light_coder,
+            "compactor" => &rc.compactor,
+            "classifier" => &rc.classifier,
+            _ => return None,
+        };
+        ep.enabled.then_some(ep)
+    }
+
+    /// Resolve a configured failover chain to the ordered list of local
+    /// endpoints the supervisor can call. Empty if the chain has no usable
+    /// local role (e.g. an all-cloud chain); callers fall back accordingly.
+    fn local_chain(&self, chain: &str) -> Vec<&codex_routing::config::OllamaEndpoint> {
+        let roles = match chain {
+            "planning" => &self.failover.planning,
+            "evaluation" => &self.failover.evaluation,
+            _ => return Vec::new(),
+        };
+        roles
+            .iter()
+            .filter_map(|role| self.local_endpoint_for_role(role))
+            .collect()
+    }
+
     /// Spawn a Codex sub-agent and wait for completion.
     async fn spawn_and_wait(&self, prompt: &str) -> Result<String, String> {
         self.spawn_and_wait_inner(prompt, None).await
@@ -485,15 +521,15 @@ impl SupervisorJudge for CodexJudge {
             | codex_routing::classifier::RouteTarget::LightCoder
             | codex_routing::classifier::RouteTarget::CloudFast => {
                 info!(route = ?classification.route, "Planning locally (simple goal)");
-                self.call_with_failover(
-                    &[
+                let mut endpoints = self.local_chain("planning");
+                if endpoints.is_empty() {
+                    endpoints = vec![
                         &self.routing_config.reasoner,
                         &self.routing_config.reasoner_backup,
-                    ],
-                    &prompt,
-                    "planning",
-                )
-                .await
+                    ];
+                }
+                self.call_with_failover(&endpoints, &prompt, "planning")
+                    .await
             }
             // Complex goals: plan with cloud (better decomposition)
             _ => {
@@ -546,16 +582,17 @@ impl SupervisorJudge for CodexJudge {
             truncate(output, 2000),
         );
 
-        // Failover chain: reasoner → reasoner_backup → Codex sub-agent
+        // Failover via the configured `evaluation` chain (local roles), falling
+        // back to reasoner → reasoner_backup if the chain has no usable role.
+        let mut endpoints = self.local_chain("evaluation");
+        if endpoints.is_empty() {
+            endpoints = vec![
+                &self.routing_config.reasoner,
+                &self.routing_config.reasoner_backup,
+            ];
+        }
         let response = self
-            .call_with_failover(
-                &[
-                    &self.routing_config.reasoner,
-                    &self.routing_config.reasoner_backup,
-                ],
-                &prompt,
-                "evaluation",
-            )
+            .call_with_failover(&endpoints, &prompt, "evaluation")
             .await;
 
         match response {

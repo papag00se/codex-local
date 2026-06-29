@@ -37,15 +37,18 @@ When upstream changes `codex-core`:
 
 ### The SupervisorJudge implementation (IMPLEMENTED)
 
-The tool handler creates a `CodexJudge` that bridges the supervisor trait to codex-core. All four judgment calls are implemented using `spawn_and_wait` — spawn a sub-agent with a specific prompt and wait for its final message:
+The tool handler creates a `CodexJudge` that bridges the supervisor trait to codex-core. It makes judgment calls **two** ways: spawn a full Codex sub-agent (`spawn_and_wait`), or call a local model endpoint directly (`call_endpoint` / `call_with_failover`). Which one is used depends on the call and the goal's complexity.
 
 ```rust
 struct CodexJudge {
     session: Arc<Session>,
     turn: Arc<TurnContext>,
+    routing_config: RoutingConfig,                            // local endpoints per role
+    ollama_pool: Arc<OllamaClientPool>,                       // for direct local calls
+    failover: codex_routing::project_config::FailoverChains,  // configured chains
 }
 
-// Shared primitive: spawn agent, wait for completion, return final message.
+// Spawn-a-sub-agent primitive: used for worker dispatch and complex-goal planning.
 async fn spawn_and_wait(&self, prompt: &str) -> Result<String, String> {
     let thread_id = agent_control.spawn_agent(config, Op::UserInput { ... }, None).await?;
     let mut status_rx = agent_control.subscribe_status(thread_id).await?;
@@ -54,31 +57,29 @@ async fn spawn_and_wait(&self, prompt: &str) -> Result<String, String> {
 }
 
 impl SupervisorJudge for CodexJudge {
-    // LLM judgment: decompose goal into JSON task list
-    async fn plan_tasks(&self, goal: &str) -> Vec<Task> {
-        let output = self.spawn_and_wait(&format!("{PLANNER_PROMPT}{goal}")).await;
-        self.parse_plan(&output, goal)  // Extract JSON array, fallback to single task
-    }
+    // Planning: classify the goal. Simple goals plan on the LOCAL `planning`
+    // failover chain (call_with_failover, reasoner → reasoner_backup fallback);
+    // complex goals plan on a stronger model via a spawned sub-agent.
+    async fn plan_tasks(&self, goal: &str) -> Vec<Task> { /* … parse_plan(output, goal) */ }
 
-    // Worker dispatch: spawn agent with task description, wait for completion
+    // Worker dispatch: spawn a specialist sub-agent for the task, wait for it.
     async fn dispatch_task(&self, task: &Task) -> Result<String, String> {
         self.spawn_and_wait(&task.description).await
     }
 
-    // LLM judgment: "is this task complete?" → yes/no
-    async fn evaluate_completion(&self, task: &Task, output: &str) -> bool {
-        let response = self.spawn_and_wait(&format!("{EVALUATOR_PROMPT}...")).await;
-        response.starts_with("yes")
-    }
+    // Completion judgment: run on the LOCAL `evaluation` failover chain.
+    async fn evaluate_completion(&self, task: &Task, output: &str) -> bool { /* … */ }
 
-    // Deterministic: run command, check exit code
-    async fn verify(&self, task: &Task, cmd: &str) -> bool {
-        Command::new("bash").arg("-c").arg(cmd).output().await?.status.success()
-    }
+    // Deterministic: run the verification command, check exit code.
+    async fn verify(&self, task: &Task, cmd: &str) -> bool { /* bash -c, success */ }
 }
 ```
 
-The code is at `codex-rs/core/src/tools/handlers/supervisor.rs` (~240 lines).
+**Failover-chain-driven judgment.** Planning and evaluation resolve their model list from the project's `[failover]` `planning` / `evaluation` chains via two helpers:
+- `local_endpoint_for_role(role)` — maps a chain role name (`light_reasoner`, `light_coder`, `compactor`, …) to a local endpoint; cloud roles return `None` (the supervisor reaches cloud only through `spawn_and_wait`).
+- `local_chain(chain)` — resolves a chain name to the ordered list of usable local endpoints; empty for an all-cloud chain, in which case the caller falls back to `reasoner → reasoner_backup`.
+
+So the same `[failover]` config that drives per-request routing also drives the supervisor's internal judgment, and `local_only` keeps planning/evaluation entirely on local models. Specialist sub-agents pick up their persona from `[roles.coder]` / `[roles.reviewer]` / `[roles.test_runner]` (`instructions` + `nickname`). The code is at `codex-rs/core/src/tools/handlers/supervisor.rs`.
 
 ### What the model sees
 

@@ -20,8 +20,8 @@ pub struct ModelEntry {
     pub weight: u32,
     #[serde(default = "default_reasoning")]
     pub reasoning: String,
-    #[serde(default)]
-    pub num_ctx: Option<usize>,
+    #[serde(default, alias = "num_ctx")]
+    pub trim_budget: Option<usize>,
 }
 
 fn default_weight() -> u32 {
@@ -43,7 +43,7 @@ pub enum ModelRole {
         #[serde(default = "default_reasoning")]
         reasoning: String,
         #[serde(default)]
-        num_ctx: Option<usize>,
+        trim_budget: Option<usize>,
         /// `"focused"` (default, ~6 tools) or `"full"` (entire catalog).
         /// Override per-model when the local model can handle a larger
         /// catalog without losing focus.
@@ -60,6 +60,30 @@ pub enum ModelRole {
         /// for slow reasoning models, lower for fast-fail behavior.
         #[serde(default)]
         timeout_seconds: Option<u64>,
+        /// Sampler overrides. When unset, `temperature` falls back to a
+        /// reasoning-based default (0.0 off / 0.1 on) and the rest are omitted
+        /// from the request (server default applies). Some local models (e.g.
+        /// Gemma 4) degenerate / repeat at the stock sampler and need explicit
+        /// values — Gemma 4's author recommends `temperature = 1.0`,
+        /// `top_p = 0.95`, `top_k = 64`, `repeat_penalty = 1.1`.
+        #[serde(default)]
+        temperature: Option<f64>,
+        #[serde(default)]
+        top_p: Option<f64>,
+        #[serde(default)]
+        top_k: Option<u64>,
+        #[serde(default)]
+        repeat_penalty: Option<f64>,
+        /// Tool-call constraint for OpenAI-compatible servers (e.g. llama.cpp).
+        /// Unset (the default) sends no `tool_choice` — i.e. `"auto"`: the model
+        /// is free to call a tool or answer in text, and the FORMAT is
+        /// unconstrained (the source of leaked/malformed tool calls). Set to
+        /// `"required"` to force + grammar-constrain a valid tool call (note:
+        /// this forces a call EVERY turn — use only for roles that should always
+        /// act, as it removes text-only completion). Set to a specific function
+        /// name to force that tool. See docs/spec/local-coder-massaging.md §25.
+        #[serde(default)]
+        tool_choice: Option<String>,
     },
     Weighted {
         entries: Vec<ModelEntry>,
@@ -81,6 +105,14 @@ pub struct RoutingBehavior {
     /// `--local-only` CLI flag.
     #[serde(default)]
     pub local_only: bool,
+    /// Max share of the local model's context budget the **system prompt**
+    /// (base instructions + state prelude) may occupy, as a percentage. When the
+    /// system exceeds it, the trimmer compresses it instead of letting it crowd
+    /// out the conversation. `0` disables system compression. Default 20.
+    /// Generic by design — bounds *any* incoming system prompt, not just Codex's,
+    /// so the same logic works when this fork becomes a harness-agnostic service.
+    #[serde(default = "default_system_budget_pct")]
+    pub system_budget_pct: u8,
 }
 
 impl Default for RoutingBehavior {
@@ -89,12 +121,17 @@ impl Default for RoutingBehavior {
             strategy: default_strategy(),
             compaction_model: None,
             local_only: false,
+            system_budget_pct: default_system_budget_pct(),
         }
     }
 }
 
 fn default_strategy() -> String {
     "cost_first".into()
+}
+
+fn default_system_budget_pct() -> u8 {
+    20
 }
 
 /// Supervisor behavior configuration.
@@ -143,8 +180,6 @@ pub struct FailoverChains {
     pub classification: Vec<String>,
     #[serde(default)]
     pub compaction: Vec<String>,
-    #[serde(default)]
-    pub review: Vec<String>,
     #[serde(default)]
     pub planning: Vec<String>,
     #[serde(default)]
@@ -363,7 +398,6 @@ impl ProjectConfig {
             "coding" => &self.failover.coding,
             "classification" => &self.failover.classification,
             "compaction" => &self.failover.compaction,
-            "review" => &self.failover.review,
             "planning" => &self.failover.planning,
             "evaluation" => &self.failover.evaluation,
             _ => &[],
@@ -432,12 +466,12 @@ entries = [
         let toml = r#"
 [models.classifier]
 provider = "ollama"
-endpoint = "http://sakura-wsl:11434"
+endpoint = "http://localhost:11434"
 model = "qwen3.5-9b:iq4_xs"
 
 [models.light_reasoner]
 provider = "ollama"
-endpoint = "http://sakura-wsl:11435"
+endpoint = "http://localhost:11435"
 model = "qwen3.5:9b"
 reasoning = "on"
 

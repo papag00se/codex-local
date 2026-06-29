@@ -4,38 +4,31 @@
 # --- Model roles ---
 
 [models.classifier]
-endpoint = "http://sakura-wsl.taile41496.ts.net:11434"
-model = "qwen3.5-9b:iq4_xs"
-num_ctx = 4096
-provider = "ollama"
+endpoint = "http://192.168.0.245:8000"
+model = "qwopus"
+trim_budget = 65536
+provider = "openai-compat"
 reasoning = "off"
 
 [models.light_reasoner]
-endpoint = "http://sakura-wsl.taile41496.ts.net:11435"
-model = "qwen3.5-9b-opus-openclaw-distilled:tools"
-num_ctx = 16384
-provider = "ollama"
-reasoning = "on"
-
-[models.light_reasoner_backup]
-endpoint = "http://meru-wsl.taile41496.ts.net:11434"
-model = "qwen3.5:9b"
-num_ctx = 16384
-provider = "ollama"
+endpoint = "http://192.168.0.245:8000"
+model = "qwopus"
+trim_budget = 65536
+provider = "openai-compat"
 reasoning = "on"
 
 [models.light_coder]
-endpoint = "http://sakura-wsl.taile41496.ts.net:11435"
-model = "qwen3.5-9b-opus-openclaw-distilled:tools"
-num_ctx = 16384
-provider = "ollama"
+endpoint = "http://192.168.0.245:8000"
+model = "qwopus"
+trim_budget = 65536
+provider = "openai-compat"
 reasoning = "off"
 
 [models.compactor]
-endpoint = "http://sakura-wsl.taile41496.ts.net:11435"
-model = "qwen3.5-9b-opus-openclaw-distilled:tools"
-num_ctx = 16384
-provider = "ollama"
+endpoint = "http://192.168.0.245:8000"
+model = "qwopus"
+trim_budget = 65536
+provider = "openai-compat"
 reasoning = "off"
 
 [models.cloud_fast]
@@ -88,15 +81,14 @@ coding = [
     "cloud_coder",
 ]
 compaction = ["compactor", "light_reasoner", "cloud_mini"]
-evaluation = ["light_reasoner", "light_reasoner_backup", "cloud_mini"]
-planning = ["light_reasoner", "cloud_reasoner", "cloud_coder"]
+evaluation = ["light_reasoner", "light_reasoner_backup"]
+planning = ["light_reasoner", "light_reasoner_backup"]
 reasoning = [
     "light_reasoner",
     "light_reasoner_backup",
     "cloud_reasoner",
     "cloud_coder",
 ]
-review = ["cloud_reasoner", "cloud_coder"]
 
 # --- Failover behavior ---
 # Controls how failures are handled before walking the failover chains above.

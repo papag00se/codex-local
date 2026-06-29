@@ -30,8 +30,8 @@ Plain-English summary of every intervention. Numbers match the detailed sections
 7. **Fix broken patches** — Small models mangle patches: (a) write git-diff format, (b) leave `@@ -1,6 +1,6 @@` line numbers, (c) forget `+` prefixes and closing markers. We fix all three automatically.
 8. **Better patch error messages** — Default errors are cryptic. We rewrote the common ones to explain what to try next.
 9. **Better network errors** — Instead of "error sending request", we show the real cause (DNS, TLS, connection refused, etc.).
-10. **Catch announce-without-act** — When the model says "Now I'll do X" and stops, a judge model spots it and we re-prompt "take the action." Up to 3 retries.
-11. **Stop repetition** — (a) Same tool + same args 3× → STOP block in next prompt. (b) Same file failing 3× with different commands → same STOP block.
+10. **Catch announce-without-act** — When the model says "Now I'll do X" and stops, a judge model spots it and we re-prompt "take the action"; the nudge **escalates** to a hard "emit one tool call, no prose" demand after it's ignored. A second, **deterministic** core-level guard catches the same pattern without the judge (and works for cloud routes too). Completion is **ground-truth-gated**: a coder turn only counts as done if it actually changed files or the judge confirms. Up to 3 retries.
+11. **Stop repetition** — (a) same tool + same args 3× → STOP block. (b) same file failing 3× → forced-diagnosis. (c) same signature recurring interleaved → forced-diagnosis, but **only failing recurrences count**, so healthy re-runs (passing tests, `ls`/`git status`) don't trip it. Past the escalation threshold the loop is **excised from context** and the model is told it's stuck.
 12. **Trim old conversation** — Keep the most recent turn intact, summarize older turns, drop stale file reads, pin errors so the model can't forget them.
 13. **Log the model's thinking** — Reasoning text goes to debug logs so we can explain weird behavior later.
 14. **Reroute wrong picks** — If the router picked "text-only model" but the conversation has tool calls, we upgrade to the tool-capable Coder.
@@ -41,19 +41,27 @@ Plain-English summary of every intervention. Numbers match the detailed sections
 18. **Pin current file contents** — Models forget a file changed and generate patches based on the old version. We pin live on-disk contents at the top of the prompt.
 19. **Catch thinking loops** — Some models spiral: "Actually, wait. Hmm. Let me reconsider." We watch the stream for 6+ self-doubt phrases after half the token budget is burned, abort mid-generation, and re-prompt "stop second-guessing."
 20. **Stream the coder's output** — To make #19 work, we switched from "send, wait, parse" to "open stream, watch tokens, abort if needed." Also lets us log reasoning in real time.
+21. **Recover leaked tool calls** — local models emit tool calls as TEXT in several dialects (Hermes `<tool_call>` JSON, the XML-function `<function=…>` form, or malformed JSON). One recovery pass promotes them to real, executed calls instead of letting the action vanish as prose. Single shared implementation on the one unified local path.
+22. **Tolerate fenced JSON** — newer control models wrap their JSON verdict in a ```json fence, which silently broke the classifier and completion verifier. We extract the JSON object so the fence doesn't matter.
+23. **Honest local-only signals** — a cloud role skipped by `local_only` no longer logs as "model not found (config error?)"; and the classifier honors its configured timeout instead of a hard-coded 10s, so a slow local server degrades gracefully instead of failing every turn.
+24. **One path for coder and reasoner** — both roles run the same streaming/recovery/overflow path with the **same full tool set** (a reasoning model can code too). The only behavioral difference is one bit: whether a text-only turn is a valid completion (`role_text_is_product` — a coder must act; a reasoner's text can be the answer). Everything else that makes a "reasoner" — temperature, reasoning budget, `max_tokens` — is per-endpoint config. And when the prompt overflows the server's real context, the path re-trims to the server's reported numbers and retries instead of crashing.
+25. **Tool-call constraint** (`tool_choice`) — the baseline (`"auto"`, unset) leaves the tool-call *format* unconstrained, the source of the leak/fence/prefill bugs. We enforce a valid call at the sampler (`tool_choice="required"`, which llama.cpp grammar-constrains) **only on the bail/rumination/quality retry of an actor role** — turning the prose "emit a single tool call" nudge into an enforced one, without blocking text-completion or termination on normal turns. Reasoners are never forced; a per-role config `tool_choice` is an operator override. Large file writes get the same treatment: `write_file` translates to a sandbox-safe, escaping-proof **shell overwrite**, and a synthetic tool whose JSON args failed to parse re-prompts under the constraint instead of dead-ending as `unsupported call`. The A/B (prose-nudge vs enforced) is a paper result.
+26. **Loop detection beyond consecutive-identical** — the hard guard only catches the *same* call repeated back-to-back. Three detectors catch the loops it misses, all productivity-gated: (a) the same **assistant preamble** repeated across turns (normalized: stopwords stripped, light-stemmed), (b) a short **cyclic tool pattern** (patch→test→cat→patch…), (c) the **same file re-edited** with near-identical content. (a) re-prompts at turn end (bounded); (b)/(c) block the call at dispatch and redirect. Drawn directly from the Ada-handle thrash that ran 14 min undetected.
+27. **Servability guarantees** — three fixes so a long/looping session can't dead-end: `apply_patch` `*** Add File` on an existing path now **errors** (was a silent overwrite that fed a rewrite loop); a `local_only` failover chain that strips cloud now **appends the other local role** as a backup instead of collapsing to one; and when protected assistant bulk alone exceeds the window, the prompt is reduced **semantic-first** — inline compaction summarizes the over-budget region (older turns, or the active turn's own middle), with a bounded last-resort drop (`drop_to_fit`, always keeping the user request) only as the floor — so the prompt always fits without crudely discarding the turn's history (see §12, §24).
 
 ---
 
-## 1. Local-only routing
+## 1. Local-only mode (no cloud)
 
-**Problem:** In `local_only` mode there is no cloud fallback. A classifier LLM call is wasted work, a separate reasoner endpoint splits inference load across an extra model, and a dedicated compactor is another model to load/keep warm.
+**Problem:** With `local_only` set there must be no cloud inference — ever — but we still want *real* routing across the local roles (a classifier to pick coder vs reasoner, a reasoner for analysis, a compactor for summaries), not a degraded "coder does everything" mode.
 
-**What we do:**
-- Skip the classifier entirely. `route_request` synthesizes a `ClassifyResult` pointing at `LightCoder` without calling the classifier endpoint.
-- Never resolve `light_reasoner` — reasoning-shaped requests fall through to the Coder.
-- Route compaction through the same `light_coder` endpoint. The dedicated `compactor` role becomes unused in local-only mode.
+**What we do:** `local_only` means "no cloud," enforced at two layers, and otherwise routes normally:
+- Cloud roles are **stripped from every failover chain** (classification, coding, compaction, reasoning) up front, and `resolve_role` refuses any cloud role outright (`FailureType::RoleUnresolvable`) — so no cloud dispatch can happen regardless of what a chain contains.
+- The classifier still runs (cloud-stripped) to pick the route; if it can't classify, the chain walks and defaults to the coder.
+- **Coder and reasoner are both local roles on the one unified streaming path** (see §24) — both are full coders with the same tools; only their completion behavior and per-endpoint config differ. The reasoner isn't something that "falls through to the coder."
+- Compaction routes through the `compaction` chain's first usable local role.
 
-**Code:** [codex-rs/core/src/local_routing.rs](../../codex-rs/core/src/local_routing.rs) — search for `local_only`. The compaction branch in `route_request` picks `&state.config.light_coder` when `local_only` is set.
+**Code:** [codex-rs/core/src/local_routing.rs](../../codex-rs/core/src/local_routing.rs) — `resolve_role` (cloud-role guard), the per-chain cloud-strip, and `local_role_profile` (coder vs reasoner). See also [[project_local_only_mode]].
 
 **Log signal:** `local_only: bypassing classifier — routing to LightCoder`
 
@@ -215,22 +223,32 @@ Even with normalization, some patches genuinely can't apply — the context line
 
 **Problem:** Local models often end a turn with text that announces intent but takes no action — "I will update the imports and then run the tests" with no tool call to actually do it. Codex interprets any text-only response as the end of a turn, emits `task_complete`, and the user is left with a broken task.
 
-**What we do:**
+**What we do:** three cooperating layers.
+
+### 10a. Completion verifier (judge) + escalating re-prompt
+
 - After each Ollama call, if the response has non-empty text and zero tool calls, send it to a small judge model (the Coder itself in local-only mode) with a prompt defining BAIL vs COMPLETE patterns.
-- If the verdict is BAIL, inject a `continuation_prompt` as a synthesized user message telling the model: "You announced an action but did not actually take it. Either take the action, restate the concrete result you produced, or explain why you cannot proceed." Then re-call the model.
-- `MAX_BAIL_RETRIES = 3` — the model gets up to 3 nudges to convert announcement into action before Codex gives up.
+- If the verdict is BAIL, inject a `continuation_prompt` as a synthesized user message. The first nudge is gentle ("re-issue it as a tool call"); once the model **ignores it and keeps emitting prose**, the nudge **escalates** to a hard constraint: *"STOP EXPLAINING. Your ENTIRE next message must be a SINGLE tool call — no prose."* This breaks the explain-instead-of-edit loop that simple repetition of the same nudge can't.
+- `MAX_BAIL_RETRIES = 3` — up to 3 nudges before Codex gives up.
 
-The verifier prompt explicitly covers:
-- "I will X" / "Let me X" / "Now I'll X" and stops
-- Plans/intents stated without any tool call
-- Findings restated without being applied
-- **Code blocks are never actions** — a markdown fence containing source code is a suggestion, not a completed action, unless the same content was passed to `apply_patch` or `shell`.
+The verifier prompt explicitly covers: "I will X" / "Let me X" / "Now I'll X" and stops; plans stated without a tool call; findings restated without being applied; and **code blocks are never actions** (a markdown fence is a suggestion unless the same content went to `apply_patch` / `shell`).
 
-The verifier uses `light_coder` as its endpoint in `local_only` mode (the classifier is offline by design). In cloud mode it uses the fast classifier.
+The verifier uses `light_coder` as its endpoint in `local_only` mode (the classifier is offline by design); cloud mode uses the fast classifier. Its JSON verdict is parsed **fence-tolerantly** (see #22) — a model that wraps `{"verdict":"bail"}` in a ```json fence was previously read as "unparseable" and defaulted to COMPLETE, silently letting a dangling turn finish.
 
-**Code:** [codex-rs/routing/src/completion_verifier.rs](../../codex-rs/routing/src/completion_verifier.rs) — `verify_completion`, `continuation_prompt`.
+### 10b. Ground-truth completion gate
 
-**Log signal:** `Completion verifier judged the model's text-only response verdict=Bail|Complete|Unclear`
+The judge is a weak local model, so we don't trust it alone. A coder turn with no tool call only ends if **either** the active turn actually modified files (`files_modified_in_active_turn`) **or** the verifier returns COMPLETE. Text alone, with no file changes and no COMPLETE, never ends a coder turn — it re-prompts.
+
+### 10c. Deterministic dangling-intent guard (route-agnostic)
+
+The judge can still be fooled, and it doesn't run on cloud routes. So there is a second, **deterministic** guard at the core turn-completion gate (`run_turn`): if a turn is about to complete but the final message ends with an announced-but-unfulfilled action — a trailing colon plus a first-person action lead-in ("Let me fix the handler:") — re-prompt instead of completing. High-precision (needs both signals, so sign-offs and summaries don't trigger), bounded to 2 re-prompts/turn, and applies to **every** route including cloud.
+
+**Code:**
+- Verifier + escalating prompt: [codex-rs/routing/src/completion_verifier.rs](../../codex-rs/routing/src/completion_verifier.rs) — `verify_completion`, `continuation_prompt(prior, attempt)`.
+- Ground-truth gate: [codex-rs/core/src/local_routing.rs](../../codex-rs/core/src/local_routing.rs) — `did_real_work` / `files_modified_in_active_turn`.
+- Deterministic guard: [codex-rs/core/src/codex.rs](../../codex-rs/core/src/codex.rs) — `ends_with_dangling_action` in `run_turn`.
+
+**Log signal:** `Completion verifier judged a no-tool-call response verdict=Bail|Complete did_real_work=…` and `Model announced an action but stopped without a tool call; re-prompting`
 
 ---
 
@@ -246,17 +264,22 @@ Walk the most recent `ToolCall` items and detect when 3+ consecutive calls share
 
 ### 11b. Same-target-failure repetition
 
-Walk the most recent `(ToolCall, ToolOutput)` pairs and detect when 3+ consecutive **failed** calls target the same file path, even with different argument shapes. Catches the "keep trying different ways to read a file that's broken" loop that 11a misses.
+Walk the most recent `(ToolCall, ToolOutput)` pairs and detect when 3+ consecutive **failed** calls target the same file path, even with different argument shapes. Catches the "keep trying different ways to read a file that's broken" loop that 11a misses. Renders as a forced-diagnosis directive ("read the failure, state the root cause, then make ONE change").
 
-When either fires, a `[STOP — REPETITION DETECTED]` block is prepended to the system prelude with:
-- The tool name and repeat count
-- A summary of the repeated call
-- An excerpt of the last output (so the model can see what the actual result was)
-- A directive: "STOP making this call. Try a different approach now: change the arguments, use a different tool, or report what you've learned to the user."
+### 11c. Unproductive recurrence (interleaved thrash)
+
+The model works toward the same end with *varying* commands so 11a/11b miss it — e.g. running the same test 3× with edits between, never passing. Count tool-call signatures over a 24-call window; a signature recurring 3+ times is thrash. **Productivity-gated: only occurrences whose output FAILED count toward the threshold.** A signature that recurs but *succeeds* (a now-passing test, a routine `ls` / `grep` / `git status` re-run) is healthy and must not fire — and "diagnose the failure" is incoherent when there's no failure. This gate is what stopped the thrash nudge from firing constantly on normal repeated commands.
+
+### Escalation ladder
+
+Repetition rendering escalates with severity:
+- `[STOP — REPETITION DETECTED]` for an exact byte-identical loop (11a).
+- `[NO PROGRESS — DIAGNOSE …]` forced-diagnosis for the thrash variants (11b/11c).
+- Past the escalation threshold (count ≥ 6), the loop's tool calls + outputs are **excised from the rendered context** so the model can't copy them out of its own history, and the prelude reframes to "you are stuck; the loop was removed."
 
 **Code:**
-- Detection: [codex-rs/routing/src/trim/state_extract.rs](../../codex-rs/routing/src/trim/state_extract.rs) — `detect_repetition`, `detect_same_target_failure_repetition`
-- Rendering: [codex-rs/routing/src/trim/render.rs](../../codex-rs/routing/src/trim/render.rs) — `render_repetition_alert`
+- Detection: [codex-rs/routing/src/trim/state_extract.rs](../../codex-rs/routing/src/trim/state_extract.rs) — `detect_repetition`, `detect_same_target_failure_repetition`, `detect_unproductive_recurrence`
+- Rendering: [codex-rs/routing/src/trim/render.rs](../../codex-rs/routing/src/trim/render.rs) — `render_repetition_alert`, `render_repetition_override`
 - Signatures: [codex-rs/routing/src/trim/signatures.rs](../../codex-rs/routing/src/trim/signatures.rs)
 
 **Log signal:** `Repetition alert fired — STOP block will be added to next prelude tool_name=X count=N`
@@ -275,9 +298,15 @@ When either fires, a `[STOP — REPETITION DETECTED]` block is prepended to the 
 - **Errors are sticky** — any tool output containing an error is preserved regardless of age, so the model can't forget a failure and repeat it.
 - The system prompt is never stubbed.
 
+`trim_for_local` is **mechanical only** — it collapses older turns and truncates tool data, but it never drops whole messages. When even that leaves the prompt over budget (a long single active turn whose protected assistant bulk alone exceeds the window), the fix lives one layer up and is **semantic-first**: inline **compaction** summarizes the over-budget region — older turns if there are any, otherwise the **active turn's own middle** (keeping the user request + the most recent steps verbatim). Only if compaction is disabled or can't shrink it enough does a bounded **last-resort drop** (`drop_to_fit`, always keeping the user request) act as the floor that guarantees a servable prompt. This ordering — *trim → compact → drop* — is what stops a long agentic loop from either crudely losing its own history or dead-ending the turn. See §13 and `maybe_inline_compact`.
+
+**Trigger calibration (the part that made compaction look broken).** The compactor must fire in **estimate space**, against the effective fit budget (`trim::effective_budget` = `trim_budget / SAFETY_FACTOR`), *not* a fraction of the raw `trim_budget`. The token estimate is `chars/4`; on JSON/code-dense content the real BPE count runs **1.8–2.8× higher** (observed live: a trimmed prompt the estimator put at ~13k tokens tokenized to **36.8k** on the server — a 2.84× undercount — and overflowed a 32k window). The old trigger (`0.85 × trim_budget`, real-token space ≈ 20.9k) sat far above any estimate the trimmer produces (~13k), so it **never fired**: the prompt overflowed while the estimate looked comfortably under budget, the server rejected it, and the overflow-retry loop scaled the budget down by the *real* overshoot and retried — repeatedly, per turn, never compacting. Triggering against `effective_budget` closes the dead band: an active turn whose estimate exceeds the fit budget now crosses the threshold and gets summarized **before** the first send.
+
+**We don't have to estimate at all — the server tells us the truth.** Every response carries the real `prompt_tokens`, and an overflow carries `n_prompt_tokens`. So instead of a fixed safety factor we **learn the real ÷ estimate ratio per model** (`record_token_ratio`, EWMA, clamped `[1.8, 3.5]`) and budget against it: `calibrated_trim_budget` pre-scales `trim_budget` by `1.8 / observed_ratio`, so with an observed 2.84 the budget shrinks to ~63% and trim/compaction/`drop_to_fit` all target a prompt that actually fits on the **first** attempt. It seeds at the 1.8 default (so behaviour is unchanged until measured) and converges after the first response; the active turn (where the bulk lives) is what gets compacted, since trim has already collapsed older turns to a small prelude. The chars/4 estimate now only sets the *starting* point — the server's real count corrects it within one turn. Code: `calibrated_trim_budget` / `record_token_ratio` / `observed_token_ratio` and the `fit_budget` threaded through `maybe_inline_compact`.
+
 The same trimmer is also used as the first pass of compaction.
 
-**Code:** [codex-rs/routing/src/trim/](../../codex-rs/routing/src/trim/) — entry point `trim_for_local` in `mod.rs`.
+**Code:** [codex-rs/routing/src/trim/](../../codex-rs/routing/src/trim/) — entry point `trim_for_local` in `mod.rs`; `drop_to_fit` is the last-resort floor. Compaction split: `maybe_inline_compact` / `compact_active_turn` in [codex-rs/core/src/local_routing.rs](../../codex-rs/core/src/local_routing.rs).
 
 **Log signal:** `Trimmed transcript for local model trim_summary=kept N/M items; collapsed K older turns; dropped X stale reads, Y superseded outputs; elided Z chars; ~T input tokens`
 
@@ -419,6 +448,150 @@ Caller (`local_routing.rs`) consumes the stream, accumulates content / reasoning
 - Caller-side assembly + watcher: [codex-rs/core/src/local_routing.rs](../../codex-rs/core/src/local_routing.rs) — the streaming loop replacing the old `chat_with_tools` call, plus the inline `StreamToolCallAcc`
 
 **Log signal (normal completion):** `Local coder response received content_len=... native_tool_calls=... reasoning_tokens=... continuation_count=...`
+
+---
+
+## 21. Leaked tool-call recovery
+
+**Problem:** Local models frequently emit a tool call as **text** instead of as a structured `tool_calls` field — the server's chat template (even with `--jinja`) doesn't recognize the finetune's format, so the call arrives as prose. Without recovery the harness sees zero tool calls: the action silently vanishes and the turn can be mistaken for a completion. Observed in three dialects:
+
+- **Hermes JSON** — `<tool_call>{"name":"exec_command","arguments":{…}}</tool_call>` (Qwen-family).
+- **XML-function** — `<tool_call><function=exec_command><parameter=cmd>…</parameter></function></tool_call>` (Hermes-2-Pro / Qwen-Agent / Ornith). Tolerates `<function=NAME>` and `<function name="NAME">`, preserves multi-line shell commands verbatim, and coerces numerics (so `max_output_tokens` stays an int).
+- **Malformed** — a `<tool_call>` block whose JSON doesn't parse (commonly a heredoc the model couldn't escape). Detected but not executed; instead the model is re-prompted to re-issue it cleanly and to prefer `write_file` over inline heredocs.
+
+**What we do:** a **single** recovery pass promotes leaked calls to real, executed calls and strips them from the visible text. There is **one** entry point — `tool_recovery::recover_tool_calls` — called from the one unified local path (§24), so coder and reasoner recover identically. It internally uses `tool_aliases` for the `<tool_call>` dialects and also handles fenced JSON blobs and embedded `tool_use` blocks. (History: recovery used to be two parallel implementations plus a buried third copy across two separate code paths; a fix that landed in only the coder's copy let `light_reasoner` XML leaks slip through. Both the recovery *and* the paths are now unified.)
+
+**Code:**
+- Single entry: [codex-rs/routing/src/tool_recovery.rs](../../codex-rs/routing/src/tool_recovery.rs) — `recover_tool_calls`.
+- `<tool_call>` dialect parser: [codex-rs/routing/src/tool_aliases.rs](../../codex-rs/routing/src/tool_aliases.rs) — `parse_leaked_tool_calls`, `parse_xml_function_call`, `has_leaked_tool_call`, `strip_leaked_tool_calls`.
+- Call site: [codex-rs/core/src/local_routing.rs](../../codex-rs/core/src/local_routing.rs) — the unified path (`tool_call_to_wire` → `translate_native_tool_calls`).
+
+**Log signal:** `Recovered leaked tool call(s) from text — server didn't parse the model's tool-call blocks` / `Local model emitted an unparseable <tool_call> (malformed JSON); re-prompting`
+
+---
+
+## 22. Fenced-JSON tolerance for control models
+
+**Problem:** The classifier and completion verifier ask a local model for a JSON verdict. Newer models (e.g. Ornith) wrap that JSON in a ```json markdown fence, so `serde_json::from_str` rejects it. The failure is silent and severe: every classification fails (`Classifier returned non-JSON` → chain exhausted → defaults every turn), and the verifier — which defaults to COMPLETE when it can't parse — lets dangling turns finish. Looks like a timeout or routing death but is purely a parse bug.
+
+**What we do:** before parsing, extract the JSON object itself — slice from the first `{` to the last `}` — which tolerates code fences, surrounding prose, and leftover tags without a brittle fence-stripping ladder. Applied to both the classifier and the verifier.
+
+**Code:** [codex-rs/routing/src/classifier.rs](../../codex-rs/routing/src/classifier.rs) — `extract_json_object`, used by the classifier parse path and by [completion_verifier.rs](../../codex-rs/routing/src/completion_verifier.rs).
+
+**Log signal (the failure it fixes):** `Classifier returned non-JSON, falling back` disappearing; real `Request classified` lines returning.
+
+---
+
+## 23. Honest local-only failover signals
+
+**Problem:** Two diagnostics actively misled debugging. (1) Under `local_only`, a failover chain that walks past a cloud role logged `model not found (config error?)` — implying a model-name typo when it's the intended cloud-skip. (2) The classifier hard-coded a 10s timeout, so a slow local server (e.g. a model split onto a slow second GPU) failed classification *every turn* while the coder, with a longer timeout, succeeded — read as a routing failure rather than a too-tight knob.
+
+**What we do:**
+- A role that won't resolve uses a distinct `FailureType::RoleUnresolvable` → logged as `role not resolvable (cloud disabled or unconfigured)`, not a model-name error. (Cloud roles are also stripped from chains up front under `local_only`, in classification, compaction, and dispatch alike.)
+- The classifier honors its configured `timeout_seconds`, clamped to a sane 15–60s window, instead of forcing 10s.
+
+**Code:**
+- [codex-rs/routing/src/failover.rs](../../codex-rs/routing/src/failover.rs) — `FailureType::RoleUnresolvable`.
+- [codex-rs/routing/src/classifier.rs](../../codex-rs/routing/src/classifier.rs) — `classify_timeout = timeout_seconds.clamp(15, 60)`.
+
+**Log signal:** `Role not resolvable (cloud disabled by local_only, or unconfigured) — walking chain`
+
+---
+
+## 24. Unified local path: one streaming path for coder and reasoner
+
+**Problem:** Coder (`light_coder`, tool-aware) and reasoner (`light_reasoner`, text) used to be two separate code paths — different pool methods, different response handlers, different recovery. They drifted, and every drift was a bug: a leaked-tool-call fix that landed only in the coder let `light_reasoner` leaks slip through; context-overflow handling existed in the coder and not the reasoner. The split also assumed "reasoner = no tools," which is wrong — a reasoner often needs to fetch docs to ground its reasoning.
+
+**What we do:** there is now **one** local streaming path. Coder and reasoner run the same body — streaming, leak recovery (§21), rumination detection (§19), completion gating (§10), and overflow self-correction (below) — with the **same full tool set** (coding tools + `read_file` + edit tools). A reasoning model is a coding model with a different temperament, not a different capability, so every local role is a full coder. The **only behavioral difference** is one bit, `role_text_is_product(role)`:
+
+| | tools | text is a valid completion? |
+|---|---|---|
+| **coder** | full set | **no** — must take an action |
+| **reasoner** | full set (identical) | **yes** — text (analysis/answer/plan) can be the turn's product; finishes unless it *bailed* |
+
+Everything else that makes a "reasoner" a reasoner — temperature, `reasoning` budget, `max_tokens` ("room to explore") — is **per-endpoint config** in its `[models.light_reasoner]` block, not behavior. A fix to the shared path now *cannot* land in only one of the two, and a coding task classified as reasoner is served by a full coder (which is why the old reasoner→coder route override was removed).
+
+### Context-overflow self-correction
+
+When the prompt's *real* tokenization exceeds the server's context window (the trimmer's estimate undercounts dense content like addresses/JSON/code by up to ~1.6×), llama.cpp returns a 400 `exceed_context_size_error` with the actual `n_prompt_tokens` and `n_ctx`. Rather than treat that as a dead stream and fail over to a tools-less role (which is how a truncated tool call once leaked as text), the path **re-trims to the server's real numbers and retries the same endpoint** — scaling the budget by how far it overshot. Context maxing out degrades gracefully instead of crashing the turn.
+
+**Code:**
+- One path + role profile: [codex-rs/core/src/local_routing.rs](../../codex-rs/core/src/local_routing.rs) — `local_role_profile`, `build_local_tools`, `synthetic_local_read_tools`.
+- Overflow signal + self-correction: [codex-rs/routing/src/ollama.rs](../../codex-rs/routing/src/ollama.rs) — `SendError::ContextOverflow`, `classify_send_error`; the re-trim/retry loop in `try_local_model`.
+- Read tool: [codex-rs/routing/src/tool_aliases.rs](../../codex-rs/routing/src/tool_aliases.rs) — `normalize_read_file_call`.
+
+**Log signal:** `Coder prompt overflowed server context — re-trimming smaller and retrying same endpoint` and `Passing tool set to local model … text_is_product=…`
+
+---
+
+## 25. Tool-call constraint (`tool_choice`)
+
+**Problem:** With `tools` attached but no `tool_choice`, the OpenAI default is `"auto"` — and on llama.cpp that means **the tool-call format is unconstrained**. The model generates freely and the server parses a tool call out of the result *after the fact* (via `--jinja`). When the model's output doesn't match the template (the XML dialect, fenced JSON, a malformed heredoc, an assistant prefill), the parse fails and it leaks. Every format bug in §21–§23 happens under this default. It is the *baseline* most people get with a local model + tools, and it's the regime where small models are unusable for agentic work.
+
+Confirmed on the test server (llama.cpp b8881): a request with `tool_choice: "required"` comes back with a clean structured `tool_calls` and empty content — no leak, no fence, no XML. The server genuinely grammar-constrains a valid call when told to. So the lever is real; the only question is *when* to pull it.
+
+**The naive way is wrong.** Setting `"required"` as a blanket per-role default forces a tool call on *every* turn — the model can never answer in text or signal "done", so the agentic loop never terminates naturally. Same trap whether set statically or keyed off the classifier's `tools_potential` (which stays true for a whole coding task).
+
+**What we do — enforce on the retry, not the turn.** The constraint is applied *exactly* where the model has already failed: when the completion verifier / rumination / quality escalation re-prompts an actor role that gave us a no-tool-call response we rejected (§7, §11, §12), the retry is sent with `tool_choice="required"`. This turns the existing "your entire next message must be a single tool call" *prose* nudge into a *sampler-enforced* one. It is scoped to the retry (a fresh turn starts clean), so normal text-completion and natural termination are never blocked. Reasoners (`text_is_product`) are never forced — their text is the product. Gate: `enforce_tool_call_on_retry(continuation_count > 0 && use_tools && !text_is_product && operator_tool_choice.is_none())`.
+
+**Large writes (the other half).** The hardest format failure isn't *which* tool but the **JSON-string escaping of large/multiline file content** — a 9B dumps the file with raw newlines and bare double-quotes, so `serde_json` rejects the whole `write_file` object and the write is lost. The fix is to **tolerate the model's known limitation, not re-prompt it to "escape better"** (it can't):
+
+1. `write_file`/`create_file` have **real handlers** (`handlers/write_file.rs`) — the model sees its own tool, not a translated `shell printf` it misreads as mangled.
+2. When the args don't parse, `translate_one_native_call` calls `tool_aliases::recover_write_file_args` to pull `path` + `content` out of the raw text and rebuild a clean `{path, content}` object (content is taken verbatim between its opening quote and the last quote before `}`; recognized escapes are still decoded, so raw, escaped, and mixed all work). The handler then writes the file normally — no retry, no dead-end.
+3. The `surviving_untranslated_synthetic` re-prompt now applies **only to the genuinely translated synthetics** (`edit_file`/`read_file`/`str_replace`/`cat_file`), which have no real handler to fall back to. **Regression fixed:** `write_file`/`create_file` were left in that list after gaining handlers, so *every* `write_file` call was flagged "malformed args" and re-prompted instead of dispatching — the source of a flood of `write_file arguments were malformed JSON` nudges.
+
+When a re-prompt *does* fire (the translated synthetics), it routes through `enforce_tool_call_on_retry` so the retry is grammar-constrained.
+
+**Operator override.** A per-endpoint `tool_choice` config field (`[models.*]`) still exists and always wins over the dynamic logic: set `"required"` to constrain unconditionally (for A/B experiments — expect the termination caveat), or a function name to force a specific tool. Unset = the dynamic enforce-on-retry behavior above.
+
+**Why it matters (and the paper hook):** format discipline is where a 9B bleeds most; enforcing it at the source on the exact turns the model stalls collapses §21–§23 from load-bearing to fallback, without sacrificing the text-completion path. The clean A/B — **bail-recovery success rate, prose-nudge vs sampler-enforced** — is a quantifiable result. (A further refinement — a "free text **or** valid call" union GBNF applied to *every* turn — would constrain without the retry indirection, but the server's lazy grammar on `"auto"` isn't firing here, so that's future work.)
+
+**Code:** [codex-rs/core/src/local_routing.rs](../../codex-rs/core/src/local_routing.rs) — `enforce_tool_call_on_retry` + the per-retry endpoint override in the coder loop; [config.rs](../../codex-rs/routing/src/config.rs) — `OllamaEndpoint::tool_choice` (operator override); [ollama.rs](../../codex-rs/routing/src/ollama.rs) — sent in `build_stream_payload` / `build_chat_payload` only when tools are present. Lives in `codex-routing` + the loop driver, so it travels into the [nudge service](nudge-service.md).
+
+---
+
+## 26. Loop detection beyond consecutive-identical
+
+**Problem:** The hard repetition guard (`ToolRepetitionGuard`) only counts *consecutive byte-identical* tool calls and resets on any change. The Ada-handle session thrashed for 14 minutes — 19 `apply_patch`, 37 `exec`, the same "I see the issue… let me fix" preamble ~18× — and **nothing fired**, because the loop was a *cycle* (patch→test→cat→patch) and the edits/preambles varied just enough to keep resetting the counter. The user had to interrupt it.
+
+**What we do:** a session-scoped [`LoopDetector`](../../codex-rs/routing/src/loop_detector.rs) with three productivity-gated detectors:
+- **(a) repeated assistant text** — normalizes each turn-ending message to a content-token preamble (lowercase, apostrophes folded, stopwords dropped, light suffix-stem) and trips when the same preamble recurs ≥3×. Catches confident restating that the rumination detector (self-doubt markers only) misses. Re-prompts at turn end, bounded by `MAX_LOOP_TEXT_REPROMPTS` so a stuck model is nudged a couple of times then allowed to stop.
+- **(b) cyclic tool pattern** — a ring of recent call signatures; trips when a period-2…4 cycle repeats ≥3×. Blocks the call at dispatch and tells the model to break the loop.
+- **(c) same-target near-identical edit** — per-path fingerprints of recent edit content; trips when one file gets ≥3 essentially-identical edits. Blocks at dispatch. **Productivity gate:** genuinely different edits (content changes) never trip — that's progress.
+
+**Why normalize for (a):** function words create a similarity floor (every sentence shares "the/a/is"), so stripping them + stemming makes "I see the issue… let me fix" and "Now I see an issue… I'll fix" collapse to the same fingerprint. See the design discussion on stopword/stemming trade-offs.
+
+**Code:** `loop_detector.rs` (pure logic + tests); wired via `Session::note_loop_tool_call` (in `tools/router.rs`, beside the hard guard) and `Session::note_loop_assistant_text` (in `codex.rs`, at the turn-ending branch before the dangling-intent guard).
+
+**Log signal:** `Blocking agentic loop (cycle/same-target guard)` / `Model is repeating itself without progress; re-prompting`.
+
+---
+
+## 27. Servability guarantees (no dead-end turns)
+
+Three fixes ensure a long or struggling session degrades gracefully instead of dead-ending:
+
+- **`apply_patch` Add-on-existing errors.** `*** Add File` on a path that already exists used to silently overwrite and report success — which let a weak model "re-create" a file forever, getting positive feedback each time (the Ada-handle loop). It now errors with *"Cannot add X: it already exists. Use `*** Update File`"*, preserving the file. [apply-patch/src/lib.rs](../../codex-rs/apply-patch/src/lib.rs).
+- **`local_only` chains keep a local backup.** Stripping cloud roles could collapse a chain to a single local entry (`reasoning = [light_reasoner, cloud_*]` → `[light_reasoner]`), so one failure killed the turn. Since coder and reasoner now share the full-tool path, the chain build appends the other local role as a backup. [local_routing.rs](../../codex-rs/core/src/local_routing.rs).
+- **Overflow-trim drops oldest turns.** `enforce_token_budget` only truncates tool data; a long single turn's protected assistant bulk can exceed the window on its own, leaving an oversized prompt the overflow-retry loop can't fix (the real root of the "reasoning chain exhausted" deaths). The trimmer now drops the oldest messages (front-first, recent context preserved) until the prompt fits. See §24. [trim/mod.rs](../../codex-rs/routing/src/trim/mod.rs).
+
+---
+
+## 28. System-prompt budget
+
+**Problem:** The base system prompt is sent in the chat `system` field and was **never trimmed** (the "system is never stubbed" invariant). Codex's is ~9k real tokens; in a 32k local window that's a third of the budget gone before any conversation — a fixed, un-shrinkable floor that forces overflow on long sessions. And it's not Codex-specific: once this is a harness-agnostic service, *any* harness's system prompt lands in that field.
+
+**What we do:** a configurable `[routing] system_budget_pct` (default **20**, `0` disables) caps the system prompt's share of `trim_budget`. Over budget, two tiers compress it:
+- **(2) Cached LLM summary (primary).** `maybe_summarize_system` routes the oversized prompt through the **compaction track** (`compactor` role, falling back per the `compaction` chain), instructed to *preserve every rule / constraint / tool / output-format directive verbatim and drop only prose and examples*. Keyed by a content hash in a global cache, so the same prompt is summarized **once** and reused across requests/sessions — the right shape for a service. Falls back to ↓ if the compactor is unreachable or the summary didn't shrink.
+- **(1) Deterministic head/tail elision (floor).** In `trim_for_local` (pure): keep the head (role/framing) + tail (output rules), elide the middle with a marker. Always available, offline-capable, and hard-enforces the budget even if the LLM summary overshoots.
+
+The prompt's freshly-generated state prelude is always preserved on top, and the compaction *request* itself leaves its own system prompt uncompressed (full fidelity for the summarizer).
+
+**Why generic, not a smaller Codex prompt:** hardcoding a leaner prompt fixes only this fork; bounding *whatever arrives* in the trim layer is what makes the harness reusable.
+
+**Code:** [trim/mod.rs](../../codex-rs/routing/src/trim/mod.rs) — `compress_system_prompt` + the `system_budget_pct` plumbing; [local_routing.rs](../../codex-rs/core/src/local_routing.rs) — `maybe_summarize_system` / `summarize_system_via_compactor` + `SYSTEM_SUMMARY_CACHE`. **Config:** `[routing] system_budget_pct`.
+
+**Log signal:** `Compressed oversized system prompt via compaction track (cached)`.
 
 ---
 

@@ -270,6 +270,18 @@ async fn apply_hunks_to_files(
         let path_abs = hunk.resolve_path(cwd);
         match hunk {
             Hunk::AddFile { contents, .. } => {
+                // `*** Add File` must create a NEW file. If the path already
+                // exists, silently overwriting it both destroys data and lets a
+                // weak model spin: it keeps "creating" the file via Add, gets a
+                // success every time, and never learns it should use Update —
+                // exactly the loop seen in the Ada-handle session. Error out with
+                // a directive instead.
+                if fs.get_metadata(&path_abs).await.is_ok() {
+                    anyhow::bail!(
+                        "Cannot add {}: it already exists. Use `*** Update File` to modify it.",
+                        affected_path.display()
+                    );
+                }
                 if let Some(parent_abs) = path_abs.parent() {
                     fs.create_directory(&parent_abs, CreateDirectoryOptions { recursive: true })
                         .await

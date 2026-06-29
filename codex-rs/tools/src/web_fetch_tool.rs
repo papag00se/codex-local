@@ -27,12 +27,26 @@ pub fn create_web_fetch_tool() -> ToolSpec {
                     .to_string(),
             )),
         ),
+        (
+            "find".to_string(),
+            JsonSchema::string(Some(
+                "Optional. Jump straight to the part of the page you need: a keyword or field name (e.g. \"handles/{handle}\" or \"authentication\"). Returns a small, in-context slice — for JSON/YAML the matching section with its path and any referenced schema inlined; for text the matching section. Prefer this over reading the whole page when you know what you're looking for."
+                    .to_string(),
+            )),
+        ),
+        (
+            "cursor".to_string(),
+            JsonSchema::string(Some(
+                "Optional. If a previous fetch said \"More remains\", pass the cursor token it gave you (copy it verbatim) with the SAME url to read the next page."
+                    .to_string(),
+            )),
+        ),
     ]);
 
     ToolSpec::Function(ResponsesApiTool {
         name: WEB_FETCH_TOOL_NAME.to_string(),
         description:
-            "Fetch a web page over HTTP(S) and return the response body as text. Use this to read the content of a specific URL (e.g. documentation, a blog post, an API endpoint) without running curl in a shell. Text-like content types (HTML, JSON, XML, plain text) are returned verbatim up to a 512KB cap; binary responses are replaced with a placeholder."
+            "Fetch a web page over HTTP(S) and return its content as text. Use this to read a specific URL (documentation, a blog post, an API spec) without running curl. Large pages are cleaned (HTML stripped to text, JSON/YAML minified) and returned one page at a time; if more remains you'll get a `cursor` token to continue. When you know what you're looking for, pass `find=\"<keyword>\"` to jump straight to the relevant section instead of paging."
                 .to_string(),
         strict: false,
         defer_loading: None,

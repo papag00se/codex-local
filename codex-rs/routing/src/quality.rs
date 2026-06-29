@@ -47,16 +47,33 @@ pub fn check_response_quality(response_text: &str, prompt_text: &str) -> Option<
         }
     }
 
-    // Excessive repetition (model stuck in a loop)
+    // Excessive repetition (model stuck in a loop). Split on a char boundary
+    // near byte 100 — a raw `text[..100]` slice panics when 100 lands inside a
+    // multi-byte UTF-8 sequence.
     if text.len() > 200 {
-        let first_100 = &text[..100];
-        let rest = &text[100..];
-        if rest.contains(first_100) {
+        let split = text
+            .char_indices()
+            .map(|(i, _)| i)
+            .find(|&i| i >= 100)
+            .unwrap_or(text.len());
+        let (first, rest) = text.split_at(split);
+        if !first.is_empty() && rest.contains(first) {
             return Some("repetition detected".into());
         }
     }
 
     None
+}
+
+/// Re-prompt to inject when a local response is discarded by
+/// [`check_response_quality`]. Names the specific defect so the model corrects
+/// it rather than reproducing it.
+pub fn quality_continuation_prompt(reason: &str) -> String {
+    format!(
+        "Your previous response was rejected: {reason}. \
+         Do not repeat it. Produce a proper response now — either call the appropriate tool to make progress, \
+         or give a substantive, complete answer to the user's request."
+    )
 }
 
 #[cfg(test)]

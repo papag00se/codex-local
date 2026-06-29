@@ -188,19 +188,24 @@ fn test_apply_patch_cli_move_overwrites_existing_destination() -> anyhow::Result
 }
 
 #[test]
-fn test_apply_patch_cli_add_overwrites_existing_file() -> anyhow::Result<()> {
+fn test_apply_patch_cli_add_to_existing_file_fails() -> anyhow::Result<()> {
+    // `*** Add File` on an existing path must FAIL (use Update File instead),
+    // not silently overwrite — silent overwrite destroys data and lets a weak
+    // model loop on "create file" forever.
     let tmp = tempdir()?;
     let path = tmp.path().join("duplicate.txt");
     fs::write(&path, "old content\n")?;
 
-    run_apply_patch_in_dir(
-        tmp.path(),
-        "*** Begin Patch\n*** Add File: duplicate.txt\n+new content\n*** End Patch",
-    )?
-    .success()
-    .stdout("Success. Updated the following files:\nA duplicate.txt\n");
+    apply_patch_command(tmp.path())?
+        .arg("*** Begin Patch\n*** Add File: duplicate.txt\n+new content\n*** End Patch")
+        .assert()
+        .failure()
+        .stderr(
+            "Cannot add duplicate.txt: it already exists. Use `*** Update File` to modify it.\n",
+        );
 
-    assert_eq!(fs::read_to_string(&path)?, "new content\n");
+    // Original content is untouched.
+    assert_eq!(fs::read_to_string(&path)?, "old content\n");
 
     Ok(())
 }

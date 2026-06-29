@@ -177,6 +177,15 @@ pub(crate) enum AppEvent {
     /// Result of computing a `/stats` command (routing metrics).
     StatsResult(String),
 
+    /// Live routing readout (current model class + tokens/sec) for the status
+    /// line while a turn is running. `None` clears it.
+    RouteReadout(Option<String>),
+
+    /// A local-model guard ("nudge") fired — repetition/rumination guard,
+    /// quality gate, or completion verifier re-prompting. Rendered as a
+    /// dim history line so the intervention is visible.
+    RouteNotice(String),
+
     /// Open the app link view in the bottom pane.
     OpenAppLink {
         app_id: String,

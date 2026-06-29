@@ -12,7 +12,7 @@ Three execution backends:
 
 | Route | Backend | Tool support | Default model |
 |-------|---------|-------------|---------------|
-| `local_coder` | Ollama | Structured tool calls (with devstral recovery) | `qwen3-coder:30b-a3b-q4_K_M` |
+| `local_coder` | Ollama | Structured tool calls (with leaked-tool-call recovery — Hermes/XML/malformed) | `qwen3-coder:30b-a3b-q4_K_M` |
 | `local_reasoner` | Ollama | Plain text only (no tool surface) | `qwen3:14b` |
 | `codex_cli` | Codex CLI subprocess | Full Codex tool loop | `gpt-5.4` via `openai` provider |
 
@@ -244,24 +244,26 @@ This ensures only one request hits each Ollama instance at a time. Ollama strugg
 
 ## Tool call recovery for local models
 
-Local models (especially devstral and qwen3-coder) sometimes emit tool calls as embedded JSON in their text output instead of using the structured tool_calls field. The tool adapter recovers these:
+Local models routinely emit tool calls as **text** instead of the structured `tool_calls` field — the server's chat template (even `--jinja`) doesn't recognize the finetune's format. The Rust implementation is `codex_routing::tool_recovery::recover_tool_calls`, the **single** recovery entry point shared by the coder path (`light_coder`) and the reasoner path (`light_reasoner`). (It previously existed as two divergent implementations plus a buried third; a format fix that landed in only one let `light_reasoner` leaks slip through. Unified — see [Local Coder Massaging §21](local-coder-massaging.md).)
 
-### Recovery strategy (`recover_ollama_message`)
+### Recovery strategy (`recover_tool_calls`)
 
 ```
-1. If message already has tool_calls → return as-is
-2. Try parsing entire content as a JSON blob (stripping ``` fences)
-   - If it contains a "tool_calls" key → extract and normalize
-3. If that fails, try recovering embedded tool blocks:
-   - Split content by double-newline into paragraphs
-   - For each paragraph:
-     - Strip [USER]/[ASSISTANT] prefixes
-     - Try parsing as JSON
-     - If JSON has type="tool_use" and name → extract as tool call
-     - If JSON has type="tool_result" → drop (it's echoed context)
-     - Otherwise keep as text
-4. Return cleaned text + recovered tool calls
+1. If message already has structured tool_calls → return as-is
+2. Strategy 0 — leaked <tool_call> blocks (via tool_aliases::parse_leaked_tool_calls):
+   - Hermes JSON:   <tool_call>{"name":..,"arguments":{..}}</tool_call>
+   - XML-function:  <tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>
+                    (also <function name="NAME">; numerics coerced; multi-line cmds preserved)
+   - Malformed:     a <tool_call> block whose JSON won't parse → detected, NOT executed;
+                    caller re-prompts to re-issue cleanly (prefer write_file over heredocs)
+3. Strategy 1 — whole content as a JSON blob (stripping ``` fences); "tool_calls" key → normalize
+4. Strategy 2 — embedded tool blocks: split by double-newline; per paragraph,
+   strip [USER]/[ASSISTANT] prefixes, parse JSON; type="tool_use"+name → tool call;
+   type="tool_result" → drop (echoed context); else keep as text
+5. Return cleaned text + recovered tool calls
 ```
+
+The coder path bridges the recovered `ToolCall`s to the Ollama wire shape (`tool_call_to_wire` → `translate_native_tool_calls`) so recovered and structured calls share the same normalization + shell-alias translation; the reasoner path emits them directly. Either way there is exactly one recovery pass.
 
 ### Streaming recovery (`recover_stream_ollama_message`)
 

@@ -18,6 +18,7 @@ Local coder models in the 4–30B range fail in characteristic, *predictable* wa
 - **Announce-without-act** — "I will update the imports and run the tests" with no tool call. Codex sees no tool call, ends the turn, the user is left holding a half-done task.
 - **Rumination** — thinking-only models can spiral on the reasoning channel for ten minutes and emit empty output.
 - **Context blindness** — they forget a file changed two turns ago and patch against the stale version.
+- **Format leaks** — they emit a tool call as plain *text* (`<tool_call>{…}</tool_call>`, or the XML `<function=…><parameter=…>` form) instead of a structured call, or wrap a control-model JSON verdict in a ```json fence. The harness sees no tool call / can't parse the verdict, so the action — or the routing decision — silently vanishes.
 
 Each of these has a fix. None of them are "wait for better models." All of them are layered between the model and Codex's tool dispatch so the existing harness code is unchanged.
 
@@ -46,11 +47,13 @@ A short tour of the interventions. Full catalog with code links lives in [docs/s
 
 - **Trim transcript for local context windows.** Active turn preserved verbatim; older turns collapsed into a synthesized state prelude (files seen, files modified, tests run, errors encountered); stale reads dropped; superseded outputs dropped; **errors are sticky** so the model can't forget a failure.
 - **Live-on-disk file pin.** Files modified in the active turn get pinned at the top of the prelude with current contents (capped at 10 KB, with hash + line count). Stops the "patch fails because the model is reasoning from a stale read" loop.
-- **Repetition alert (two flavors).** Same `(tool_name, args_hash)` 3× in a row → `[STOP — REPETITION DETECTED]` block in the next prelude with the actual error excerpt and a directive to change approach. Same *file path* failing 3× with different commands → same STOP block. Catches both exact-loop and "keep trying different ways to read the same broken file" loops.
+- **Repetition alert (three flavors, productivity-gated).** Same `(tool_name, args_hash)` 3× in a row → `[STOP — REPETITION DETECTED]`. Same *file path* failing 3× with different commands → `[NO PROGRESS — DIAGNOSE]` forced-diagnosis. Same signature recurring *interleaved* with other work (the "run the test, edit, run again, never passing" loop) → forced-diagnosis too — but **only failing recurrences count**, so a now-passing test or a routine `ls` / `git status` re-run doesn't trip it. Past the escalation threshold the loop's calls + outputs are **excised from context** so the model can't copy them back out, and the prelude reframes to "you're stuck."
 
 ### Generation-time guards
 
-- **Bail detector / completion verifier.** After every Coder response, if there's text but zero tool calls, route the response through a small judge prompt (BAIL vs COMPLETE). On BAIL, inject a continuation message ("you announced an action but did not take it — either take it, restate the concrete result, or explain why you can't proceed") and re-call. Up to 3 retries. **Code blocks are explicitly never actions** unless the same content was passed to `apply_patch` or `shell`.
+- **Bail detector / completion verifier (escalating + ground-truth-gated).** After every Coder response with text but zero tool calls, route it through a small judge prompt (BAIL vs COMPLETE). On BAIL, inject a continuation message and re-call; if the model keeps explaining instead of acting, the nudge **escalates** to "STOP EXPLAINING — your entire next message must be a single tool call." Up to 3 retries. The judge is weak, so completion is also **ground-truth-gated**: a coder turn only ends if it actually changed files or the judge confirms COMPLETE. And a second, **deterministic** guard in core (`run_turn`) catches "Let me fix the handler:"-style announce-without-act with no judge at all — high-precision, route-agnostic, so it covers cloud routes too. **Code blocks are never actions** unless passed to `apply_patch` / `shell`.
+- **Leaked tool-call recovery.** When a model emits a tool call as text — Hermes `<tool_call>` JSON, the XML `<function=…>` dialect, or fenced JSON — a single recovery pass promotes it to a real, executed call and strips it from the visible text, instead of the action vanishing. Malformed blocks (e.g. an unescaped heredoc) are detected and re-prompted rather than silently dropped. One shared implementation across the coder and reasoner paths, so a format fix can't land in only one.
+- **Fenced-JSON tolerance for control models.** The classifier and verifier extract the JSON object (first `{` to last `}`) before parsing, so a model that wraps its verdict in a ```json fence doesn't silently break routing (chain-exhausted every turn) or let dangling turns finish.
 - **Rumination guard (streaming).** A streaming-time phrase-counter watches the reasoning channel for 23 self-doubt markers (`actually`, `wait`, `hmm`, `let me reconsider`, `or maybe`, `scratch that`, ...). After half the token budget is burned, ≥6 markers triggers an in-flight abort (drops the SSE receiver, signals the server to stop generating, frees the slot) and a re-prompt telling the model to pick the simplest next step and take it. Same 3-retry cap as the bail detector.
 - **Streaming tool-call assembly** — the tool-aware path is fully streaming so the rumination watcher can see reasoning as it happens, with a unified `StreamChunk` enum across Ollama NDJSON and OpenAI SSE.
 
@@ -105,6 +108,20 @@ Reports per-session routing decisions, local vs cloud token counts, and approxim
 If you have cloud credentials too, the same `config.toml` can declare cloud roles and a failover chain. A small classifier picks a route per request (fast / mini / reasoner / coder, weighted across providers); failures (rate limits, timeouts, quota, auth, quality, context overflow) are classified F1–F8 and either retried with backoff or walked down the chain. Anthropic dispatch routes through the local Claude CLI binary so subscription auth Just Works.
 
 This is genuinely useful — it'll keep a heavy task on your subscription's preferred model and shove cheap stuff to local — but it's not the main reason this fork exists. The main reason is everything in the section above. If you want the routing internals: [orchestrator/README.md](orchestrator/README.md) and the specs under [docs/spec/](docs/spec/).
+
+---
+
+## Multi-agent supervisor (optional)
+
+Beyond per-request routing, the fork adds a **`supervisor` tool** for goals too big for one turn. The model calls `supervisor(goal, verification_command?)`; control then stays inside a **deterministic loop** (the model is blocked on the tool call, so it can't bail mid-run) that:
+
+1. **Plans** — decomposes the goal into a task list.
+2. **Dispatches** — spawns a specialist sub-agent per task and waits for completion.
+3. **Evaluates** — judges whether each task is actually done.
+4. **Verifies** — runs `verification_command` (e.g. `pytest tests/`) and interprets the result.
+5. **Retries** failures, bounded by `[supervisor] max_iterations / max_retries_per_task / timeout_seconds`.
+
+Specialist behavior is config-driven via `[roles.coder]`, `[roles.reviewer]`, `[roles.test_runner]` (each an `instructions` + `nickname`). Planning and evaluation honor the configured `[failover]` `planning` / `evaluation` chains — so in `local_only` mode the judgment calls run on local models (`light_reasoner` → backup), and simple goals plan locally while complex ones can plan on a stronger cloud model. Details: [supervisor-integration.md](docs/spec/supervisor-integration.md) and [agent-taxonomy.md](docs/spec/agent-taxonomy.md).
 
 ---
 

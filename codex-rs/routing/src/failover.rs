@@ -30,6 +30,11 @@ pub enum FailureType {
     QualityFailure,
     /// F8: Request too large for model's context window.
     ContextOverflow,
+    /// F9: A role in the failover chain couldn't be resolved — e.g. a cloud role
+    /// skipped under `local_only`, or a chain referencing an undefined/disabled
+    /// role. Benign: walk the chain. This is NOT a server "model not found" (404)
+    /// and must not be reported as a config error about a model name.
+    RoleUnresolvable,
 }
 
 /// What the failover executor decided to do.
@@ -166,6 +171,20 @@ pub fn decide_action(
                 chain_name,
                 chain,
                 "model not found (config error?)",
+            )
+        }
+        FailureType::RoleUnresolvable => {
+            // Not a model/name error — a role just didn't resolve (cloud skipped
+            // under local_only, or an undefined/disabled role in the chain).
+            info!(
+                role = current_model_role,
+                "Role not resolvable (cloud disabled by local_only, or unconfigured) — walking chain"
+            );
+            walk_chain(
+                current_model_role,
+                chain_name,
+                chain,
+                "role not resolvable (cloud disabled or unconfigured)",
             )
         }
         FailureType::QualityFailure => walk_chain(

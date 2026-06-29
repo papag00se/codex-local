@@ -4,6 +4,10 @@
 //! crate's `ProjectConfig`) on each invocation. The lookup is cheap; we
 //! re-read so config edits take effect without restarting Codex.
 
+use codex_protocol::models::WebSearchAction;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::WebSearchBeginEvent;
+use codex_protocol::protocol::WebSearchEndEvent;
 use codex_routing::local_web_search;
 use codex_routing::project_config::ProjectConfig;
 use serde::Deserialize;
@@ -35,7 +39,13 @@ impl ToolHandler for LocalWebSearchHandler {
     }
 
     async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
-        let ToolInvocation { payload, .. } = invocation;
+        let ToolInvocation {
+            session,
+            turn,
+            call_id,
+            payload,
+            ..
+        } = invocation;
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
@@ -61,7 +71,33 @@ impl ToolHandler for LocalWebSearchHandler {
             .count
             .unwrap_or(project_config.search.results_per_query);
 
-        match local_web_search::search(&api_key, query, count, args.user_agent.as_deref()).await {
+        // Surface the search in the UI (reusing the web-search cell) so the user
+        // can see when the model reaches the network.
+        session
+            .send_event(
+                turn.as_ref(),
+                EventMsg::WebSearchBegin(WebSearchBeginEvent {
+                    call_id: call_id.clone(),
+                }),
+            )
+            .await;
+        let result =
+            local_web_search::search(&api_key, query, count, args.user_agent.as_deref()).await;
+        session
+            .send_event(
+                turn.as_ref(),
+                EventMsg::WebSearchEnd(WebSearchEndEvent {
+                    call_id: call_id.clone(),
+                    query: query.to_string(),
+                    action: WebSearchAction::Search {
+                        query: Some(query.to_string()),
+                        queries: None,
+                    },
+                }),
+            )
+            .await;
+
+        match result {
             Ok(results) => Ok(FunctionToolOutput::from_text(
                 local_web_search::format_results(query, &results),
                 Some(true),

@@ -796,6 +796,9 @@ pub(crate) struct ChatWidget {
     /// This is kept separate from `mcp_startup_status` so that MCP startup progress (or completion)
     /// can update the status header without accidentally clearing the spinner for an active turn.
     agent_turn_running: bool,
+    /// Gate for the background task that polls the live routing readout
+    /// (current model class + tokens/sec) while a turn is running.
+    route_readout_poll: Arc<AtomicBool>,
     /// Tracks per-server MCP startup state while startup is in progress.
     ///
     /// The map is `Some(_)` from the first `McpStartupUpdate` until `McpStartupComplete`, and the
@@ -1668,6 +1671,12 @@ impl ChatWidget {
     fn update_task_running_state(&mut self) {
         self.bottom_pane
             .set_task_running(self.agent_turn_running || self.mcp_startup_status.is_some());
+        // Poll the live routing readout only during an active agent turn.
+        if self.agent_turn_running {
+            self.start_route_readout_poll();
+        } else {
+            self.stop_route_readout_poll();
+        }
         self.refresh_terminal_title();
     }
 
@@ -2270,6 +2279,48 @@ impl ChatWidget {
     }
 
     // Raw reasoning uses the same flow as summarized reasoning
+
+    /// Mirror the live routing readout into the status row.
+    pub(crate) fn set_route_readout(&mut self, readout: Option<String>) {
+        self.bottom_pane.set_route_readout(readout);
+    }
+
+    /// Render a local-model guard ("nudge") notice as a durable history line.
+    pub(crate) fn add_route_notice(&mut self, message: String) {
+        self.add_to_history(history_cell::new_local_nudge_notice(message));
+    }
+
+    /// Begin polling the routing layer for the live readout (current model
+    /// class + tokens/sec) while a turn runs. No-op if already polling, or if
+    /// routing is inactive (the readout simply stays `None`).
+    fn start_route_readout_poll(&self) {
+        let gate = self.route_readout_poll.clone();
+        if gate
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            while gate.load(Ordering::Relaxed) {
+                let readout = codex_core::local_routing::live_readout().await;
+                tx.send(AppEvent::RouteReadout(readout));
+                // Surface any guard interventions that fired since the last tick
+                // as durable history lines.
+                for notice in codex_core::local_routing::drain_route_notices().await {
+                    tx.send(AppEvent::RouteNotice(notice));
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        });
+    }
+
+    /// Stop the live-readout poll and clear the status-line readout.
+    fn stop_route_readout_poll(&mut self) {
+        self.route_readout_poll.store(false, Ordering::Release);
+        self.set_route_readout(None);
+    }
 
     fn on_task_started(&mut self) {
         self.agent_turn_running = true;
@@ -4647,6 +4698,7 @@ impl ChatWidget {
             task_complete_pending: false,
             unified_exec_processes: Vec::new(),
             agent_turn_running: false,
+            route_readout_poll: Arc::new(AtomicBool::new(false)),
             mcp_startup_status: None,
             pending_turn_copyable_output: None,
             mcp_startup_expected_servers: None,

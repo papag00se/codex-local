@@ -16,6 +16,41 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
 use tracing::warn;
 
+/// Why a request to the local server failed to start, distinguishing the one
+/// case the caller can recover from — the prompt exceeding the server's context
+/// window — from everything else (connection, timeout, other 4xx/5xx).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendError {
+    /// The server rejected the request because the tokenized prompt exceeds its
+    /// context window. Carries the server's own numbers so the caller can
+    /// re-trim to fit and retry instead of crashing.
+    ContextOverflow { n_ctx: u64, n_prompt_tokens: u64 },
+    /// Any other failure — connection refused/reset, timeout, auth, a different
+    /// 4xx/5xx. Not recoverable by re-trimming.
+    Other,
+}
+
+/// Classify a non-success response body. llama.cpp returns a 400 with
+/// `type=exceed_context_size_error` and the real `n_ctx` / `n_prompt_tokens`
+/// when the prompt is too large; surface those so the caller can self-correct.
+fn classify_send_error(status: u16, body: &str) -> SendError {
+    if status == 400 && body.contains("exceed_context_size_error") {
+        if let Ok(v) = serde_json::from_str::<JsonValue>(body) {
+            let err = v.get("error").unwrap_or(&v);
+            if let (Some(n_ctx), Some(n_prompt_tokens)) = (
+                err.get("n_ctx").and_then(JsonValue::as_u64),
+                err.get("n_prompt_tokens").and_then(JsonValue::as_u64),
+            ) {
+                return SendError::ContextOverflow {
+                    n_ctx,
+                    n_prompt_tokens,
+                };
+            }
+        }
+    }
+    SendError::Other
+}
+
 /// Per-endpoint semaphore to serialize Ollama requests.
 /// Ollama struggles with concurrent requests — this was discovered
 /// through testing in the coding-agent-router project.
@@ -80,6 +115,63 @@ impl OllamaClientPool {
             .await
     }
 
+    /// POST a request with bounded retries on *transient* failures, returning
+    /// the successful response (or `None`).
+    ///
+    /// Every local role points at the same server, so when that server
+    /// momentarily refuses a connection (single slot busy / checkpointing) or
+    /// returns a 5xx, failing over the chain can't route around it — the next
+    /// role hits the same server. Only retrying the same server recovers it, so
+    /// this lives at the pool layer where *every* local caller (coder, reasoner,
+    /// classifier, completion verifier, compaction, supervisor) benefits.
+    ///
+    /// Retried: connection-level errors (`is_connect`) and 5xx. NOT retried:
+    /// 4xx (e.g. context-overflow 400 — terminal, must escalate), timeouts (the
+    /// model is slow; the caller's failover handles that), and parse errors.
+    async fn send_with_retry(
+        &self,
+        url: &str,
+        payload: &JsonValue,
+        timeout_seconds: u64,
+        label: &str,
+    ) -> Result<reqwest::Response, SendError> {
+        const ATTEMPTS: usize = 3;
+        const BACKOFF_MS: u64 = 750;
+        for attempt in 0..ATTEMPTS {
+            let mut req = self.client.post(url).json(payload);
+            if timeout_seconds > 0 {
+                req = req.timeout(Duration::from_secs(timeout_seconds));
+            }
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => return Ok(resp),
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_server_error() && attempt + 1 < ATTEMPTS {
+                        warn!(label = %label, status = %status, attempt = attempt + 1,
+                            "transient 5xx from local server; retrying same server after backoff");
+                        tokio::time::sleep(Duration::from_millis(BACKOFF_MS)).await;
+                        continue;
+                    }
+                    let body = resp.text().await.unwrap_or_default();
+                    let snippet = body.chars().take(500).collect::<String>();
+                    warn!(label = %label, url = %url, status = %status, body = %snippet,
+                        "request returned non-success status");
+                    return Err(classify_send_error(status.as_u16(), &body));
+                }
+                Err(e) if e.is_connect() && attempt + 1 < ATTEMPTS => {
+                    warn!(label = %label, error = %e, attempt = attempt + 1,
+                        "transient connect error to local server; retrying same server after backoff");
+                    tokio::time::sleep(Duration::from_millis(BACKOFF_MS)).await;
+                }
+                Err(e) => {
+                    warn!(label = %label, url = %url, error = %e, "request error");
+                    return Err(SendError::Other);
+                }
+            }
+        }
+        Err(SendError::Other)
+    }
+
     /// Call the endpoint's chat completion API with optional tools.
     ///
     /// Branches internally on [`OllamaEndpoint::flavor`] to build the right
@@ -108,63 +200,40 @@ impl OllamaClientPool {
         let payload =
             build_chat_payload(endpoint, payload_messages, response_format, tools.as_ref());
 
-        let mut req = self.client.post(&url).json(&payload);
-        if endpoint.timeout_seconds > 0 {
-            req = req.timeout(Duration::from_secs(endpoint.timeout_seconds));
-        }
-        let result = req.send().await;
-
-        match result {
-            Ok(resp) => {
-                let status = resp.status();
-                let body_text = resp.text().await.unwrap_or_default();
-                if !status.is_success() {
-                    let snippet = body_text.chars().take(500).collect::<String>();
+        let resp = self
+            .send_with_retry(&url, &payload, endpoint.timeout_seconds, "chat")
+            .await
+            .ok()?;
+        let body_text = resp.text().await.unwrap_or_default();
+        match serde_json::from_str::<JsonValue>(&body_text) {
+            Ok(body) => {
+                // Some OpenAI-compat servers (and Ollama itself for some failure
+                // modes) return HTTP 200 with an `{"error": ...}` body instead
+                // of a real response. The translator would silently produce
+                // empty content, hiding the actual problem — surface it as a
+                // None so the caller's warn fires with the cause. (Not retried:
+                // a 200 error body is usually terminal, e.g. context overflow.)
+                if let Some(err) = body.get("error") {
+                    let snippet = err.to_string().chars().take(500).collect::<String>();
                     warn!(
                         url = %url,
-                        status = %status,
-                        body = %snippet,
-                        "chat request returned non-success status"
+                        error = %snippet,
+                        "chat response carried an error body — treating as failure"
                     );
                     return None;
                 }
-                match serde_json::from_str::<JsonValue>(&body_text) {
-                    Ok(body) => {
-                        // Some OpenAI-compat servers (and Ollama itself for
-                        // some failure modes) return HTTP 200 with an
-                        // `{"error": ...}` body instead of a real response.
-                        // The translator would silently produce empty
-                        // content, hiding the actual problem from the
-                        // caller — surface it as a None so the
-                        // try_local_model warn fires with the cause.
-                        if let Some(err) = body.get("error") {
-                            let snippet =
-                                err.to_string().chars().take(500).collect::<String>();
-                            warn!(
-                                url = %url,
-                                error = %snippet,
-                                "chat response carried an error body — treating as failure"
-                            );
-                            return None;
-                        }
-                        self.record_warm_model(&endpoint.base_url, &endpoint.model)
-                            .await;
-                        Some(translate_response_to_ollama_shape(body, endpoint.flavor))
-                    }
-                    Err(e) => {
-                        let snippet = body_text.chars().take(500).collect::<String>();
-                        warn!(
-                            url = %url,
-                            error = %e,
-                            body = %snippet,
-                            "chat response parse error"
-                        );
-                        None
-                    }
-                }
+                self.record_warm_model(&endpoint.base_url, &endpoint.model)
+                    .await;
+                Some(translate_response_to_ollama_shape(body, endpoint.flavor))
             }
             Err(e) => {
-                warn!("chat request error for {url}: {e}");
+                let snippet = body_text.chars().take(500).collect::<String>();
+                warn!(
+                    url = %url,
+                    error = %e,
+                    body = %snippet,
+                    "chat response parse error"
+                );
                 None
             }
         }
@@ -196,24 +265,10 @@ impl OllamaClientPool {
 
         let payload = build_stream_payload(endpoint, payload_messages, None);
         let url = build_chat_url(&endpoint.base_url, endpoint.flavor);
-        let mut req = self.client.post(&url).json(&payload);
-        if endpoint.timeout_seconds > 0 {
-            req = req.timeout(Duration::from_secs(endpoint.timeout_seconds));
-        }
-        let response = req.send().await.ok()?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            let snippet = body.chars().take(500).collect::<String>();
-            warn!(
-                url = %url,
-                status = %status,
-                body = %snippet,
-                "stream request returned non-success status"
-            );
-            return None;
-        }
+        let response = self
+            .send_with_retry(&url, &payload, endpoint.timeout_seconds, "stream")
+            .await
+            .ok()?;
 
         self.record_warm_model(&endpoint.base_url, &endpoint.model)
             .await;
@@ -241,9 +296,9 @@ impl OllamaClientPool {
         messages: Vec<JsonValue>,
         system: Option<&str>,
         tools: Option<Vec<JsonValue>>,
-    ) -> Option<tokio::sync::mpsc::Receiver<StreamChunk>> {
+    ) -> Result<tokio::sync::mpsc::Receiver<StreamChunk>, SendError> {
         let sem = self.semaphore_for(&endpoint.base_url).await;
-        let _permit = sem.acquire().await.ok()?;
+        let _permit = sem.acquire().await.map_err(|_| SendError::Other)?;
 
         let mut payload_messages = messages;
         if let Some(sys) = system {
@@ -252,24 +307,9 @@ impl OllamaClientPool {
 
         let payload = build_stream_payload(endpoint, payload_messages, tools.as_ref());
         let url = build_chat_url(&endpoint.base_url, endpoint.flavor);
-        let mut req = self.client.post(&url).json(&payload);
-        if endpoint.timeout_seconds > 0 {
-            req = req.timeout(Duration::from_secs(endpoint.timeout_seconds));
-        }
-        let response = req.send().await.ok()?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            let snippet = body.chars().take(500).collect::<String>();
-            warn!(
-                url = %url,
-                status = %status,
-                body = %snippet,
-                "tool-stream request returned non-success status"
-            );
-            return None;
-        }
+        let response = self
+            .send_with_retry(&url, &payload, endpoint.timeout_seconds, "tool-stream")
+            .await?;
 
         self.record_warm_model(&endpoint.base_url, &endpoint.model)
             .await;
@@ -279,7 +319,7 @@ impl OllamaClientPool {
             ClientFlavor::Ollama => spawn_ollama_stream_reader(response, tx),
             ClientFlavor::OpenAICompat => spawn_openai_sse_reader(response, tx),
         }
-        Some(rx)
+        Ok(rx)
     }
 }
 
@@ -288,20 +328,113 @@ impl OllamaClientPool {
 /// `stream_options: {include_usage: true}` so usage tokens arrive in the
 /// final SSE chunk. `tools` — when `Some` — is the same function-calling
 /// schema we pass on non-streaming calls.
+/// Apply optional sampler overrides (`top_p` / `top_k` / `repeat_penalty`) onto
+/// an Ollama `options` object or an OpenAI-compat top-level payload — llama.cpp
+/// accepts all three keys at the top level too. No-op for any value left unset,
+/// so the server default applies. Models like Gemma 4 degenerate at the stock
+/// sampler and need these set (see the per-role config fields).
+fn apply_sampler_overrides(target: &mut JsonValue, endpoint: &OllamaEndpoint) {
+    if let Some(v) = endpoint.top_p {
+        target["top_p"] = json!(v);
+    }
+    if let Some(v) = endpoint.top_k {
+        target["top_k"] = json!(v);
+    }
+    if let Some(v) = endpoint.repeat_penalty {
+        target["repeat_penalty"] = json!(v);
+    }
+}
+
+/// Normalize the outbound message list so the local server accepts it,
+/// regardless of how transcript trimming/loop-excision shaped it. Two rules,
+/// both enforcing the same invariant — *the list must not have, or end with,
+/// stray assistant messages*:
+///
+/// 1. **Merge consecutive `assistant` messages.** Some servers reject adjacent
+///    same-role messages ("Cannot have 2 or more assistant messages at the end
+///    of the list"). A run of consecutive assistants can't contain tool/result
+///    messages (different role), so merging is safe: concatenate text, union
+///    `tool_calls`; any tool results still follow and stay paired by id. Only
+///    `assistant` is touched (never `tool`/`user`, whose results carry ids).
+/// 2. **Drop a trailing `assistant` message.** A request ending in an assistant
+///    message is a "prefill", which servers reject when thinking is enabled
+///    ("Assistant response prefill is incompatible with enable_thinking"). In
+///    this harness the model always responds to a user/tool message, so a
+///    trailing assistant is always an artifact (e.g. a dangling tool-call left
+///    by loop excision) — drop it so the model responds fresh to the real last
+///    input. Never empties the list.
+fn normalize_outbound_messages(messages: Vec<JsonValue>) -> Vec<JsonValue> {
+    let is_assistant = |m: &JsonValue| m.get("role").and_then(|r| r.as_str()) == Some("assistant");
+    let mut out: Vec<JsonValue> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        if is_assistant(&msg) && out.last().is_some_and(is_assistant) {
+            merge_assistant_into_prev(out.last_mut().unwrap(), msg);
+        } else {
+            out.push(msg);
+        }
+    }
+    while out.len() > 1 && out.last().is_some_and(is_assistant) {
+        out.pop();
+    }
+    out
+}
+
+fn merge_assistant_into_prev(prev: &mut JsonValue, next: JsonValue) {
+    let JsonValue::Object(next_obj) = next else {
+        return;
+    };
+    let Some(prev_obj) = prev.as_object_mut() else {
+        return;
+    };
+    if let Some(next_content) = next_obj.get("content").and_then(|c| c.as_str())
+        && !next_content.is_empty()
+    {
+        let merged = match prev_obj.get("content").and_then(|c| c.as_str()) {
+            Some(p) if !p.is_empty() => format!("{p}\n{next_content}"),
+            _ => next_content.to_string(),
+        };
+        prev_obj.insert("content".to_string(), JsonValue::String(merged));
+    }
+    if let Some(JsonValue::Array(next_tc)) = next_obj.get("tool_calls")
+        && !next_tc.is_empty()
+    {
+        match prev_obj.get_mut("tool_calls") {
+            Some(JsonValue::Array(prev_tc)) => prev_tc.extend(next_tc.iter().cloned()),
+            _ => {
+                prev_obj.insert("tool_calls".to_string(), JsonValue::Array(next_tc.clone()));
+            }
+        }
+    }
+}
+
+/// Render a configured `tool_choice` for the wire. The keyword forms
+/// (`auto`/`none`/`required`/`any`) pass through as bare strings; anything else is
+/// treated as a TOOL NAME and emitted in OpenAI's object form so the server forces
+/// that specific tool (e.g. steering a stuck local model to `write_file`). Without
+/// this, a function name would be sent as an invalid bare string and ignored.
+fn tool_choice_payload(tc: &str) -> JsonValue {
+    match tc {
+        "auto" | "none" | "required" | "any" => json!(tc),
+        name => json!({ "type": "function", "function": { "name": name } }),
+    }
+}
+
 fn build_stream_payload(
     endpoint: &OllamaEndpoint,
     messages: Vec<JsonValue>,
     tools: Option<&Vec<JsonValue>>,
 ) -> JsonValue {
+    let messages = normalize_outbound_messages(messages);
     match endpoint.flavor {
         ClientFlavor::Ollama => {
             let mut options = json!({
                 "temperature": endpoint.temperature,
-                "num_ctx": endpoint.num_ctx,
+                "num_ctx": endpoint.trim_budget,
             });
             if let Some(n) = endpoint.max_tokens {
                 options["num_predict"] = json!(n);
             }
+            apply_sampler_overrides(&mut options, endpoint);
             let mut payload = json!({
                 "model": &endpoint.model,
                 "messages": messages,
@@ -322,11 +455,18 @@ fn build_stream_payload(
                 "temperature": endpoint.temperature,
                 "stream_options": {"include_usage": true},
             });
+            apply_sampler_overrides(&mut payload, endpoint);
             if let Some(n) = endpoint.max_tokens {
                 payload["max_tokens"] = json!(n);
             }
             if let Some(t) = tools {
                 payload["tools"] = json!(t);
+                // Constrain tool-call FORMAT at the source when configured (e.g.
+                // `"required"` makes llama.cpp grammar-enforce a valid call).
+                // Only meaningful when tools are present.
+                if let Some(tc) = &endpoint.tool_choice {
+                    payload["tool_choice"] = tool_choice_payload(tc);
+                }
             }
             payload
         }
@@ -381,20 +521,26 @@ fn spawn_ollama_stream_reader(
                 // Ollama emits any tool_calls atomically in the final chunk
                 // (not as per-arg-char deltas like OpenAI SSE). Forward them
                 // as one ToolCallDelta per call, with the full argument JSON.
-                if let Some(tool_calls) = msg.and_then(|m| m.get("tool_calls")).and_then(|tc| tc.as_array()) {
+                if let Some(tool_calls) = msg
+                    .and_then(|m| m.get("tool_calls"))
+                    .and_then(|tc| tc.as_array())
+                {
                     for (index, call) in tool_calls.iter().enumerate() {
                         let func = call.get("function").unwrap_or(call);
                         let name = func
                             .get("name")
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string());
-                        let args = func.get("arguments").map(|v| {
-                            if let Some(s) = v.as_str() {
-                                s.to_string()
-                            } else {
-                                v.to_string()
-                            }
-                        }).unwrap_or_default();
+                        let args = func
+                            .get("arguments")
+                            .map(|v| {
+                                if let Some(s) = v.as_str() {
+                                    s.to_string()
+                                } else {
+                                    v.to_string()
+                                }
+                            })
+                            .unwrap_or_default();
                         let _ = tx
                             .send(StreamChunk::ToolCallDelta {
                                 index,
@@ -411,13 +557,18 @@ fn spawn_ollama_stream_reader(
                         .get("prompt_eval_count")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
-                    let output_tokens =
-                        obj.get("eval_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let output_tokens = obj.get("eval_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                    // Ollama reports durations in nanoseconds; convert to ms.
+                    // These are exact model-side times (exclude network).
+                    let ns_to_ms =
+                        |key: &str| obj.get(key).and_then(|v| v.as_u64()).unwrap_or(0) / 1_000_000;
                     let _ = tx
                         .send(StreamChunk::Done {
                             input_tokens,
                             output_tokens,
                             reasoning_tokens: 0, // Ollama doesn't break out reasoning tokens
+                            prompt_ms: ns_to_ms("prompt_eval_duration"),
+                            gen_ms: ns_to_ms("eval_duration"),
                         })
                         .await;
                     return;
@@ -438,6 +589,19 @@ fn spawn_openai_sse_reader(
         let mut input_tokens: u64 = 0;
         let mut output_tokens: u64 = 0;
         let mut reasoning_tokens: u64 = 0;
+        // OpenAI-compat servers don't report eval durations, so measure
+        // throughput by wall clock: `start` (reader spawn, ~response headers)
+        // to first generated token approximates prompt-ingest; first token to
+        // [DONE] approximates generation time.
+        let start = std::time::Instant::now();
+        let mut first_token: Option<std::time::Instant> = None;
+        let wallclock_ms = |first: Option<std::time::Instant>| match first {
+            Some(ft) => (
+                ft.duration_since(start).as_millis() as u64,
+                ft.elapsed().as_millis() as u64,
+            ),
+            None => (start.elapsed().as_millis() as u64, 0),
+        };
 
         while let Some(chunk_result) = byte_stream.next().await {
             let Ok(bytes) = chunk_result else { break };
@@ -462,11 +626,14 @@ fn spawn_openai_sse_reader(
                 let payload = payload.trim_start();
 
                 if payload == "[DONE]" {
+                    let (prompt_ms, gen_ms) = wallclock_ms(first_token);
                     let _ = tx
                         .send(StreamChunk::Done {
                             input_tokens,
                             output_tokens,
                             reasoning_tokens,
+                            prompt_ms,
+                            gen_ms,
                         })
                         .await;
                     return;
@@ -512,14 +679,14 @@ fn spawn_openai_sse_reader(
                     .unwrap_or("");
 
                 if !delta_reasoning.is_empty() {
+                    first_token.get_or_insert_with(std::time::Instant::now);
                     let _ = tx
                         .send(StreamChunk::ReasoningDelta(delta_reasoning.to_string()))
                         .await;
                 }
                 if !delta_content.is_empty() {
-                    let _ = tx
-                        .send(StreamChunk::Delta(delta_content.to_string()))
-                        .await;
+                    first_token.get_or_insert_with(std::time::Instant::now);
+                    let _ = tx.send(StreamChunk::Delta(delta_content.to_string())).await;
                 }
 
                 // Tool-call deltas: each chunk carries zero or more entries
@@ -533,14 +700,9 @@ fn spawn_openai_sse_reader(
                     .and_then(|tc| tc.as_array())
                 {
                     for tc in tool_calls {
-                        let index = tc
-                            .get("index")
-                            .and_then(JsonValue::as_u64)
-                            .unwrap_or(0) as usize;
-                        let id = tc
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
+                        let index =
+                            tc.get("index").and_then(JsonValue::as_u64).unwrap_or(0) as usize;
+                        let id = tc.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
                         let func = tc.get("function");
                         let name = func
                             .and_then(|f| f.get("name"))
@@ -567,11 +729,14 @@ fn spawn_openai_sse_reader(
         // Stream ended without seeing [DONE] — still flush a Done event with
         // whatever usage we accumulated (often zero) so the consumer can
         // finalize.
+        let (prompt_ms, gen_ms) = wallclock_ms(first_token);
         let _ = tx
             .send(StreamChunk::Done {
                 input_tokens,
                 output_tokens,
                 reasoning_tokens,
+                prompt_ms,
+                gen_ms,
             })
             .await;
     });
@@ -608,10 +773,21 @@ pub enum StreamChunk {
     /// surfaces the server's reasoning-channel budget consumption when
     /// available (OpenAI-compat `usage.completion_tokens_details
     /// .reasoning_tokens`); 0 if the server didn't report it.
+    ///
+    /// `prompt_ms` / `gen_ms` carry the prompt-ingest and generation wall
+    /// times in milliseconds so callers can compute tokens/sec. For Ollama
+    /// these are the server's exact `prompt_eval_duration` / `eval_duration`
+    /// (model-side GPU time, excludes network). For OpenAI-compat servers,
+    /// which don't report durations, they are wall-clock measured from the
+    /// reader: `prompt_ms` is time-to-first-token and `gen_ms` is
+    /// first-token-to-done (so they include some network overhead). Either
+    /// is 0 when the duration is unknown.
     Done {
         input_tokens: u64,
         output_tokens: u64,
         reasoning_tokens: u64,
+        prompt_ms: u64,
+        gen_ms: u64,
     },
 }
 
@@ -641,16 +817,18 @@ pub(crate) fn build_chat_payload(
     response_format: Option<&str>,
     tools: Option<&Vec<JsonValue>>,
 ) -> JsonValue {
+    let messages = normalize_outbound_messages(messages);
     match endpoint.flavor {
         ClientFlavor::Ollama => {
             let mut options = json!({
                 "temperature": endpoint.temperature,
-                "num_ctx": endpoint.num_ctx,
+                "num_ctx": endpoint.trim_budget,
             });
             if let Some(n) = endpoint.max_tokens {
                 // Ollama's equivalent of `max_tokens` is `num_predict`.
                 options["num_predict"] = json!(n);
             }
+            apply_sampler_overrides(&mut options, endpoint);
             let mut payload = json!({
                 "model": &endpoint.model,
                 "messages": messages,
@@ -667,9 +845,9 @@ pub(crate) fn build_chat_payload(
             payload
         }
         ClientFlavor::OpenAICompat => {
-            // OpenAI puts `temperature` at the top level. `num_ctx` has no
-            // direct equivalent — the model's context window is fixed on
-            // the server side. `think` is Ollama-specific and is silently
+            // OpenAI puts `temperature` at the top level. Our `trim_budget` is
+            // client-side only — this API has no context-size field (the
+            // window is fixed on the server), so it is intentionally not sent. `think` is Ollama-specific and is silently
             // dropped. `response_format: json` is intentionally NOT
             // forwarded — LM Studio (and some other OpenAI-compat servers)
             // reject the older `{"type": "json_object"}` shape, accepting
@@ -684,11 +862,15 @@ pub(crate) fn build_chat_payload(
                 "stream": false,
                 "temperature": endpoint.temperature,
             });
+            apply_sampler_overrides(&mut payload, endpoint);
             if let Some(n) = endpoint.max_tokens {
                 payload["max_tokens"] = json!(n);
             }
             if let Some(tools) = tools {
                 payload["tools"] = json!(tools);
+                if let Some(tc) = &endpoint.tool_choice {
+                    payload["tool_choice"] = tool_choice_payload(tc);
+                }
             }
             payload
         }
@@ -766,11 +948,124 @@ mod tests {
     use super::*;
     use crate::config::{ClientFlavor, OllamaEndpoint, ToolSubset};
 
+    #[test]
+    fn normalize_merges_mid_list_consecutive_assistants() {
+        // Consecutive assistants NOT at the end are merged (the 019f079f
+        // "2 or more assistant" case) but kept, because a user/tool follows.
+        let msgs = vec![
+            json!({"role": "assistant", "content": "first"}),
+            json!({"role": "assistant", "content": "second", "tool_calls": [{"id": "a"}]}),
+            json!({"role": "user", "content": "go on"}),
+        ];
+        let out = normalize_outbound_messages(msgs);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["role"], "assistant");
+        assert_eq!(out[0]["content"], "first\nsecond");
+        assert_eq!(out[0]["tool_calls"][0]["id"], "a");
+        assert_eq!(out[1]["role"], "user");
+    }
+
+    #[test]
+    fn normalize_drops_trailing_assistant_prefill() {
+        // The 019f0b3f failure: a list ending in an assistant message is a
+        // "prefill", rejected when thinking is on. Drop it so the model
+        // responds fresh to the real last input. Merge-then-drop also collapses
+        // a trailing run of assistants entirely.
+        let one = normalize_outbound_messages(vec![
+            json!({"role": "user", "content": "do it"}),
+            json!({"role": "assistant", "content": "I'll do X:"}),
+        ]);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0]["role"], "user");
+
+        let run = normalize_outbound_messages(vec![
+            json!({"role": "tool", "tool_call_id": "x", "content": "r"}),
+            json!({"role": "assistant", "content": "a"}),
+            json!({"role": "assistant", "content": "b"}),
+        ]);
+        assert_eq!(run.len(), 1);
+        assert_eq!(run[0]["role"], "tool");
+    }
+
+    #[test]
+    fn normalize_leaves_well_ordered_lists_untouched() {
+        // Ends with a tool result; tool messages are never merged (their ids
+        // must stay separate) and nothing trailing to drop.
+        let msgs = vec![
+            json!({"role": "assistant", "tool_calls": [{"id": "x"}]}),
+            json!({"role": "tool", "tool_call_id": "x", "content": "r1"}),
+            json!({"role": "tool", "tool_call_id": "y", "content": "r2"}),
+            json!({"role": "user", "content": "next"}),
+        ];
+        let out = normalize_outbound_messages(msgs.clone());
+        assert_eq!(out, msgs);
+    }
+
+    #[test]
+    #[test]
+    fn tool_choice_function_name_becomes_object_form() {
+        // Keywords pass through as bare strings; a tool name must become the
+        // OpenAI object form, else forcing write_file would be an invalid bare string.
+        assert_eq!(
+            tool_choice_payload("required"),
+            serde_json::json!("required")
+        );
+        assert_eq!(
+            tool_choice_payload("write_file"),
+            serde_json::json!({ "type": "function", "function": { "name": "write_file" } })
+        );
+    }
+
+    fn tool_choice_is_sent_only_when_configured_and_tools_present() {
+        let tools = vec![json!({"type": "function", "function": {"name": "shell"}})];
+        let mut ep = endpoint(ClientFlavor::OpenAICompat);
+
+        // Unset → no tool_choice field (server default = "auto", unconstrained).
+        let p = build_stream_payload(
+            &ep,
+            vec![json!({"role": "user", "content": "hi"})],
+            Some(&tools),
+        );
+        assert!(p.get("tool_choice").is_none());
+
+        // Set → forwarded to the server to constrain tool-call format.
+        ep.tool_choice = Some("required".to_string());
+        let p = build_stream_payload(
+            &ep,
+            vec![json!({"role": "user", "content": "hi"})],
+            Some(&tools),
+        );
+        assert_eq!(p["tool_choice"], "required");
+
+        // Set but NO tools → omitted (tool_choice is meaningless without tools).
+        let p = build_stream_payload(&ep, vec![json!({"role": "user", "content": "hi"})], None);
+        assert!(p.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn classify_send_error_parses_context_overflow() {
+        // The exact body llama.cpp returned in session 019f05ae.
+        let body = r#"{"error":{"code":400,"message":"request (32946 tokens) exceeds the available context size (32768 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":32946,"n_ctx":32768}}"#;
+        assert_eq!(
+            classify_send_error(400, body),
+            SendError::ContextOverflow {
+                n_ctx: 32768,
+                n_prompt_tokens: 32946,
+            }
+        );
+        // A different 400 and a 5xx are both Other (not recoverable by re-trim).
+        assert_eq!(
+            classify_send_error(400, r#"{"error":{"type":"invalid_request"}}"#),
+            SendError::Other
+        );
+        assert_eq!(classify_send_error(500, "internal error"), SendError::Other);
+    }
+
     fn endpoint(flavor: ClientFlavor) -> OllamaEndpoint {
         OllamaEndpoint {
             base_url: "http://host:1234".to_string(),
             model: "m".to_string(),
-            num_ctx: 2048,
+            trim_budget: 2048,
             temperature: 0.1,
             timeout_seconds: 10,
             enabled: true,
@@ -778,6 +1073,10 @@ mod tests {
             tool_subset: ToolSubset::Focused,
             flavor,
             max_tokens: None,
+            top_p: None,
+            top_k: None,
+            repeat_penalty: None,
+            tool_choice: None,
         }
     }
 
@@ -820,16 +1119,50 @@ mod tests {
     #[test]
     fn ollama_payload_has_options_and_think() {
         let ep = endpoint(ClientFlavor::Ollama);
-        let payload = build_chat_payload(&ep, vec![json!({"role":"user","content":"hi"})], None, None);
+        let payload =
+            build_chat_payload(&ep, vec![json!({"role":"user","content":"hi"})], None, None);
         assert_eq!(payload["model"], "m");
         assert_eq!(payload["options"]["num_ctx"], 2048);
         assert_eq!(payload["think"], true);
     }
 
     #[test]
+    fn sampler_overrides_appear_in_payload_when_set() {
+        let mut ep = endpoint(ClientFlavor::Ollama);
+        ep.top_p = Some(0.95);
+        ep.top_k = Some(64);
+        ep.repeat_penalty = Some(1.1);
+        let p = build_chat_payload(&ep, vec![json!({"role":"user","content":"hi"})], None, None);
+        assert_eq!(p["options"]["top_p"], 0.95);
+        assert_eq!(p["options"]["top_k"], 64);
+        assert_eq!(p["options"]["repeat_penalty"], 1.1);
+
+        let mut ep2 = endpoint(ClientFlavor::OpenAICompat);
+        ep2.top_p = Some(0.95);
+        ep2.repeat_penalty = Some(1.1);
+        let p2 = build_chat_payload(
+            &ep2,
+            vec![json!({"role":"user","content":"hi"})],
+            None,
+            None,
+        );
+        assert_eq!(p2["top_p"], 0.95);
+        assert_eq!(p2["repeat_penalty"], 1.1);
+    }
+
+    #[test]
+    fn sampler_overrides_omitted_when_unset() {
+        let ep = endpoint(ClientFlavor::Ollama);
+        let p = build_chat_payload(&ep, vec![json!({"role":"user","content":"hi"})], None, None);
+        assert!(p["options"].get("top_p").is_none());
+        assert!(p["options"].get("repeat_penalty").is_none());
+    }
+
+    #[test]
     fn openai_payload_flat_temp_no_think_no_num_ctx() {
         let ep = endpoint(ClientFlavor::OpenAICompat);
-        let payload = build_chat_payload(&ep, vec![json!({"role":"user","content":"hi"})], None, None);
+        let payload =
+            build_chat_payload(&ep, vec![json!({"role":"user","content":"hi"})], None, None);
         assert_eq!(payload["model"], "m");
         assert_eq!(payload["temperature"], 0.1);
         assert!(payload.get("options").is_none());
@@ -896,7 +1229,8 @@ mod tests {
                 "total_tokens": 49
             }
         });
-        let translated = translate_response_to_ollama_shape(openai_body, ClientFlavor::OpenAICompat);
+        let translated =
+            translate_response_to_ollama_shape(openai_body, ClientFlavor::OpenAICompat);
         assert_eq!(translated["message"]["content"], "hello");
         assert_eq!(
             translated["message"]["tool_calls"][0]["function"]["name"],
@@ -912,7 +1246,8 @@ mod tests {
             "choices": [{"message": {"role": "assistant", "content": null}}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 0}
         });
-        let translated = translate_response_to_ollama_shape(openai_body, ClientFlavor::OpenAICompat);
+        let translated =
+            translate_response_to_ollama_shape(openai_body, ClientFlavor::OpenAICompat);
         assert_eq!(translated["message"]["content"], "");
     }
 
@@ -928,7 +1263,8 @@ mod tests {
             }],
             "usage": {"prompt_tokens": 10, "completion_tokens": 5}
         });
-        let translated = translate_response_to_ollama_shape(openai_body, ClientFlavor::OpenAICompat);
+        let translated =
+            translate_response_to_ollama_shape(openai_body, ClientFlavor::OpenAICompat);
         assert_eq!(translated["message"]["thinking"], "let me think...");
     }
 

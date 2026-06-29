@@ -12,6 +12,10 @@ use crate::local_web_search::DEFAULT_USER_AGENT;
 /// a notice is appended. Sized to fit comfortably in a local model's context
 /// without letting a single fetch dominate the transcript.
 const MAX_BODY_BYTES: usize = 512 * 1024;
+/// Token budget a single fetched body may occupy after reduction. A web page
+/// shouldn't eat the local model's whole window; ~4k leaves room for the rest of
+/// the turn. (`find`/`cursor` will let the model pull more on demand.)
+pub const WEB_FETCH_CONTENT_CAP_TOKENS: usize = 4000;
 
 /// Per-request timeout. Matches the search tool's expectations — local
 /// models shouldn't block for minutes on a single fetch.
@@ -169,7 +173,12 @@ fn is_text_content_type(ct: Option<&str>) -> bool {
         // No Content-Type header: be optimistic and try to decode as text.
         return true;
     };
-    let ct = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let ct = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     ct.starts_with("text/")
         || ct == "application/json"
         || ct == "application/xml"
@@ -179,27 +188,225 @@ fn is_text_content_type(ct: Option<&str>) -> bool {
         || ct.ends_with("+xml")
 }
 
-/// Render a `FetchResult` as a compact text block for a tool output.
-pub fn format_result(query_url: &str, result: &FetchResult) -> String {
-    let mut out = format!(
-        "Fetched: {}\nStatus: {}\n",
-        result.final_url, result.status,
-    );
-    if query_url != result.final_url {
-        out.push_str(&format!("Requested: {query_url}\n"));
+// ---------------------------------------------------------------------------
+// Navigation: lossless reduce → cache by URL → find / paginate (cursor)
+// ---------------------------------------------------------------------------
+
+struct CachedDoc {
+    status: u16,
+    content_type: Option<String>,
+    reduced: String,
+}
+static DOC_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, CachedDoc>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+const DOC_CACHE_CAP: usize = 32;
+
+/// The cursor is just the next CHARACTER offset, encoded so the model copies it
+/// verbatim. Deliberately NOT hash-validated: if the cached page changed, an
+/// offset still lands *somewhere* sensible (a small gap/overlap, snapped to a
+/// line) rather than hard-failing — graceful degradation beats an error.
+fn parse_cursor(c: &str) -> Option<usize> {
+    c.strip_prefix('c')?.parse().ok()
+}
+fn make_cursor(offset: usize) -> String {
+    format!("c{offset}")
+}
+
+fn cache_get(url: &str) -> Option<(u16, Option<String>, String)> {
+    DOC_CACHE
+        .lock()
+        .ok()?
+        .get(url)
+        .map(|d| (d.status, d.content_type.clone(), d.reduced.clone()))
+}
+
+async fn fetch_reduce_cache(
+    url: &str,
+    user_agent: Option<&str>,
+) -> Result<(u16, Option<String>, String), FetchError> {
+    let result = fetch(url, user_agent).await?;
+    let reduced =
+        crate::content_reduce::reduce_lossless(&result.body, result.content_type.as_deref());
+    if let Ok(mut cache) = DOC_CACHE.lock() {
+        if cache.len() >= DOC_CACHE_CAP && !cache.contains_key(url) {
+            cache.clear();
+        }
+        cache.insert(
+            url.to_string(),
+            CachedDoc {
+                status: result.status,
+                content_type: result.content_type.clone(),
+                reduced: reduced.clone(),
+            },
+        );
     }
-    if let Some(ct) = &result.content_type {
-        out.push_str(&format!("Content-Type: {ct}\n"));
+    Ok((result.status, result.content_type, reduced))
+}
+
+/// The single entry point for `web_fetch`: plain fetch, `find=` selection, and
+/// `cursor=` (offset) pagination, backed by a URL-keyed cache. `cap_tokens`
+/// bounds one page / one find response.
+pub async fn fetch_nav(
+    url: &str,
+    user_agent: Option<&str>,
+    find: Option<&str>,
+    cursor: Option<&str>,
+    cap_tokens: usize,
+) -> Result<String, FetchError> {
+    // find/cursor navigate the already-fetched doc → prefer the cache (no
+    // re-fetch); a plain fetch always pulls fresh content.
+    let (status, ct, reduced, fetched) = if find.is_some() || cursor.is_some() {
+        match cache_get(url) {
+            Some((s, c, r)) => (s, c, r, false),
+            None => {
+                let (s, c, r) = fetch_reduce_cache(url, user_agent).await?;
+                (s, c, r, true)
+            }
+        }
+    } else {
+        let (s, c, r) = fetch_reduce_cache(url, user_agent).await?;
+        (s, c, r, true)
+    };
+
+    // Track CONSECUTIVE non-2xx fetches. A single 404 is just reported (its body
+    // may be real content — api.handle.me serves documentation ON its 404 page),
+    // but 3+ failures in a row means the model is GUESSING URLs, and only then do
+    // we add the stop-guessing nudge. Only real fetches move the streak; cache
+    // re-serves (find/cursor) don't.
+    let streak = if fetched {
+        note_fetch_outcome(status)
+    } else {
+        current_streak()
+    };
+
+    // Always surface the real status AND the body — never suppress content, even
+    // on a non-2xx. The status label makes a 404/500 unmistakable; the body still
+    // comes through (paginated / find-able like any page).
+    let out = if reduced.trim().is_empty() {
+        render_empty_ok(url, status, ct.as_deref())
+    } else if let Some(q) = find {
+        let slice = crate::content_reduce::find_in(&reduced, ct.as_deref(), q, cap_tokens);
+        format!(
+            "{} \u{b7} {url}\nContent-Type: {}\nfind=\"{q}\"\n\n---\n{slice}",
+            status_label(status),
+            ct.as_deref().unwrap_or("(none)")
+        )
+    } else {
+        let offset = cursor.and_then(parse_cursor).unwrap_or(0);
+        render_page(url, status, ct.as_deref(), &reduced, offset, cap_tokens)
+    };
+    Ok(append_guess_hint(out, status, streak))
+}
+
+/// Consecutive non-2xx fetches in this process. A 2xx resets it; the count is how
+/// many failures in a row — the signal that the model is guessing rather than
+/// hitting a one-off bad URL.
+static FETCH_FAILURE_STREAK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+const GUESS_STREAK_THRESHOLD: usize = 3;
+
+fn note_fetch_outcome(status: u16) -> usize {
+    use std::sync::atomic::Ordering;
+    if (200..300).contains(&status) {
+        FETCH_FAILURE_STREAK.store(0, Ordering::Relaxed);
+        0
+    } else {
+        FETCH_FAILURE_STREAK.fetch_add(1, Ordering::Relaxed) + 1
     }
-    if result.truncated {
+}
+fn current_streak() -> usize {
+    FETCH_FAILURE_STREAK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `HTTP 404 Not Found` / `HTTP 200 OK` / `HTTP 599` (unknown code → no phrase).
+fn status_label(status: u16) -> String {
+    let reason = status_reason(status);
+    if reason.is_empty() {
+        format!("HTTP {status}")
+    } else {
+        format!("HTTP {status} {reason}")
+    }
+}
+
+/// After several non-2xx fetches in a row, the model is guessing — tell it to
+/// stop and change tactic. Below the threshold, a failure stands on its own (the
+/// status + body are enough; no scolding for a single bad URL).
+fn append_guess_hint(mut out: String, status: u16, streak: usize) -> String {
+    if !(200..300).contains(&status) && streak >= GUESS_STREAK_THRESHOLD {
         out.push_str(&format!(
-            "Note: body truncated to first {} bytes.\n",
-            MAX_BODY_BYTES,
+            "\n\n\u{26a0} {streak} web_fetch calls in a row have failed (non-2xx). If you're guessing URLs, STOP — more variants on the same host will keep failing. Find the correct URL via local_web_search or a known source, or take a different step."
         ));
     }
-    out.push_str("\n---\n");
-    out.push_str(&result.body);
     out
+}
+
+fn render_page(
+    url: &str,
+    status: u16,
+    ct: Option<&str>,
+    reduced: &str,
+    offset: usize,
+    cap_tokens: usize,
+) -> String {
+    let (body, next, total) = crate::content_reduce::page_from(reduced, offset, cap_tokens);
+    let mut out = format!(
+        "{} \u{b7} {url}\nContent-Type: {}\n--- (chars {offset}\u{2013}{next} of {total}) ---\n{body}\n",
+        status_label(status),
+        ct.unwrap_or("(none)"),
+    );
+    if next < total {
+        out.push_str(&format!(
+            "\n\u{26a0} More remains ({} of {total} chars left). Continue with the SAME url and:\n  cursor=\"{}\"\n(or call with find=\"<keyword>\" to jump straight to a section.)",
+            total - next,
+            make_cursor(next),
+        ));
+    }
+    out
+}
+
+/// A 2xx with an empty body — say so explicitly; a bare empty string reads as
+/// "nothing happened" and invites a pointless identical retry.
+fn render_empty_ok(url: &str, status: u16, ct: Option<&str>) -> String {
+    format!(
+        "HTTP {status} {} \u{b7} {url}\nContent-Type: {}\nThe response body was EMPTY (no text content). \
+         Retrying this exact URL will return the same empty result — try a different source or path.",
+        status_reason(status),
+        ct.unwrap_or("(none)"),
+    )
+}
+
+/// Canonical reason phrase for the HTTP status codes a fetch realistically hits.
+/// Unknown codes return `""` (the numeric code still carries the signal).
+fn status_reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        406 => "Not Acceptable",
+        408 => "Request Timeout",
+        410 => "Gone",
+        418 => "I'm a teapot",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "",
+    }
 }
 
 #[cfg(test)]
@@ -230,6 +437,66 @@ mod tests {
             rt.block_on(fetch("ftp://example.com/foo", None)),
             Err(FetchError::InvalidUrl(_))
         ));
+    }
+
+    #[test]
+    fn non_2xx_keeps_the_body_and_shows_status() {
+        // api.handle.me serves real docs on its 404 — the body must survive, with
+        // the status made unmistakable.
+        let page = render_page(
+            "https://api.handle.me/openapi.json",
+            404,
+            Some("application/json"),
+            "Not found, but here are the available endpoints: /handles, /holders",
+            0,
+            4000,
+        );
+        assert!(
+            page.contains("HTTP 404 Not Found"),
+            "status visible: {page}"
+        );
+        assert!(
+            page.contains("available endpoints"),
+            "body preserved: {page}"
+        );
+    }
+
+    #[test]
+    fn guess_hint_only_after_threshold_and_only_on_failure() {
+        let base = "HTTP 404 Not Found \u{b7} https://x".to_string();
+        // 1–2 failures: no scolding.
+        assert!(!append_guess_hint(base.clone(), 404, 1).contains("guessing"));
+        assert!(!append_guess_hint(base.clone(), 404, 2).contains("guessing"));
+        // 3rd consecutive failure: the stop-guessing nudge appears.
+        let hinted = append_guess_hint(base.clone(), 404, 3);
+        assert!(hinted.contains("3 web_fetch calls in a row"));
+        assert!(hinted.contains("guessing"));
+        // A 2xx never gets the nudge, regardless of streak.
+        assert!(
+            !append_guess_hint("HTTP 200 OK \u{b7} x".to_string(), 200, 9).contains("guessing")
+        );
+    }
+
+    #[test]
+    fn status_label_formats() {
+        assert_eq!(status_label(404), "HTTP 404 Not Found");
+        assert_eq!(status_label(200), "HTTP 200 OK");
+        assert_eq!(status_label(599), "HTTP 599");
+    }
+
+    #[test]
+    fn empty_2xx_says_empty() {
+        let out = render_empty_ok("https://e.com/x", 200, Some("text/plain"));
+        assert!(out.contains("HTTP 200 OK"));
+        assert!(out.contains("EMPTY"), "{out}");
+    }
+
+    #[test]
+    fn status_reason_maps_common_codes() {
+        assert_eq!(status_reason(404), "Not Found");
+        assert_eq!(status_reason(200), "OK");
+        assert_eq!(status_reason(503), "Service Unavailable");
+        assert_eq!(status_reason(599), "");
     }
 
     #[test]

@@ -266,6 +266,45 @@ impl ToolRouter {
             ));
         }
 
+        // Hard repetition-loop guard. The soft guard (trim prelude + fabricated
+        // tool result) asks a looping model to stop, but a weak local model can
+        // ignore it. Once an identical call has been dispatched too many times
+        // in a row, refuse to re-execute it and hand back an error so the model
+        // must change course instead of re-running the same no-op forever.
+        // `write_stdin` is exempt — its signature is intentionally constant
+        // (it's meant to be called repeatedly to feed an interactive process).
+        const REPEAT_BLOCK_THRESHOLD: usize = 5;
+        if tool_name != "write_stdin" {
+            let signature =
+                codex_routing::trim::signature_for_call(&tool_name, payload.log_payload().as_ref());
+            let count = session.note_tool_call_repetition(signature);
+            if count >= REPEAT_BLOCK_THRESHOLD {
+                tracing::warn!(
+                    tool = %tool_name,
+                    count,
+                    "Blocking repeated identical tool call (loop guard)"
+                );
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "BLOCKED (loop guard): `{tool_name}` was called with identical arguments \
+                     {count} times in a row and the result has not changed. This call was NOT \
+                     executed. Stop repeating it — take a different action (different arguments \
+                     or a different tool), or explain why you are stuck."
+                )));
+            }
+
+            // Broader loop detection the consecutive-identical guard above misses:
+            // a cyclic pattern of distinct calls (patch→test→cat→patch…), or the
+            // same file re-edited with near-identical content. Both are
+            // productivity-gated — varied actions / genuinely different edits don't
+            // trip.
+            if let Some(message) =
+                session.note_loop_tool_call(&tool_name, payload.log_payload().as_ref())
+            {
+                tracing::warn!(tool = %tool_name, "Blocking agentic loop (cycle/same-target guard)");
+                return Err(FunctionCallError::RespondToModel(message));
+            }
+        }
+
         let invocation = ToolInvocation {
             session,
             turn,

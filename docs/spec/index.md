@@ -17,6 +17,8 @@
 - [Routing Logic Reference](routing-logic-reference.md) — **Preserved from coding-agent-router:** every heuristic, threshold, fallback path, config knob
 - [Compaction Reference](compaction-reference.md) — **Preserved from coding-agent-router:** full compaction pipeline algorithm
 - [Local Coder Massaging](local-coder-massaging.md) — Every orchestration-layer intervention that props up small local coder models: problem, fix, code pointer, log signal
+- [Nudge Engine as a Service](nudge-service.md) — **Proposal:** extract the massaging layer into a standalone OpenAI-compatible streaming service (heartbeat keep-alive, session header, harness keeps tool execution + workspace)
+- [Content Reduction (`content_reduce`)](content-reduce.md) — **Proposal:** MIME-aware, lossless-first reducer that bounds large tool outputs at the source (HTML→text, JSON/YAML tree-walk, guarded prose stripper), plus `find=` selection + `cursor=` pagination — replaces trim's destructive truncation
 - [Provider Abstraction](provider-abstraction.md) — Provider types, capability schema, adapter interface
 - [State Model](state-model.md) — SQLite schema, task state machine, entity relationships
 - [Event Model](event-model.md) — 20+ event types with producers, consumers, payloads, idempotency

@@ -46,7 +46,6 @@ pub(crate) fn build_specs_with_discoverable_tools(
     use crate::tools::handlers::JsReplResetHandler;
     use crate::tools::handlers::ListDirHandler;
     use crate::tools::handlers::LocalWebSearchHandler;
-    use crate::tools::handlers::WebFetchHandler;
     use crate::tools::handlers::McpHandler;
     use crate::tools::handlers::McpResourceHandler;
     use crate::tools::handlers::PlanHandler;
@@ -60,6 +59,7 @@ pub(crate) fn build_specs_with_discoverable_tools(
     use crate::tools::handlers::ToolSuggestHandler;
     use crate::tools::handlers::UnifiedExecHandler;
     use crate::tools::handlers::ViewImageHandler;
+    use crate::tools::handlers::WebFetchHandler;
     use crate::tools::handlers::multi_agents::CloseAgentHandler;
     use crate::tools::handlers::multi_agents::ResumeAgentHandler;
     use crate::tools::handlers::multi_agents::SendInputHandler;
@@ -247,6 +247,16 @@ pub(crate) fn build_specs_with_discoverable_tools(
             }
         }
     }
+
+    // Synthetic local-model tools (`write_file`/`create_file`) are injected into
+    // local tool lists (not the cloud catalog), so they have no spec entry and
+    // thus no handler from the loop above. Register real handlers by name so the
+    // model's call dispatches as `write_file` instead of being translated to a
+    // `shell` command it misreads as broken. See handlers/write_file.rs.
+    let write_file_handler = Arc::new(crate::tools::handlers::WriteFileHandler);
+    builder.register_handler("write_file", write_file_handler.clone());
+    builder.register_handler("create_file", write_file_handler);
+
     builder
 }
 

@@ -396,7 +396,7 @@ async fn apply_patch_cli_move_without_content_change_has_no_turn_diff(
 #[test_case(ApplyPatchModelOutput::Shell)]
 #[test_case(ApplyPatchModelOutput::ShellViaHeredoc)]
 #[test_case(ApplyPatchModelOutput::ShellCommandViaHeredoc)]
-async fn apply_patch_cli_add_overwrites_existing_file(
+async fn apply_patch_cli_add_to_existing_file_fails(
     model_output: ApplyPatchModelOutput,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -405,15 +405,23 @@ async fn apply_patch_cli_add_overwrites_existing_file(
 
     harness.write_file("duplicate.txt", "old content\n").await?;
 
+    // `*** Add File` on an existing path must fail (use Update File) rather than
+    // silently overwrite — the latter destroys data and feeds rewrite loops.
     let patch = "*** Begin Patch\n*** Add File: duplicate.txt\n+new content\n*** End Patch";
     let call_id = "apply-add-overwrite";
     mount_apply_patch(&harness, call_id, patch, "ok", model_output).await;
 
     harness.submit("apply add overwrite patch").await?;
 
+    let out = harness.apply_patch_output(call_id, model_output).await;
+    assert!(
+        out.contains("already exists"),
+        "expected an 'already exists' error in output: {out:?}"
+    );
+    // Original content is untouched.
     assert_eq!(
         harness.read_file_text("duplicate.txt").await?,
-        "new content\n"
+        "old content\n"
     );
     Ok(())
 }

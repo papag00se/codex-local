@@ -36,6 +36,13 @@ pub fn recover_tool_calls(content: &str, existing_tool_calls: bool) -> Recovered
         };
     }
 
+    // Strategy 0: leaked `<tool_call>` blocks (Hermes JSON or XML-function),
+    // via the shared tool_aliases parser — single source of truth so the
+    // reasoner path recovers the same formats as the coder path.
+    if let Some(recovered) = recover_leaked_tool_call_blocks(content) {
+        return recovered;
+    }
+
     // Strategy 1: Try parsing entire content as a JSON blob
     if let Some(recovered) = try_parse_json_blob(content) {
         if let Some(tool_calls) = extract_tool_calls_from_blob(&recovered) {
@@ -55,6 +62,48 @@ pub fn recover_tool_calls(content: &str, existing_tool_calls: bool) -> Recovered
     recover_embedded_tool_blocks(content, /*streaming=*/ false)
 }
 
+/// Recover leaked `<tool_call>…</tool_call>` blocks via the shared
+/// [`crate::tool_aliases`] parser, which handles Hermes JSON, malformed JSON,
+/// and the XML-function (`<function=NAME><parameter=KEY>`) dialect. Returns
+/// `None` when there's nothing to recover so callers fall through to their
+/// other strategies. This is the one place both the coder and reasoner paths
+/// converge on for `<tool_call>` recovery.
+fn recover_leaked_tool_call_blocks(content: &str) -> Option<RecoveredMessage> {
+    if !crate::tool_aliases::has_leaked_tool_call(content) {
+        return None;
+    }
+    let tool_calls: Vec<ToolCall> = crate::tool_aliases::parse_leaked_tool_calls(content)
+        .iter()
+        .filter_map(tool_call_from_wire)
+        .collect();
+    if tool_calls.is_empty() {
+        return None;
+    }
+    Some(RecoveredMessage {
+        content: crate::tool_aliases::strip_leaked_tool_calls(content),
+        tool_calls,
+    })
+}
+
+/// Convert a tool_aliases wire call (`{"function":{"name","arguments":<string>}}`)
+/// into a [`ToolCall`].
+fn tool_call_from_wire(v: &JsonValue) -> Option<ToolCall> {
+    let func = v.get("function")?;
+    let name = func.get("name")?.as_str()?.to_string();
+    let arguments = match func.get("arguments") {
+        Some(JsonValue::String(s)) => {
+            serde_json::from_str(s).unwrap_or_else(|_| JsonValue::Object(serde_json::Map::new()))
+        }
+        Some(other) => other.clone(),
+        None => JsonValue::Object(serde_json::Map::new()),
+    };
+    Some(ToolCall {
+        id: None,
+        name,
+        arguments,
+    })
+}
+
 /// Streaming variant — partial tool blocks at the end are dropped.
 pub fn recover_tool_calls_streaming(content: &str, existing_tool_calls: bool) -> RecoveredMessage {
     if existing_tool_calls {
@@ -62,6 +111,11 @@ pub fn recover_tool_calls_streaming(content: &str, existing_tool_calls: bool) ->
             content: content.to_string(),
             tool_calls: Vec::new(),
         };
+    }
+
+    // Strategy 0: leaked `<tool_call>` blocks (shared tool_aliases parser).
+    if let Some(recovered) = recover_leaked_tool_call_blocks(content) {
+        return recovered;
     }
 
     // Strategy 1: JSON blob
@@ -263,6 +317,22 @@ mod tests {
         let result = recover_tool_calls("anything", true);
         assert_eq!(result.content, "anything");
         assert!(result.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn test_recover_xml_function_leak_on_reasoner_path() {
+        // The reasoner path (chat_stream) calls recover_tool_calls. It must now
+        // recover the XML-function dialect Ornith leaks — previously it didn't,
+        // so a tool call on light_reasoner silently leaked as text.
+        let content = "Sure.\n<tool_call>\n<function=exec_command>\n<parameter=cmd>\npytest -q 2>&1 | tail -5\n</parameter>\n</function>\n</tool_call>";
+        let result = recover_tool_calls(content, false);
+        assert_eq!(result.tool_calls.len(), 1, "reasoner must recover XML leak");
+        assert_eq!(result.tool_calls[0].name, "exec_command");
+        assert_eq!(
+            result.tool_calls[0].arguments["cmd"],
+            "pytest -q 2>&1 | tail -5"
+        );
+        assert_eq!(result.content, "Sure."); // block stripped from visible text
     }
 
     #[test]

@@ -104,8 +104,12 @@ pub async fn verify_completion(
         .and_then(|c| c.as_str())
         .unwrap_or("");
     let stripped = crate::classifier::strip_think_tags(content);
+    // Pull out the JSON object so a ```json fence (newer models like Ornith wrap
+    // their output) doesn't make a real verdict look unparseable — which would
+    // default to Complete and let a dangling-intent turn finish.
+    let json = crate::classifier::extract_json_object(stripped.trim());
 
-    let parsed: Result<VerifierResponse, _> = serde_json::from_str(stripped.trim());
+    let parsed: Result<VerifierResponse, _> = serde_json::from_str(json);
     match parsed {
         Ok(resp) => match resp.verdict.to_lowercase().as_str() {
             "complete" => CompletionVerdict::Complete,
@@ -124,17 +128,35 @@ pub async fn verify_completion(
 
 /// Build the continuation prompt to inject when verification flags a bail.
 /// Appended as a `user`-role message before re-calling the local model.
-pub fn continuation_prompt(prior_response: &str) -> String {
-    format!(
-        "[VERIFIER] Your previous response was: \"{}\"\n\n\
-         You announced an action but did not actually take it. Either:\n\
-         (a) Take the action you announced — invoke the tools needed to complete it.\n\
-         (b) If the task is genuinely done, restate the concrete result you produced (which file, which test, which output).\n\
-         (c) If you cannot proceed, explain WHY and what you need.\n\n\
-         Do not just announce intent again. Act, or report concretely.",
-        // Truncate to keep the prompt compact.
-        prior_response.chars().take(400).collect::<String>()
-    )
+///
+/// `attempt` is how many times we've *already* re-prompted in this turn (0 on
+/// the first). The first nudge is a plain reminder; once the model has ignored
+/// it and kept emitting prose, the nudge escalates to a hard tool-call-only
+/// constraint — the failure mode is a model that explains the fix repeatedly
+/// without ever emitting the patch.
+pub fn continuation_prompt(prior_response: &str, attempt: usize) -> String {
+    let prior = prior_response.chars().take(400).collect::<String>();
+    if attempt == 0 {
+        format!(
+            "[VERIFIER] You called NO tools last turn, so nothing actually happened — no file was written and no command ran. Your previous text was: \"{prior}\"\n\n\
+             If that text contained code or file contents, it was NOT saved to disk. You MUST now re-issue it as a tool call: `write_file` to create a new file, or `edit_file`/`apply_patch` to change an existing one. Do NOT paste the code as text again — pasted code is discarded.\n\
+             If the task is genuinely already done, restate the concrete result (which file you wrote, which command you ran, which output you got).\n\
+             If you cannot proceed, explain WHY and what you need.\n\n\
+             Act via a tool call now — do not just describe what you would do."
+        )
+    } else {
+        // The model has now described the action `attempt`+ times without doing
+        // it. Stop accepting prose: constrain the entire next message to one
+        // tool call. Repetition of the prior text is what we must break.
+        format!(
+            "[VERIFIER — STOP EXPLAINING] You have now described what you would do {n} times without doing it. Nothing has changed on disk and the task is still NOT done.\n\n\
+             Your ENTIRE next message must be a SINGLE tool call and nothing else — no prose, no analysis, no restating the plan or the problem. \
+             To change a file use `apply_patch` or `edit_file`; to create one use `write_file`; to run/verify use `exec_command`. \
+             Pick the one tool call that moves the task forward and emit ONLY that. Do not explain it first.\n\n\
+             (Your last text, which did nothing, was: \"{prior}\")",
+            n = attempt + 1,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -148,7 +170,7 @@ mod tests {
         let endpoint = OllamaEndpoint {
             base_url: "http://127.0.0.1:9999".into(),
             model: "x".into(),
-            num_ctx: 4096,
+            trim_budget: 4096,
             temperature: 0.0,
             timeout_seconds: 5,
             enabled: true,
@@ -156,6 +178,10 @@ mod tests {
             tool_subset: crate::config::ToolSubset::Focused,
             flavor: crate::config::ClientFlavor::Ollama,
             max_tokens: None,
+            top_p: None,
+            top_k: None,
+            repeat_penalty: None,
+            tool_choice: None,
         };
         let pool = OllamaClientPool::new();
         let verdict = rt.block_on(verify_completion("hi", "", &endpoint, &pool));
@@ -164,9 +190,24 @@ mod tests {
 
     #[test]
     fn continuation_prompt_includes_prior_response_excerpt() {
-        let prompt = continuation_prompt("Now I'll create the file:");
+        let prompt = continuation_prompt("Now I'll create the file:", 0);
         assert!(prompt.contains("Now I'll create the file:"));
         assert!(prompt.contains("VERIFIER"));
-        assert!(prompt.contains("Take the action"));
+        // Must direct the model to actually call a write tool, not re-narrate.
+        assert!(prompt.contains("write_file"));
+        assert!(prompt.contains("tool call"));
+    }
+
+    #[test]
+    fn continuation_prompt_escalates_after_first_ignore() {
+        // First nudge is the gentle reminder; later ones hard-constrain to a
+        // single tool call so a model that keeps explaining gets cut off.
+        let first = continuation_prompt("Let me fix this:", 0);
+        let escalated = continuation_prompt("Let me fix this:", 2);
+        assert!(!first.contains("STOP EXPLAINING"));
+        assert!(escalated.contains("STOP EXPLAINING"));
+        assert!(escalated.contains("ENTIRE next message must be a SINGLE tool call"));
+        // It tells the model how many times it has now stalled (2 prior + this).
+        assert!(escalated.contains('3'));
     }
 }

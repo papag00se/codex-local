@@ -20,6 +20,7 @@ fn empty_transcript_produces_only_system_prompt() {
             user_instructions: None,
             current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
@@ -37,6 +38,7 @@ fn user_instructions_appear_in_prelude() {
             user_instructions: Some("Don't use mocks."),
             current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
@@ -59,6 +61,7 @@ fn system_prompt_is_never_stubbed_or_truncated() {
             user_instructions: None,
             current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
@@ -75,6 +78,7 @@ fn active_turn_user_message_kept_verbatim() {
             user_instructions: None,
             current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
@@ -104,6 +108,7 @@ fn tool_calls_and_outputs_in_active_turn_are_preserved() {
             user_instructions: None,
             current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
@@ -146,6 +151,7 @@ fn old_read_then_patch_drops_old_read_output() {
             user_instructions: None,
             current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
@@ -186,6 +192,7 @@ fn duplicate_grep_supersedes_older_output() {
             user_instructions: None,
             current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
@@ -211,7 +218,11 @@ fn shell_output_with_nonzero_exit_recognized_as_failure() {
     // in [UNRESOLVED ERRORS] AND tagging it as <tool_error>.
     let items = vec![
         user_msg("run the broken command"),
-        function_call("call1", "shell", r#"{"command":["bash","-lc","rg '*.ts'"]}"#),
+        function_call(
+            "call1",
+            "shell",
+            r#"{"command":["bash","-lc","rg '*.ts'"]}"#,
+        ),
         function_output(
             "call1",
             r#"{"output":"rg: regex parse error","metadata":{"exit_code":2,"duration_seconds":0.1}}"#,
@@ -225,6 +236,7 @@ fn shell_output_with_nonzero_exit_recognized_as_failure() {
             user_instructions: None,
             current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
@@ -261,6 +273,7 @@ fn failed_shell_output_kept_even_in_old_turn() {
             user_instructions: None,
             current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
@@ -295,6 +308,7 @@ fn repetition_detected_after_three_identical_calls() {
             user_instructions: None,
             current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
@@ -346,6 +360,7 @@ fn repetition_detected_with_short_assistant_text_interleaved() {
             user_instructions: None,
             current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
@@ -374,6 +389,7 @@ fn no_repetition_alert_after_only_two_identical_calls() {
             user_instructions: None,
             current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
@@ -414,12 +430,117 @@ fn no_repetition_alert_when_calls_have_different_args() {
             user_instructions: None,
             current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
     assert!(
         !result.system.contains("[STOP — REPETITION DETECTED]"),
         "different args shouldn't trigger the alert"
+    );
+}
+
+#[test]
+fn repetition_injects_synthetic_tool_result_on_most_recent_call() {
+    // Three identical apply_patch calls all returning the same failure: the
+    // hard guard must replace the MOST RECENT call's tool-output with the
+    // synthesized "stop repeating" result (in addition to the prelude alert),
+    // and must do so exactly once (only the last call, not c1/c2).
+    let patch = r#"{"input":"*** Begin Patch\n*** Update File: a.rs\n@@\n-x\n+y\n*** End Patch"}"#;
+    let items = vec![
+        user_msg("fix it"),
+        function_call("c1", "apply_patch", patch),
+        function_output("c1", "Failed to find context", false),
+        function_call("c2", "apply_patch", patch),
+        function_output("c2", "Failed to find context", false),
+        function_call("c3", "apply_patch", patch),
+        function_output("c3", "Failed to find context", false),
+    ];
+    let result = trim_for_local(
+        &TrimInput {
+            items: &items,
+            system_prompt: "SYS",
+            user_instructions: None,
+            current_files: None,
+            flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
+        },
+        16384,
+    );
+    // Reinforcing prelude alert still present.
+    assert!(result.system.contains("[STOP — REPETITION DETECTED]"));
+    let joined = result
+        .messages
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let hits = joined.matches("[REPEATED CALL BLOCKED BY HARNESS]").count();
+    assert_eq!(
+        hits, 1,
+        "synthetic stop result should appear exactly once (on the last call):\n{joined}"
+    );
+    // And it must be the most recent call (c3), not an earlier one.
+    let c3_output = result
+        .messages
+        .iter()
+        .find(|m| m.to_string().contains("call_id=\\\"c3\\\""))
+        .expect("c3 tool output message present");
+    assert!(
+        c3_output
+            .to_string()
+            .contains("[REPEATED CALL BLOCKED BY HARNESS]"),
+        "c3's output should be the one overridden:\n{c3_output}"
+    );
+}
+
+#[test]
+fn enforces_token_budget_by_truncating_bulky_tool_output() {
+    // A single active-turn tool output far larger than the budget MUST be
+    // truncated so the rendered prompt fits target_ctx — overflow has to be
+    // structurally impossible, not merely unlikely.
+    let huge = "lorem ipsum dolor sit amet ".repeat(8000); // ~50k+ tokens
+    let items = vec![
+        user_msg("do the thing"),
+        function_call("c1", "shell", r#"{"command":["bash","-lc","cat big.txt"]}"#),
+        function_output("c1", &huge, true),
+    ];
+    let target = 4096usize;
+    let result = trim_for_local(
+        &TrimInput {
+            items: &items,
+            system_prompt: "SYS",
+            user_instructions: None,
+            current_files: None,
+            flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
+        },
+        target,
+    );
+    // The enforced budget is the safety-adjusted ceiling (target / SAFETY_FACTOR),
+    // not the raw target — that margin is what keeps the *real* tokenized prompt
+    // (which runs larger than the chars/4 estimate) under the model's window.
+    let effective = (target as f64 / super::ESTIMATE_SAFETY_FACTOR) as usize;
+    assert!(
+        result.summary.estimated_input_tokens <= effective,
+        "prompt must fit the safety-adjusted budget: {} > {effective} (raw target {target})",
+        result.summary.estimated_input_tokens
+    );
+    // The user's actual request must survive truncation.
+    assert!(
+        result.messages.iter().any(|m| m
+            .get("content")
+            .and_then(|c| c.as_str())
+            .is_some_and(|s| s.contains("do the thing"))),
+        "user request must be preserved"
+    );
+    // The bulky tool output must show the truncation marker.
+    assert!(
+        result.messages.iter().any(|m| m
+            .get("content")
+            .and_then(|c| c.as_str())
+            .is_some_and(|s| s.contains("truncated to fit"))),
+        "bulky tool output should be truncated with a marker"
     );
 }
 
@@ -447,6 +568,7 @@ fn world_state_includes_stale_warning_for_old_modifications() {
             user_instructions: None,
             current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
@@ -457,9 +579,7 @@ fn world_state_includes_stale_warning_for_old_modifications() {
     );
     assert!(
         result.system.contains("re-read with `cat <path>`")
-            || result
-                .system
-                .contains("re-read with `cat <path>`")
+            || result.system.contains("re-read with `cat <path>`")
             || result.system.to_lowercase().contains("re-read"),
         "should suggest re-reading stale files:\n{}",
         result.system
@@ -488,6 +608,7 @@ fn apply_patch_failure_gets_recovery_hint() {
             user_instructions: None,
             current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
@@ -502,8 +623,70 @@ fn apply_patch_failure_gets_recovery_hint() {
         "failed apply_patch should get a recovery hint:\n{combined}"
     );
     assert!(
-        combined.contains("Re-read the file"),
-        "hint should mention re-reading the file:\n{combined}"
+        combined.contains("write_file"),
+        "hint should steer to a write_file rewrite, not a re-read:\n{combined}"
+    );
+}
+
+#[test]
+fn failed_patch_steers_to_write_file_rewrite() {
+    // Most-recent apply_patch on foo.ts failed → prelude directive + the
+    // structured patch_rewrite_path signal the caller uses to force write_file.
+    let base = || {
+        vec![
+            user_msg("add a function to foo.ts"),
+            function_call(
+                "p1",
+                "apply_patch",
+                r#"{"input":"*** Begin Patch\n*** Update File: /work/foo.ts\n-def gone():\n-    pass\n+def gone():\n+    return 1\n*** End Patch"}"#,
+            ),
+            function_output(
+                "p1",
+                "apply_patch verification failed: Failed to find expected lines in /work/foo.ts",
+                false,
+            ),
+        ]
+    };
+    let input_for = |items: &[ResponseItem]| -> super::TrimResult {
+        trim_for_local(
+            &TrimInput {
+                items,
+                system_prompt: "SYS",
+                user_instructions: None,
+                current_files: None,
+                flavor: super::super::config::ClientFlavor::Ollama,
+                system_budget_pct: 0,
+            },
+            16384,
+        )
+    };
+
+    let result = input_for(&base());
+    assert_eq!(
+        result.patch_rewrite_path.as_deref(),
+        Some("/work/foo.ts"),
+        "the failed-patch target should be surfaced for the caller to force write_file"
+    );
+    assert!(
+        result
+            .system
+            .contains("[PATCH DID NOT APPLY — REWRITE THE FILE]"),
+        "prelude should carry the rewrite directive:\n{}",
+        result.system
+    );
+
+    // A later SUCCESSFUL write_file to the same file clears the directive.
+    let mut items2 = base();
+    items2.push(function_call(
+        "w1",
+        "write_file",
+        r#"{"path":"/work/foo.ts","content":"def gone():\n    return 1\n"}"#,
+    ));
+    items2.push(function_output("w1", "write_file: wrote 24 bytes", true));
+    assert_eq!(
+        input_for(&items2).patch_rewrite_path,
+        None,
+        "a successful rewrite should clear the failed-patch state (no infinite directive)"
     );
 }
 
@@ -511,11 +694,7 @@ fn apply_patch_failure_gets_recovery_hint() {
 fn shell_regex_failure_gets_glob_hint() {
     let items = vec![
         user_msg("find ts files"),
-        function_call(
-            "s1",
-            "shell",
-            r#"{"command":["bash","-lc","rg '*.ts'"]}"#,
-        ),
+        function_call("s1", "shell", r#"{"command":["bash","-lc","rg '*.ts'"]}"#),
         function_output(
             "s1",
             r#"{"output":"rg: regex parse error:\n    repetition operator missing expression","metadata":{"exit_code":2,"duration_seconds":0.0}}"#,
@@ -529,6 +708,7 @@ fn shell_regex_failure_gets_glob_hint() {
             user_instructions: None,
             current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
@@ -563,6 +743,7 @@ fn world_state_lists_modified_files() {
             user_instructions: None,
             current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
@@ -593,6 +774,7 @@ fn old_assistant_text_dropped_from_messages_but_actions_recorded() {
             user_instructions: None,
             current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
@@ -636,6 +818,7 @@ fn old_successful_shell_output_dropped_action_receipt_kept() {
             user_instructions: None,
             current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
@@ -683,6 +866,7 @@ fn old_grep_output_kept_with_match_cap() {
             user_instructions: None,
             current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
@@ -729,7 +913,14 @@ fn current_file_state_block_injects_modified_file_contents() {
     let patch = "*** Begin Patch\n*** Update File: handler.py\n@@\n-old\n+new\n*** End Patch\n";
     let items = vec![
         user_msg("please edit"),
-        function_call("c1", "apply_patch", &format!("{{\"input\":{}}}", serde_json::Value::String(patch.to_string()))),
+        function_call(
+            "c1",
+            "apply_patch",
+            &format!(
+                "{{\"input\":{}}}",
+                serde_json::Value::String(patch.to_string())
+            ),
+        ),
         function_output("c1", "Success", true),
     ];
     // Caller has re-read the file and passed the current disk content.
@@ -745,6 +936,7 @@ fn current_file_state_block_injects_modified_file_contents() {
             user_instructions: None,
             current_files: Some(&current_files),
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
@@ -777,6 +969,7 @@ fn current_file_state_block_omitted_when_no_files_modified() {
             user_instructions: None,
             current_files: Some(&current_files),
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
@@ -796,12 +989,45 @@ fn same_target_failure_repetition_detected_despite_different_args() {
     };
     let items = vec![
         user_msg("fix it"),
-        function_call("c1", "apply_patch", &format!("{{\"input\":{}}}", serde_json::Value::String(mk_patch("foo")))),
-        function_output("c1", "apply_patch verification failed: Failed to find expected lines", false),
-        function_call("c2", "apply_patch", &format!("{{\"input\":{}}}", serde_json::Value::String(mk_patch("bar")))),
-        function_output("c2", "apply_patch verification failed: Failed to find expected lines", false),
-        function_call("c3", "apply_patch", &format!("{{\"input\":{}}}", serde_json::Value::String(mk_patch("baz")))),
-        function_output("c3", "apply_patch verification failed: Failed to find expected lines", false),
+        function_call(
+            "c1",
+            "apply_patch",
+            &format!(
+                "{{\"input\":{}}}",
+                serde_json::Value::String(mk_patch("foo"))
+            ),
+        ),
+        function_output(
+            "c1",
+            "apply_patch verification failed: Failed to find expected lines",
+            false,
+        ),
+        function_call(
+            "c2",
+            "apply_patch",
+            &format!(
+                "{{\"input\":{}}}",
+                serde_json::Value::String(mk_patch("bar"))
+            ),
+        ),
+        function_output(
+            "c2",
+            "apply_patch verification failed: Failed to find expected lines",
+            false,
+        ),
+        function_call(
+            "c3",
+            "apply_patch",
+            &format!(
+                "{{\"input\":{}}}",
+                serde_json::Value::String(mk_patch("baz"))
+            ),
+        ),
+        function_output(
+            "c3",
+            "apply_patch verification failed: Failed to find expected lines",
+            false,
+        ),
     ];
     let result = trim_for_local(
         &TrimInput {
@@ -810,12 +1036,13 @@ fn same_target_failure_repetition_detected_despite_different_args() {
             user_instructions: None,
             current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
         },
         16384,
     );
     assert!(
-        result.system.contains("[STOP — REPETITION DETECTED]"),
-        "expected repetition alert:\n{}",
+        result.system.contains("[NO PROGRESS — DIAGNOSE"),
+        "expected forced-diagnosis alert (same-target thrash):\n{}",
         result.system
     );
     assert!(
@@ -823,6 +1050,139 @@ fn same_target_failure_repetition_detected_despite_different_args() {
         "expected failure-streak summary:\n{}",
         result.system
     );
+}
+
+#[test]
+fn unproductive_recurrence_forces_diagnosis_on_interleaved_thrash() {
+    // The model re-runs the SAME failing test 3x with DIFFERENT edits between
+    // each run. The runs are never consecutive (an edit sits between them), so
+    // the exact-repeat detector misses it — the windowed recurrence detector
+    // should catch the repeated test and force a diagnosis instead.
+    let test_cmd = r#"{"cmd":"pytest test_x.py"}"#;
+    let edit = |s: &str| format!(r#"{{"cmd":"sed -i {s} test_x.py"}}"#);
+    let fail = "FAILED test_x.py::test_foo - AssertionError: 1 != 2";
+    let items = vec![
+        user_msg("make the test pass"),
+        function_call("e1", "exec_command", &edit("'1s/a/b/'")),
+        function_output("e1", "ok", true),
+        function_call("t1", "exec_command", test_cmd),
+        function_output("t1", fail, false),
+        function_call("e2", "exec_command", &edit("'2s/c/d/'")),
+        function_output("e2", "ok", true),
+        function_call("t2", "exec_command", test_cmd),
+        function_output("t2", fail, false),
+        function_call("e3", "exec_command", &edit("'3s/e/f/'")),
+        function_output("e3", "ok", true),
+        function_call("t3", "exec_command", test_cmd),
+        function_output("t3", fail, false),
+    ];
+    let result = trim_for_local(
+        &TrimInput {
+            items: &items,
+            system_prompt: "SYS",
+            user_instructions: None,
+            current_files: None,
+            flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
+        },
+        16384,
+    );
+    assert!(
+        result.system.contains("[NO PROGRESS — DIAGNOSE"),
+        "expected forced-diagnosis on interleaved thrash:\n{}",
+        result.system
+    );
+    // Not a byte-identical consecutive loop, so the plain STOP banner must NOT fire.
+    assert!(!result.system.contains("[STOP — REPETITION DETECTED]"));
+}
+
+#[test]
+fn productive_recurrence_does_not_force_diagnosis() {
+    // Same command runs 3x interleaved with edits, but SUCCEEDS every time
+    // (e.g. keeping a passing test green while refactoring, or routine re-runs of
+    // ls/grep/git status). That is healthy, not thrash — the forced-diagnosis
+    // nudge must NOT fire just because a signature recurs.
+    let test_cmd = r#"{"cmd":"pytest test_x.py"}"#;
+    let edit = |s: &str| format!(r#"{{"cmd":"sed -i {s} test_x.py"}}"#);
+    let pass = "1 passed in 0.01s";
+    let items = vec![
+        user_msg("keep the test green while refactoring"),
+        function_call("e1", "exec_command", &edit("'1s/a/b/'")),
+        function_output("e1", "ok", true),
+        function_call("t1", "exec_command", test_cmd),
+        function_output("t1", pass, true),
+        function_call("e2", "exec_command", &edit("'2s/c/d/'")),
+        function_output("e2", "ok", true),
+        function_call("t2", "exec_command", test_cmd),
+        function_output("t2", pass, true),
+        function_call("e3", "exec_command", &edit("'3s/e/f/'")),
+        function_output("e3", "ok", true),
+        function_call("t3", "exec_command", test_cmd),
+        function_output("t3", pass, true),
+    ];
+    let result = trim_for_local(
+        &TrimInput {
+            items: &items,
+            system_prompt: "SYS",
+            user_instructions: None,
+            current_files: None,
+            flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
+        },
+        16384,
+    );
+    assert!(
+        !result.system.contains("[NO PROGRESS — DIAGNOSE"),
+        "successful repeats must not force diagnosis:\n{}",
+        result.system
+    );
+    assert!(!result.system.contains("[STOP — REPETITION DETECTED]"));
+}
+
+#[test]
+fn escalation_excises_the_loop_and_reframes() {
+    // A byte-identical call repeated past the escalation threshold should be
+    // PRUNED from the rendered messages (so the model can't copy it out of its
+    // own context) and replaced by a context-reset reframe in the prelude.
+    let probe = r#"{"cmd":"python3 -c \"print(1)\""}"#;
+    let mut items = vec![user_msg("make it pass")];
+    for i in 0..7 {
+        items.push(function_call(&format!("c{i}"), "exec_command", probe));
+        items.push(function_output(&format!("c{i}"), "1", true));
+    }
+    let result = trim_for_local(
+        &TrimInput {
+            items: &items,
+            system_prompt: "SYS",
+            user_instructions: None,
+            current_files: None,
+            flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
+        },
+        16384,
+    );
+    // The reframe fired.
+    assert!(
+        result.system.contains("[HARNESS — STUCK; LOOP REMOVED"),
+        "expected context-reset reframe:\n{}",
+        result.system
+    );
+    // Every loop call+output was excised from the messages.
+    let leaks = result
+        .messages
+        .iter()
+        .filter(|m| m.to_string().contains("print(1)"))
+        .count();
+    assert_eq!(
+        leaks, 0,
+        "loop calls must be pruned from messages:\n{result:#?}"
+    );
+    let tool_call_msgs = result
+        .messages
+        .iter()
+        .filter(|m| m.get("tool_calls").is_some())
+        .count();
+    assert_eq!(tool_call_msgs, 0, "no loop tool-calls should remain");
 }
 
 // --- helpers ------------------------------------------------------------
@@ -869,4 +1229,96 @@ fn function_output(call_id: &str, content: &str, success: bool) -> ResponseItem 
             success: Some(success),
         },
     }
+}
+
+#[test]
+fn drop_oldest_until_fit_drops_front_and_keeps_recent() {
+    use serde_json::json;
+    // Five assistant messages, each ~400 chars of protected content (tool-data
+    // truncation can't touch assistant messages). With a tight budget the
+    // last-resort pass must drop the OLDEST until it fits, keeping the newest.
+    let big = "x".repeat(400);
+    let mut messages = vec![
+        json!({"role": "assistant", "content": format!("OLDEST {big}")}),
+        json!({"role": "assistant", "content": format!("second {big}")}),
+        json!({"role": "assistant", "content": format!("third {big}")}),
+        json!({"role": "assistant", "content": format!("fourth {big}")}),
+        json!({"role": "user", "content": "NEWEST request"}),
+    ];
+    let dropped = super::drop_oldest_until_fit("sys", &mut messages, 60);
+    assert!(dropped > 0, "should have dropped oldest content");
+    // The newest message is always retained.
+    assert_eq!(messages.last().unwrap()["content"], "NEWEST request");
+    // The oldest was dropped first.
+    assert_ne!(
+        messages.first().unwrap()["content"],
+        json!(format!("OLDEST {big}"))
+    );
+    // It actually fits now (or is down to the single final message).
+    let fit = super::estimate_messages_tokens(&messages) + crate::metrics::estimate_tokens("sys")
+        <= 60
+        || messages.len() == 1;
+    assert!(fit, "must converge to fit or a single message");
+}
+
+#[test]
+fn drop_oldest_strips_leading_orphan_tool_message() {
+    use serde_json::json;
+    // After dropping an assistant turn, a leading `tool` result would be orphaned;
+    // it must be stripped so the wire payload stays well-formed.
+    let big = "y".repeat(800);
+    let mut messages = vec![
+        json!({"role": "assistant", "content": format!("a {big}")}),
+        json!({"role": "tool", "content": format!("orphan {big}")}),
+        json!({"role": "user", "content": "final"}),
+    ];
+    super::drop_oldest_until_fit("", &mut messages, 20);
+    assert_ne!(
+        messages.first().unwrap()["role"],
+        json!("tool"),
+        "no leading orphan tool message"
+    );
+}
+
+#[test]
+fn compress_system_prompt_keeps_head_and_tail_when_over_budget() {
+    // Build a big system prompt with a distinctive head and tail.
+    let body = "MIDDLE ".repeat(4000); // ~28k chars
+    let text = format!("HEAD-ROLE-FRAMING\n{body}\nTAIL-OUTPUT-RULES");
+    // Budget it tiny (100 est tokens ≈ 400 chars) so it must compress.
+    let out = super::compress_system_prompt(&text, 100);
+    assert!(out.len() < text.len(), "should shrink");
+    assert!(out.contains("HEAD-ROLE-FRAMING"), "keeps the head");
+    assert!(out.contains("TAIL-OUTPUT-RULES"), "keeps the tail");
+    assert!(out.contains("middle elided"), "marks the elision");
+}
+
+#[test]
+fn compress_system_prompt_untouched_when_within_budget_or_disabled() {
+    let text = "You are a careful coding agent. Always use tools.";
+    // Generous budget → unchanged.
+    assert_eq!(super::compress_system_prompt(text, 10_000), text);
+    // usize::MAX (disabled) → unchanged.
+    assert_eq!(super::compress_system_prompt(text, usize::MAX), text);
+}
+
+#[test]
+fn drop_oldest_always_keeps_a_user_message() {
+    use serde_json::json;
+    // A huge turn: user request (oldest) + many big assistant/tool messages.
+    let big = "z".repeat(2000);
+    let mut messages = vec![
+        json!({"role": "user", "content": "Build the Ada handle resolver"}),
+        json!({"role": "assistant", "content": format!("a {big}")}),
+        json!({"role": "tool", "content": format!("t {big}")}),
+        json!({"role": "assistant", "content": format!("b {big}")}),
+        json!({"role": "tool", "content": format!("u {big}")}),
+    ];
+    super::drop_oldest_until_fit("sys", &mut messages, 30); // tiny budget → drop almost all
+    // Even though the user message was the OLDEST (dropped first), one survives —
+    // otherwise Ornith's template raises "No user query found" (a 500).
+    assert!(
+        messages.iter().any(|m| m["role"] == "user"),
+        "a user message must always survive: {messages:?}"
+    );
 }

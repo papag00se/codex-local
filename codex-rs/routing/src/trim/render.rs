@@ -17,6 +17,7 @@ use super::items::TrimItem;
 use super::rules::CompressedOlder;
 use super::state_extract::ExtractedState;
 use super::state_extract::ModifyOp;
+use super::state_extract::RepetitionAlert;
 
 /// Cap applied to each injected current-file block. Large files get
 /// truncated with a notice so a single edit doesn't blow the whole context
@@ -58,6 +59,12 @@ pub fn render_prelude(
         sections.push(block);
     }
 
+    // If the model's last apply_patch failed, steer it to a full write_file
+    // rewrite right after the pinned file contents it should rewrite from.
+    if let Some(directive) = render_patch_rewrite_directive(state) {
+        sections.push(directive);
+    }
+
     let world = render_world_state(state, active_turn);
     if !world.is_empty() {
         sections.push(world);
@@ -84,6 +91,24 @@ pub fn render_prelude(
     }
 
     sections.join("\n\n")
+}
+
+/// When the model's most recent `apply_patch` failed, steer it to a whole-file
+/// `write_file` rewrite instead of re-patching a file whose contents don't match
+/// its mental model. The authoritative file is pinned just above this directive.
+fn render_patch_rewrite_directive(state: &ExtractedState) -> Option<String> {
+    let pf = state.patch_failure.as_ref()?;
+    Some(format!(
+        "[PATCH DID NOT APPLY — REWRITE THE FILE]\n\
+         Your last `apply_patch` to `{path}` FAILED: its target lines are not in the file as \
+         written (commonly because an earlier edit never actually landed, so the code you tried to \
+         change was never created). Re-running apply_patch will keep failing the same way.\n\
+         The file's CURRENT on-disk contents are pinned above — rewrite from those. Output the \
+         COMPLETE intended file and save it with `write_file` (path=\"{path}\", content=<the entire \
+         file>). A full rewrite overwrites the file, so there is nothing to match. Do NOT call \
+         apply_patch on `{path}` again.",
+        path = pf.path,
+    ))
 }
 
 /// Render a `[Current file state]` block listing the verbatim on-disk
@@ -152,6 +177,38 @@ fn short_hash(s: &str) -> String {
 
 fn render_repetition_alert(state: &ExtractedState) -> Option<String> {
     let alert = state.repetition.as_ref()?;
+    if alert.escalate {
+        // Top tier: the advisory nudge and the hard block were both ignored.
+        // The loop's own turns have been excised from the messages (see
+        // `render_messages`); restate its single, unchanging result once and
+        // point the model at the live state (current file + last test result,
+        // rendered elsewhere in this prelude) so it acts instead of copying the
+        // loop it can no longer see.
+        return Some(format!(
+            "[HARNESS — STUCK; LOOP REMOVED FROM CONTEXT]\n\
+             You ran `{}` {} times and the result never changed, so those repeated calls were REMOVED from this conversation. Here is that result once — it will NOT change, do not run it again:\n{}\n\n\
+             The current file contents and latest test results are in your context above. Use them: make EXACTLY ONE edit to fix the failing test, then run the test once. Do not repeat any command you have already run.",
+            alert.command_summary, alert.count, alert.last_output_excerpt
+        ));
+    }
+    if alert.force_diagnosis {
+        // Thrash: same goal, varying commands, still failing. The model is
+        // guessing edits without reading the failure. Force it to diagnose
+        // before it's allowed to act again — this is the agent coaching the
+        // model through a problem it keeps bouncing off.
+        return Some(format!(
+            "[NO PROGRESS — DIAGNOSE BEFORE YOUR NEXT ACTION]\n\
+             You have attempted `{}` {} times now and the result keeps coming back the same. \
+             Your changes are NOT fixing it — you are guessing instead of reading the failure.\n\
+             Before you call ANY tool, reply in PLAIN TEXT with exactly these three things:\n\
+             1. Quote the exact error or failing line from the output below.\n\
+             2. State the single root cause of that specific error.\n\
+             3. State the ONE concrete change that fixes that root cause — and how it differs from what you already tried.\n\n\
+             Most recent result:\n{}\n\n\
+             Do not repeat a variation of an edit you have already made. Diagnose first, then make exactly one targeted change.",
+            alert.command_summary, alert.count, alert.last_output_excerpt
+        ));
+    }
     Some(format!(
         "[STOP — REPETITION DETECTED]\n\
          You have called `{}` with identical arguments {} times in a row. The result will not change. STOP making this call.\n\
@@ -160,6 +217,40 @@ fn render_repetition_alert(state: &ExtractedState) -> Option<String> {
          You MUST try a different approach now: change the arguments, use a different tool, or report what you've learned to the user. Repeating the same call is a wasted turn.",
         alert.tool_name, alert.count, alert.command_summary, alert.last_output_excerpt
     ))
+}
+
+/// Synthesized tool-output for the most-recent call in a detected repetition
+/// loop. Replaces the real (identical) result so the model reads, in the
+/// tool-output slot it actually attends to, an unambiguous "stop repeating"
+/// signal. The prelude alert ([`render_repetition_alert`]) stays as a
+/// reinforcing nudge, but this is the part a looping local model can't talk
+/// past — it's the result of its own last call.
+fn render_repetition_override(alert: &RepetitionAlert, content: &str) -> String {
+    if alert.force_diagnosis {
+        // Thrash override: planted in the tool-output slot the model actually
+        // attends to, demanding a diagnosis before its next move. This is the
+        // part a guessing local model can't talk past — it's the result of its
+        // own last call.
+        return format!(
+            "[HARNESS: NO PROGRESS — DIAGNOSE BEFORE ACTING]\n\
+             You have attempted this {} times and the outcome has not changed. More guesses will not help.\n\
+             Your NEXT reply must be PLAIN TEXT (no tool call) containing:\n\
+             1. The exact error/failing line, quoted from the result below.\n\
+             2. The single root cause.\n\
+             3. The one specific change that fixes it, and why it's different from what you already tried.\n\n\
+             The result you keep getting:\n{}",
+            alert.count, content
+        );
+    }
+    format!(
+        "[REPEATED CALL BLOCKED BY HARNESS]\n\
+         You have now called `{}` {} times in a row in the exact same way and gotten the exact same result every time ({}). \
+         Calling it again will produce the identical result — this is a no-op loop and a wasted turn.\n\n\
+         You MUST change approach now: use different arguments, switch to a different tool, or stop and report to the user what you've learned and what is blocking you. \
+         Do NOT issue this same `{}` call again.\n\n\
+         The identical result you already received (unchanged):\n{}",
+        alert.tool_name, alert.count, alert.command_summary, alert.tool_name, content
+    )
 }
 
 fn render_world_state(state: &ExtractedState, active_turn: u32) -> String {
@@ -194,7 +285,10 @@ fn render_world_state(state: &ExtractedState, active_turn: u32) -> String {
             let turns_since = active_turn.saturating_sub(m.turn_id);
             let entry = if turns_since >= 2 {
                 any_stale = true;
-                format!("{path} (turn {}, {} turns ago — content likely stale)", m.turn_id, turns_since)
+                format!(
+                    "{path} (turn {}, {} turns ago — content likely stale)",
+                    m.turn_id, turns_since
+                )
             } else {
                 format!("{path} (turn {})", m.turn_id)
             };
@@ -277,6 +371,7 @@ pub fn render_messages(
     parsed: &ParsedTranscript,
     active_turn: u32,
     flavor: crate::config::ClientFlavor,
+    repetition: Option<&RepetitionAlert>,
 ) -> (Vec<JsonValue>, usize) {
     let mut messages: Vec<JsonValue> = Vec::new();
 
@@ -346,6 +441,30 @@ pub fn render_messages(
 
     let older_turn_message_count = messages.len();
 
+    // Context reset: once a repeat-loop has escalated (advisory nudge + hard
+    // block both ignored), excise the loop's own calls + outputs from the
+    // active turn so the model stops copying the pattern out of its own
+    // saturated context. The prelude reframe restates the loop's single result
+    // once. Only signature-based loops are pruned (we can match those exactly).
+    let pruned_loop: std::collections::HashSet<&str> = match repetition {
+        Some(alert) if alert.escalate && !alert.signature.is_empty() => parsed
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                TrimItem::ToolCall {
+                    signature,
+                    call_id,
+                    turn_id,
+                    ..
+                } if *turn_id == active_turn && *signature == alert.signature => {
+                    Some(call_id.as_str())
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => std::collections::HashSet::new(),
+    };
+
     // Active turn: pass through verbatim, preserving the original
     // role/structure as best Ollama can represent it.
     for item in &parsed.items {
@@ -373,6 +492,9 @@ pub fn render_messages(
                 call_id,
                 ..
             } => {
+                if pruned_loop.contains(call_id.as_str()) {
+                    continue; // loop call excised by context reset
+                }
                 // Wire format for `arguments` differs by flavor:
                 //   - Ollama: JSON OBJECT (sending a string triggers parser
                 //     errors). We parse our stored args as JSON and embed
@@ -416,6 +538,9 @@ pub fn render_messages(
                 success,
                 ..
             } => {
+                if pruned_loop.contains(call_id.as_str()) {
+                    continue; // output of an excised loop call
+                }
                 // Render tool output as a `user`-role message wrapped in a
                 // `<tool_result>` block (or `<tool_error>` if the call failed)
                 // instead of the OpenAI-native `{role: "tool", ...}` form.
@@ -434,9 +559,21 @@ pub fn render_messages(
                 // important for local models that don't always parse error
                 // messages closely enough to figure out the recovery on their
                 // own.
-                let tag = if *success { "tool_result" } else { "tool_error" };
-                let hint = if !*success {
-                    tool_failure_hint(tool_name, content)
+                // Hard repetition stop: if this is the most-recent call in a
+                // detected repeat-loop, replace its output with a synthesized
+                // result that explicitly tells the model it has repeated this
+                // exact call and gotten the identical result. Lands in the
+                // tool-output slot the model is trained to read — far harder to
+                // ignore than the prelude alert (which a stuck local model
+                // routinely talks right past).
+                let repetition_override = repetition
+                    .filter(|alert| !alert.call_id.is_empty() && alert.call_id == *call_id)
+                    .map(|alert| render_repetition_override(alert, content));
+                let success = *success && repetition_override.is_none();
+                let body: &str = repetition_override.as_deref().unwrap_or(content);
+                let tag = if success { "tool_result" } else { "tool_error" };
+                let hint = if !success && repetition_override.is_none() {
+                    tool_failure_hint(tool_name, body)
                 } else {
                     String::new()
                 };
@@ -448,10 +585,10 @@ pub fn render_messages(
                         // `tool_call_id`. Anything else (e.g. our `<tool_result>`
                         // user-message wrapper) is rejected as
                         // "Invalid 'messages' in payload."
-                        let mut content_str = if *success {
-                            content.clone()
+                        let mut content_str = if success {
+                            body.to_string()
                         } else {
-                            format!("<{tag} tool=\"{tool_name}\">\n{content}\n</{tag}>")
+                            format!("<{tag} tool=\"{tool_name}\">\n{body}\n</{tag}>")
                         };
                         if !hint.is_empty() {
                             content_str.push_str(&hint);
@@ -470,7 +607,7 @@ pub fn render_messages(
                         messages.push(serde_json::json!({
                             "role": "user",
                             "content": format!(
-                                "<{tag} tool=\"{tool_name}\" call_id=\"{call_id}\">\n{content}\n</{tag}>{hint}"
+                                "<{tag} tool=\"{tool_name}\" call_id=\"{call_id}\">\n{body}\n</{tag}>{hint}"
                             ),
                         }));
                     }
@@ -502,12 +639,16 @@ fn tool_failure_hint(tool_name: &str, content: &str) -> String {
     let prefix = "\n\n→ Hint: ";
     match tool_name {
         "apply_patch" => {
-            if content.contains("Failed to find context") {
+            if content.contains("Failed to find context")
+                || content.contains("Failed to find expected lines")
+            {
                 format!(
-                    "{prefix}The patch's context lines don't match the file's current content — your in-memory view is stale. Re-read the file with `shell` `cat <path>` (or `nl -ba <path>` for line numbers) BEFORE constructing the next patch."
+                    "{prefix}The patch's target lines aren't in the file as written — often because an earlier edit never actually landed. Re-patching will keep failing. The file's current contents are pinned above; rewrite the WHOLE file with `write_file` instead."
                 )
             } else if content.contains("first line of the patch must be '*** Begin Patch'") {
-                format!("{prefix}Add `*** Begin Patch` as the very first line of the `input` string.")
+                format!(
+                    "{prefix}Add `*** Begin Patch` as the very first line of the `input` string."
+                )
             } else if content.contains("last line of the patch must be '*** End Patch'") {
                 format!("{prefix}Add `*** End Patch` as the very last line of the `input` string.")
             } else if content.contains("not a valid hunk header") {
@@ -519,7 +660,8 @@ fn tool_failure_hint(tool_name: &str, content: &str) -> String {
             }
         }
         "shell" | "exec_command" | "shell_command" | "local_shell" => {
-            if content.contains("regex parse error") || content.contains("repetition operator missing expression")
+            if content.contains("regex parse error")
+                || content.contains("repetition operator missing expression")
             {
                 format!(
                     "{prefix}`rg` interpreted your argument as a regex with invalid syntax. For file globbing use `rg --files -g '<glob>'` (e.g. `-g '*.ts'`), repeated for each glob."

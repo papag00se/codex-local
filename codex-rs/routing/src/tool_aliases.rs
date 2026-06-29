@@ -354,6 +354,236 @@ pub struct TranslatedCall {
     pub command_line: String,
 }
 
+/// Render a block of text as `apply_patch` hunk lines, each prefixed with
+/// `prefix` (`-` for the lines to remove, `+` for the lines to add). A single
+/// trailing newline is stripped so we don't emit a spurious bare-prefix line.
+/// Empty input yields no lines (a pure insertion or deletion).
+fn prefix_hunk_lines(text: &str, prefix: char) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    text.trim_end_matches('\n')
+        .split('\n')
+        .map(|line| format!("{prefix}{line}\n"))
+        .collect()
+}
+
+/// Translate a content-based `edit_file` call into an `apply_patch` Update
+/// hunk. Local models handle "find this exact snippet, replace it with that"
+/// far more reliably than the unified-diff/hunk format — there are no `@@`
+/// headers, no per-line prefixes, and no surrounding context for them to
+/// reproduce from memory (the #1 source of "Failed to find context" loops).
+/// The `old_string` lines become the `-` lines, which `seek_sequence`
+/// fuzzy-locates in the file; `new_string` lines become the `+` lines.
+///
+/// Accepts `{path|file, old_string|old, new_string|new}`. `new_string` may be
+/// empty (a deletion). Returns `None` if `path` or `old_string` is missing /
+/// empty (an edit with no anchor can't be located).
+pub fn normalize_edit_file_call(args: &JsonValue) -> Option<TranslatedCall> {
+    let obj = args.as_object()?;
+    let get = |keys: &[&str]| -> Option<String> {
+        keys.iter()
+            .find_map(|k| obj.get(*k).and_then(|v| v.as_str()))
+            .map(str::to_string)
+    };
+    let path = get(&["path", "file", "file_path", "filename"])?;
+    let old = get(&["old_string", "old", "old_str", "search"])?;
+    let new = get(&["new_string", "new", "new_str", "replace"]).unwrap_or_default();
+    if path.is_empty() || old.is_empty() {
+        return None;
+    }
+    let minus = prefix_hunk_lines(&old, '-');
+    let plus = prefix_hunk_lines(&new, '+');
+    let body = format!("*** Begin Patch\n*** Update File: {path}\n{minus}{plus}*** End Patch");
+    Some(TranslatedCall {
+        name: "apply_patch",
+        args: serde_json::json!({ "input": body }),
+        command_line: format!("edit_file -> apply_patch (Update {path})"),
+    })
+}
+
+/// Translate a `write_file` call into a `shell` invocation that writes the
+/// content to disk, **creating or overwriting** the file. We route through
+/// `shell` (not `apply_patch`) for two reasons: `apply_patch`'s `Add File` now
+/// refuses to overwrite an existing file (the intended guard), and small models
+/// reliably botch the JSON/heredoc escaping of large file content. The content
+/// is single-quote-escaped (`'` → `'\''`) so ANY bytes — newlines, quotes, `$`,
+/// backticks — are written verbatim, and the command runs under the same
+/// sandbox as every other `shell` call. Parent directories are created.
+///
+/// Accepts `{path|file, content|contents|text}`. Returns `None` if `path` is
+/// missing/empty or contains a single quote (which we can't safely quote).
+pub fn normalize_write_file_call(args: &JsonValue) -> Option<TranslatedCall> {
+    let obj = args.as_object()?;
+    let get = |keys: &[&str]| -> Option<String> {
+        keys.iter()
+            .find_map(|k| obj.get(*k).and_then(|v| v.as_str()))
+            .map(str::to_string)
+    };
+    let path = get(&["path", "file", "file_path", "filename"])?;
+    if path.is_empty() || path.contains('\'') {
+        return None;
+    }
+    let content = get(&["content", "contents", "text", "body"]).unwrap_or_default();
+    // Wrap content in single quotes; the only sequence that needs escaping
+    // inside single quotes is the single quote itself.
+    let escaped = content.replace('\'', "'\\''");
+    // Echo a confirmation on success: `printf … > file` is silent, and a small
+    // model with no positive feedback assumes the write failed and retries (seen
+    // live: "let me use write_file again" loops). The byte count + path tells it
+    // the write landed.
+    let cmd = format!(
+        "mkdir -p \"$(dirname '{path}')\" 2>/dev/null; printf '%s' '{escaped}' > '{path}' \
+         && printf 'write_file: wrote %s bytes to %s\\n' \"$(wc -c < '{path}')\" '{path}'"
+    );
+    Some(TranslatedCall {
+        name: "shell",
+        args: serde_json::json!({ "command": ["bash", "-lc", cmd] }),
+        command_line: format!("write_file -> shell (overwrite {path})"),
+    })
+}
+
+/// Best-effort recovery of a `write_file`/`create_file` call whose JSON arguments
+/// the model botched. A small model cannot reliably JSON-escape an entire file as
+/// a string argument: it emits raw (unescaped) newlines and bare double-quotes in
+/// the `content` value, so `serde_json` rejects the whole object and the write is
+/// lost. Rather than re-prompt it to "escape better" (which it can't), we parse the
+/// two fields we need out of the raw text and rebuild a clean `{path, content}`
+/// object the real handler can ingest.
+///
+/// Heuristics (robust to the common failure, not a general JSON repair):
+/// - `path` is short and single-line — read to the next unescaped quote.
+/// - `content` is assumed to be the LAST field — take everything from its opening
+///   quote to the last quote before the closing brace, treating the interior as
+///   raw text. Recognized escapes the model *did* emit (`\n`, `\t`, `\"`, `\\`) are
+///   still decoded, so fully-escaped, fully-raw, and mixed content all work.
+///
+/// Returns `None` if the fields can't be located (caller then leaves the malformed
+/// call alone, so the handler surfaces a normal error).
+pub fn recover_write_file_args(raw: &str) -> Option<JsonValue> {
+    let path_at = value_open_quote(raw, &["path", "file", "file_path", "filename"])?;
+    let path_rest = &raw[path_at..];
+    let path_end = next_unescaped_quote(path_rest)?;
+    let path = decode_lenient(&path_rest[..path_end]);
+    if path.trim().is_empty() {
+        return None;
+    }
+
+    let content_at = value_open_quote(
+        raw,
+        &["content", "contents", "text", "body", "data", "file_text"],
+    )?;
+    let tail = &raw[content_at..];
+    // content is the last field → its closing quote is the last quote in the tail.
+    let close = tail.rfind('"')?;
+    let content = decode_lenient(&tail[..close]);
+
+    Some(serde_json::json!({ "path": path, "content": content }))
+}
+
+/// Byte index just AFTER the opening quote of the first matching `"key": "…"`
+/// pair in `raw`, or `None` if no key matches / the value isn't a quoted string.
+fn value_open_quote(raw: &str, keys: &[&str]) -> Option<usize> {
+    for key in keys {
+        let pat = format!("\"{key}\"");
+        if let Some(k) = raw.find(&pat) {
+            let after_key = k + pat.len();
+            let rest = &raw[after_key..];
+            if let Some(colon) = rest.find(':') {
+                let after_colon = &rest[colon + 1..];
+                if let Some(q) = after_colon.find('"') {
+                    return Some(after_key + colon + 1 + q + 1);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Byte index of the first `"` not preceded by an odd number of backslashes.
+fn next_unescaped_quote(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            let mut bs = 0;
+            let mut j = i;
+            while j > 0 && bytes[j - 1] == b'\\' {
+                bs += 1;
+                j -= 1;
+            }
+            if bs % 2 == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Decode the standard JSON string escapes a model may have emitted, while
+/// passing raw (already-literal) characters through untouched. Unknown escapes
+/// keep their backslash so nothing is silently dropped.
+fn decode_lenient(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('/') => out.push('/'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Normalize a read-only `read_file` call into a `shell` invocation that prints
+/// the file (optionally a line range). The model supplies only a path and
+/// optional bounds; the command itself is built by the harness, so a read-only
+/// role cannot smuggle arbitrary shell through it. Paths containing a single
+/// quote are refused rather than risk breaking the quoting.
+pub fn normalize_read_file_call(args: &JsonValue) -> Option<TranslatedCall> {
+    let obj = args.as_object()?;
+    let get_str = |keys: &[&str]| -> Option<String> {
+        keys.iter()
+            .find_map(|k| obj.get(*k).and_then(|v| v.as_str()))
+            .map(str::to_string)
+    };
+    let get_u = |keys: &[&str]| -> Option<u64> {
+        keys.iter()
+            .find_map(|k| obj.get(*k).and_then(|v| v.as_u64()))
+    };
+    let path = get_str(&["path", "file", "file_path", "filename"])?;
+    if path.is_empty() || path.contains('\'') {
+        return None;
+    }
+    let cmd = match (
+        get_u(&["start_line", "start", "from"]),
+        get_u(&["end_line", "end", "to"]),
+    ) {
+        (Some(s), Some(e)) => format!("sed -n '{s},{e}p' '{path}'"),
+        (Some(s), None) => format!("sed -n '{s},$p' '{path}'"),
+        _ => format!("cat '{path}'"),
+    };
+    Some(TranslatedCall {
+        name: "shell",
+        args: serde_json::json!({ "command": ["bash", "-lc", cmd.clone()] }),
+        command_line: format!("read_file -> shell ({cmd})"),
+    })
+}
+
 /// Normalize an `apply_patch` invocation. Two normalizations apply, in order:
 ///
 /// 1. **Unified-diff translation** — when the model emits a standard unified
@@ -366,6 +596,56 @@ pub struct TranslatedCall {
 ///    pasting a file body, not a diff). Detect that and add the missing
 ///    prefix. Also auto-appends `*** End Patch` when missing.
 ///
+/// Convert a pure single-file `*** Add File:` patch into a `write_file` call.
+/// `apply_patch` is being retired for local models (the 9B can't reliably produce
+/// matching context); a file-creating patch is just a whole-file write, so routing
+/// it to the robust `write_file` handler is both more reliable and avoids the
+/// "Cannot add: already exists" failure (write_file overwrites). Returns `None` for
+/// anything that isn't a clean single Add — Update/Delete/multi-file/unified-diff
+/// patches fall through to normal `apply_patch` normalization.
+pub fn apply_patch_add_to_write_file(args: &JsonValue) -> Option<TranslatedCall> {
+    let input = args
+        .get("input")
+        .or_else(|| args.get("patch"))
+        .and_then(|v| v.as_str())?;
+    if input.contains("*** Update File:") || input.contains("*** Delete File:") {
+        return None;
+    }
+    let adds: Vec<&str> = input
+        .lines()
+        .filter_map(|l| l.strip_prefix("*** Add File: "))
+        .collect();
+    if adds.len() != 1 {
+        return None; // zero, or multi-file — let the normal path handle it
+    }
+    let path = adds[0].trim().to_string();
+    if path.is_empty() || path.contains('\n') {
+        return None;
+    }
+    // Body = the '+'-prefixed lines after the Add File header, '+' stripped.
+    let mut content = String::new();
+    let mut in_body = false;
+    for line in input.lines() {
+        if line.starts_with("*** Add File:") {
+            in_body = true;
+            continue;
+        }
+        if line.starts_with("*** ") {
+            in_body = false; // *** End Patch or another header
+            continue;
+        }
+        if in_body && let Some(rest) = line.strip_prefix('+') {
+            content.push_str(rest);
+            content.push('\n');
+        }
+    }
+    Some(TranslatedCall {
+        name: "write_file",
+        args: serde_json::json!({ "path": path, "content": content }),
+        command_line: format!("apply_patch Add -> write_file ({path})"),
+    })
+}
+
 /// Returns `Some(translated)` only when at least one normalization fired.
 pub fn normalize_apply_patch_call(args: &JsonValue) -> Option<TranslatedCall> {
     let obj = args.as_object()?;
@@ -617,7 +897,11 @@ fn normalize_codex_hunk_header(rest: &str) -> String {
     };
     // Expect digits immediately after the `-`; otherwise it's a real
     // anchor line that happens to start with `-` (unusual but possible).
-    if !after_minus.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+    if !after_minus
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_digit())
+    {
         return rest.to_string();
     }
     // Require a closing `@@` somewhere after, otherwise this isn't a
@@ -1132,9 +1416,295 @@ fn shell_quote_if_needed(s: &str) -> String {
     format!("'{escaped}'")
 }
 
+// --- Leaked tool-call recovery (Hermes / ChatML `<tool_call>` format) --------
+//
+// Qwen-family models (e.g. Qwopus) emit tool calls as:
+//   <tool_call>
+//   {"name": "exec_command", "arguments": {"cmd": "..."}}
+//   </tool_call>
+// When the server's chat template doesn't parse this into structured
+// `tool_calls` (it should with `--jinja`, but doesn't reliably for every turn),
+// the call leaks into the assistant's *text* content. The harness then sees
+// zero tool calls and the model's action silently vanishes — and worse, the
+// turn can be accepted as a completion. Recovering the call here turns it back
+// into a real tool call. The proper fix is server-side parsing; this is the
+// safety net.
+
+const TOOL_CALL_OPEN: &str = "<tool_call>";
+const TOOL_CALL_CLOSE: &str = "</tool_call>";
+
+/// Cheap pre-check: does the content carry a leaked `<tool_call>` block?
+pub fn has_leaked_tool_call(content: &str) -> bool {
+    content.contains(TOOL_CALL_OPEN)
+}
+
+/// Parse every `<tool_call>{json}</tool_call>` block in `content` into the
+/// Ollama wire shape (`{"function": {"name", "arguments": <string>}}`) so they
+/// can go through the same `translate_native_tool_calls` path as real calls.
+pub fn parse_leaked_tool_calls(content: &str) -> Vec<JsonValue> {
+    let mut out = Vec::new();
+    let mut rest = content;
+    while let Some(open) = rest.find(TOOL_CALL_OPEN) {
+        let after = &rest[open + TOOL_CALL_OPEN.len()..];
+        let Some(close) = after.find(TOOL_CALL_CLOSE) else {
+            break;
+        };
+        if let Some(call) = parse_one_leaked_call(after[..close].trim()) {
+            out.push(call);
+        }
+        rest = &after[close + TOOL_CALL_CLOSE.len()..];
+    }
+    out
+}
+
+fn parse_one_leaked_call(inner: &str) -> Option<JsonValue> {
+    // Preferred shape: Hermes JSON — `{"name":..,"arguments":{..}}`.
+    if let Ok(v) = serde_json::from_str::<JsonValue>(inner)
+        && let Some(name) = v.get("name").and_then(|n| n.as_str())
+    {
+        // `arguments` (Hermes) or `parameters` (some variants); object or string.
+        let args_string = match v.get("arguments").or_else(|| v.get("parameters")) {
+            Some(JsonValue::String(s)) => s.clone(),
+            Some(other) => serde_json::to_string(other).ok()?,
+            None => "{}".to_string(),
+        };
+        return Some(serde_json::json!({
+            "function": { "name": name, "arguments": args_string }
+        }));
+    }
+    // Fallback: XML-function shape some finetunes (Ornith, Hermes-2-Pro,
+    // Qwen-Agent) emit instead — `<function=NAME><parameter=KEY>VALUE</parameter>…</function>`.
+    parse_xml_function_call(inner)
+}
+
+/// Parse the XML-style tool call `<function=NAME><parameter=KEY>VALUE</parameter>…`
+/// into the Ollama wire shape. Tolerates both `<function=NAME>` and
+/// `<function name="NAME">` (likewise for parameters). Numeric/bool values become
+/// JSON scalars; everything else stays a string so multi-line shell commands
+/// survive intact.
+fn parse_xml_function_call(inner: &str) -> Option<JsonValue> {
+    const FN_TAG: &str = "<function";
+    const P_TAG: &str = "<parameter";
+    const P_CLOSE: &str = "</parameter>";
+
+    let fstart = inner.find(FN_TAG)?;
+    let after_fn = &inner[fstart + FN_TAG.len()..];
+    let head_end = after_fn.find('>')?;
+    let name = tag_key(&after_fn[..head_end])?;
+    if name.is_empty() {
+        return None;
+    }
+
+    let mut map = serde_json::Map::new();
+    let mut rest = &after_fn[head_end + 1..];
+    while let Some(p) = rest.find(P_TAG) {
+        let after_tag = &rest[p + P_TAG.len()..];
+        let Some(tag_end) = after_tag.find('>') else {
+            break;
+        };
+        let key = tag_key(&after_tag[..tag_end]);
+        let body = &after_tag[tag_end + 1..];
+        let Some(vclose) = body.find(P_CLOSE) else {
+            break;
+        };
+        if let Some(key) = key.filter(|k| !k.is_empty()) {
+            map.insert(key, parse_param_value(body[..vclose].trim()));
+        }
+        rest = &body[vclose + P_CLOSE.len()..];
+    }
+
+    let args_string = serde_json::to_string(&JsonValue::Object(map)).ok()?;
+    Some(serde_json::json!({
+        "function": { "name": name, "arguments": args_string }
+    }))
+}
+
+/// Pull the identifier out of an opening-tag remainder, handling both
+/// `=NAME` (from `<function=NAME>`) and ` name="NAME"` attribute styles.
+fn tag_key(tag_attrs: &str) -> Option<String> {
+    let key = tag_attrs
+        .split('=')
+        .nth(1)?
+        .trim()
+        .trim_matches('"')
+        .trim()
+        .to_string();
+    Some(key)
+}
+
+/// A parameter value is a JSON scalar when it cleanly parses as one (so
+/// `max_output_tokens` stays an int), otherwise a string (so a multi-line
+/// shell command is preserved verbatim).
+fn parse_param_value(raw: &str) -> JsonValue {
+    match raw {
+        "true" => return JsonValue::Bool(true),
+        "false" => return JsonValue::Bool(false),
+        _ => {}
+    }
+    if let Ok(n) = raw.parse::<i64>() {
+        return JsonValue::from(n);
+    }
+    JsonValue::String(raw.to_string())
+}
+
+/// Remove the `<tool_call>...</tool_call>` blocks from `content` so the leaked
+/// JSON doesn't also show up as prose once it's been promoted to a real call.
+pub fn strip_leaked_tool_calls(content: &str) -> String {
+    let mut out = String::new();
+    let mut rest = content;
+    while let Some(open) = rest.find(TOOL_CALL_OPEN) {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + TOOL_CALL_OPEN.len()..];
+        match after.find(TOOL_CALL_CLOSE) {
+            Some(close) => rest = &after[close + TOOL_CALL_CLOSE.len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_patch_add_becomes_write_file() {
+        let args = serde_json::json!({"input": "*** Begin Patch\n*** Add File: src/new.py\n+import os\n+\n+def main():\n+    pass\n*** End Patch"});
+        let t = apply_patch_add_to_write_file(&args).expect("a pure Add should convert");
+        assert_eq!(t.name, "write_file");
+        assert_eq!(t.args["path"], "src/new.py");
+        assert_eq!(t.args["content"], "import os\n\ndef main():\n    pass\n");
+    }
+
+    #[test]
+    fn apply_patch_update_is_not_converted() {
+        // Updates need context matching — they must NOT be turned into a blind
+        // overwrite (that would destroy the rest of the file).
+        let args = serde_json::json!({"input": "*** Begin Patch\n*** Update File: a.py\n-old\n+new\n*** End Patch"});
+        assert!(apply_patch_add_to_write_file(&args).is_none());
+        // Multi-file patch also falls through.
+        let multi =
+            serde_json::json!({"input": "*** Add File: a.py\n+x\n*** Add File: b.py\n+y\n"});
+        assert!(apply_patch_add_to_write_file(&multi).is_none());
+    }
+
+    #[test]
+    fn recover_write_file_handles_raw_newlines_and_bare_quotes() {
+        // The dominant 9B failure: file content dumped with LITERAL newlines and
+        // unescaped inner double-quotes → invalid JSON that serde rejects.
+        let raw = "{\"path\": \"app.py\", \"content\": \"def greet():\n    print(\"hi\")\n    return 0\"}";
+        assert!(
+            serde_json::from_str::<JsonValue>(raw).is_err(),
+            "precondition: invalid JSON"
+        );
+        let recovered = recover_write_file_args(raw).expect("should recover");
+        assert_eq!(recovered["path"], "app.py");
+        let content = recovered["content"].as_str().unwrap();
+        assert!(
+            content.contains("print(\"hi\")"),
+            "inner quotes preserved: {content:?}"
+        );
+        assert!(
+            content.contains("def greet():\n"),
+            "raw newline preserved: {content:?}"
+        );
+    }
+
+    #[test]
+    fn recover_write_file_decodes_escaped_content() {
+        // Fully-escaped (valid-ish) content also decodes to the same result.
+        let raw = r#"{"path":"a.txt","content":"line1\nline2\ttabbed"}"#;
+        let recovered = recover_write_file_args(raw).expect("should recover");
+        assert_eq!(recovered["content"], "line1\nline2\ttabbed");
+    }
+
+    #[test]
+    fn recover_write_file_none_without_fields() {
+        assert!(recover_write_file_args(r#"{"foo": 1}"#).is_none());
+        assert!(recover_write_file_args("not json at all").is_none());
+    }
+
+    #[test]
+    fn recovers_leaked_hermes_tool_call() {
+        // The exact shape that leaked in a real session: the model wrote its
+        // pytest call as text instead of a structured call.
+        let content = "I'll verify now.\n<tool_call>\n{\"name\": \"exec_command\", \"arguments\": {\"cmd\": \"pytest -q\"}}\n</tool_call>\nDone.";
+        assert!(has_leaked_tool_call(content));
+        let calls = parse_leaked_tool_calls(content);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "exec_command");
+        // arguments must be a STRING (Ollama wire shape), re-parseable to the object.
+        let args: JsonValue =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["cmd"], "pytest -q");
+        // Stripping removes the block but keeps the prose.
+        let stripped = strip_leaked_tool_calls(content);
+        assert!(!stripped.contains("<tool_call>"));
+        assert!(stripped.contains("I'll verify now."));
+        assert!(stripped.contains("Done."));
+    }
+
+    #[test]
+    fn recovers_leaked_xml_function_tool_call() {
+        // The exact Ornith leak: <tool_call><function=NAME><parameter=KEY>…
+        let leaked = "<tool_call>\n<function=exec_command>\n<parameter=cmd>\ncd /tmp && python3 -c \"print('hi')\"\n</parameter>\n<parameter=max_output_tokens>\n5000\n</parameter>\n</function>\n</tool_call>";
+        assert!(has_leaked_tool_call(leaked));
+        let calls = parse_leaked_tool_calls(leaked);
+        assert_eq!(calls.len(), 1, "should recover one call");
+        let f = &calls[0]["function"];
+        assert_eq!(f["name"], "exec_command");
+        // arguments is a JSON string; parse it back and check the fields.
+        let args: serde_json::Value =
+            serde_json::from_str(f["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["cmd"], "cd /tmp && python3 -c \"print('hi')\"");
+        assert_eq!(args["max_output_tokens"], 5000); // numeric, not "5000"
+        // The block is stripped from the visible content.
+        assert!(strip_leaked_tool_calls(leaked).is_empty());
+    }
+
+    #[test]
+    fn recovers_real_world_xml_leak_with_pipes_and_redirects() {
+        // The EXACT shape Ornith leaked in session 019f05ae: a multi-line shell
+        // command with a pipe and a `2>&1` redirect inside the parameter body.
+        // The `>` in `2>&1` must NOT be mistaken for a tag close.
+        let leaked = "<tool_call>\n<function=exec_command>\n<parameter=cmd>\ncd /home/jesse/src/codex.test.site && python3 -m pytest test_lambda_handler.py -v 2>&1 | tail -40\n</parameter>\n</function>\n</tool_call>";
+        assert!(has_leaked_tool_call(leaked));
+        let calls = parse_leaked_tool_calls(leaked);
+        assert_eq!(calls.len(), 1, "must recover the real leak");
+        assert_eq!(calls[0]["function"]["name"], "exec_command");
+        let args: serde_json::Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            args["cmd"],
+            "cd /home/jesse/src/codex.test.site && python3 -m pytest test_lambda_handler.py -v 2>&1 | tail -40"
+        );
+    }
+
+    #[test]
+    fn malformed_leaked_tool_call_is_detected_but_not_parsed() {
+        // The real failure: a heredoc whose quotes/newlines break the JSON. The
+        // detector must still flag it (so the harness nudges instead of treating
+        // the turn as complete), but the parser must gracefully yield nothing
+        // rather than panic or recover garbage.
+        let bad = "<tool_call>\n{\"name\": \"exec_command\", \"arguments\": {\"cmd\": \"python3 << 'EOF'\nprint('x')\"\nEOF\n\"}}\n</tool_call>";
+        assert!(has_leaked_tool_call(bad));
+        assert!(parse_leaked_tool_calls(bad).is_empty());
+    }
+
+    #[test]
+    fn leaked_parser_handles_multiple_and_ignores_plain_text() {
+        assert!(!has_leaked_tool_call("just prose, no tools"));
+        assert!(parse_leaked_tool_calls("just prose").is_empty());
+        let two = "<tool_call>{\"name\":\"a\",\"arguments\":{\"x\":1}}</tool_call> mid <tool_call>{\"name\":\"b\",\"arguments\":{}}</tool_call>";
+        let calls = parse_leaked_tool_calls(two);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["function"]["name"], "a");
+        assert_eq!(calls[1]["function"]["name"], "b");
+    }
 
     #[test]
     fn recognizes_common_unix_commands() {
@@ -1334,6 +1904,98 @@ mod tests {
     }
 
     #[test]
+    fn edit_file_translates_to_update_hunk() {
+        let call = serde_json::json!({
+            "path": "src/a.rs",
+            "old_string": "let x = 1;\nlet y = 2;",
+            "new_string": "let x = 10;\nlet y = 20;"
+        });
+        let t = normalize_edit_file_call(&call).unwrap();
+        assert_eq!(t.name, "apply_patch");
+        let body = t.args.get("input").unwrap().as_str().unwrap();
+        assert_eq!(
+            body,
+            "*** Begin Patch\n*** Update File: src/a.rs\n-let x = 1;\n-let y = 2;\n+let x = 10;\n+let y = 20;\n*** End Patch"
+        );
+    }
+
+    #[test]
+    fn edit_file_empty_new_string_is_a_deletion() {
+        let call =
+            serde_json::json!({"path": "a.rs", "old_string": "dead_line();", "new_string": ""});
+        let body = normalize_edit_file_call(&call)
+            .unwrap()
+            .args
+            .get("input")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            body,
+            "*** Begin Patch\n*** Update File: a.rs\n-dead_line();\n*** End Patch"
+        );
+    }
+
+    #[test]
+    fn edit_file_requires_path_and_nonempty_old_string() {
+        assert!(normalize_edit_file_call(&serde_json::json!({"path": "a.rs"})).is_none());
+        assert!(
+            normalize_edit_file_call(&serde_json::json!({"old_string": "x", "new_string": "y"}))
+                .is_none()
+        );
+        assert!(
+            normalize_edit_file_call(
+                &serde_json::json!({"path": "a.rs", "old_string": "", "new_string": "y"})
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn edit_file_accepts_alias_keys() {
+        let call = serde_json::json!({"file": "a.rs", "old": "alpha", "new": "beta"});
+        let body = normalize_edit_file_call(&call)
+            .unwrap()
+            .args
+            .get("input")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            body,
+            "*** Begin Patch\n*** Update File: a.rs\n-alpha\n+beta\n*** End Patch"
+        );
+    }
+
+    #[test]
+    fn write_file_translates_to_shell_overwrite() {
+        // Content with a single quote must be escaped so it writes verbatim and
+        // can't break out of the shell quoting.
+        let call =
+            serde_json::json!({"path": "src/new.rs", "content": "fn main() { let s = 'x'; }\n"});
+        let t = normalize_write_file_call(&call).unwrap();
+        assert_eq!(t.name, "shell");
+        let cmd = t.args["command"][2].as_str().unwrap();
+        assert!(cmd.contains("> 'src/new.rs'"), "writes to the path: {cmd}");
+        assert!(cmd.contains("mkdir -p"), "creates parent dirs: {cmd}");
+        // The embedded single quote is escaped as '\'' (no raw break-out).
+        assert!(cmd.contains("'\\''x'\\''"), "single quotes escaped: {cmd}");
+        // Confirms success so the model knows the write landed.
+        assert!(
+            cmd.contains("write_file: wrote"),
+            "echoes a confirmation: {cmd}"
+        );
+    }
+
+    #[test]
+    fn write_file_refuses_path_with_single_quote() {
+        let call = serde_json::json!({"path": "weird'name.rs", "content": "x"});
+        assert!(normalize_write_file_call(&call).is_none());
+    }
+
+    #[test]
     fn unified_diff_translation_basic_update() {
         let input = "\
 --- a/handler.py
@@ -1495,7 +2157,10 @@ index abc1234..def5678 100644
         let result = normalize_apply_patch_call(&serde_json::json!({"input": input})).unwrap();
         let body = result.args.get("input").unwrap().as_str().unwrap();
         // Anchor text is preserved; line numbers are gone.
-        assert!(body.contains("@@ def my_function():"), "expected `@@ def my_function():`, got:\n{body}");
+        assert!(
+            body.contains("@@ def my_function():"),
+            "expected `@@ def my_function():`, got:\n{body}"
+        );
         assert!(!body.contains("-17,7"));
     }
 
@@ -1513,7 +2178,10 @@ index abc1234..def5678 100644
 ";
         // Since this patch is already well-formed, normalize should return None.
         let result = normalize_apply_patch_call(&serde_json::json!({"input": input}));
-        assert!(result.is_none(), "well-formed @@ anchor should not be rewritten");
+        assert!(
+            result.is_none(),
+            "well-formed @@ anchor should not be rewritten"
+        );
     }
 
     #[test]

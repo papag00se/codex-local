@@ -351,6 +351,30 @@ mod tests {
     }
 
     #[test]
+    fn renders_inline_route_readout() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut w = StatusIndicatorWidget::new(
+            tx,
+            crate::tui::FrameRequester::test_dummy(),
+            /*animations_enabled*/ false,
+        );
+        // The live routing readout is delivered through the inline-message slot.
+        w.update_inline_message(Some("light_coder (qwopus) · 312/47 tok/s".to_string()));
+        w.set_interrupt_hint_visible(/*visible*/ false);
+
+        // Freeze time-dependent rendering to keep the snapshot stable.
+        w.is_paused = true;
+        w.elapsed_running = Duration::ZERO;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 1)).expect("terminal");
+        terminal
+            .draw(|f| w.render(f.area(), f.buffer_mut()))
+            .expect("draw");
+        insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
     fn renders_wrapped_details_panama_two_lines() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);

@@ -64,7 +64,7 @@ pub enum ClientFlavor {
 pub struct OllamaEndpoint {
     pub base_url: String,
     pub model: String,
-    pub num_ctx: usize,
+    pub trim_budget: usize,
     pub temperature: f64,
     /// Per-request wall-clock timeout. `0` disables the timeout entirely
     /// (reasoning runs are legitimately unbounded). Normalized from config:
@@ -95,6 +95,23 @@ pub struct OllamaEndpoint {
     /// the key (unlimited), which is the ergonomic convention.
     #[serde(default)]
     pub max_tokens: Option<usize>,
+    /// Optional sampler overrides. `None` = omit from the request so the
+    /// server default applies. Set per-role for models that need non-stock
+    /// sampling (e.g. Gemma 4: `top_p=0.95`, `top_k=64`, `repeat_penalty=1.1`).
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    #[serde(default)]
+    pub top_k: Option<u64>,
+    #[serde(default)]
+    pub repeat_penalty: Option<f64>,
+    /// Tool-call constraint sent to OpenAI-compatible servers. `None` omits the
+    /// field (server default = `"auto"`, unconstrained format). `Some("required")`
+    /// forces and grammar-constrains a valid tool call; `Some("<fn name>")`
+    /// forces a specific tool. The lever for fixing local-model tool-call format
+    /// at the source instead of recovering after the fact — see
+    /// docs/spec/local-coder-massaging.md §25.
+    #[serde(default)]
+    pub tool_choice: Option<String>,
 }
 
 impl OllamaEndpoint {
@@ -102,7 +119,7 @@ impl OllamaEndpoint {
         Self {
             base_url: env_or(url_var, defaults.0),
             model: env_or(model_var, defaults.1),
-            num_ctx: 8192,
+            trim_budget: 8192,
             temperature: 0.1,
             timeout_seconds: 300,
             enabled: true,
@@ -110,6 +127,10 @@ impl OllamaEndpoint {
             tool_subset: ToolSubset::Focused,
             flavor: ClientFlavor::Ollama,
             max_tokens: None,
+            top_p: None,
+            top_k: None,
+            repeat_penalty: None,
+            tool_choice: None,
         }
     }
 }
@@ -145,7 +166,7 @@ pub struct RoutingConfig {
 pub struct RouterModelConfig {
     pub base_url: String,
     pub model: String,
-    pub num_ctx: usize,
+    pub trim_budget: usize,
     pub temperature: f64,
     pub timeout_seconds: u64,
 }
@@ -155,7 +176,7 @@ pub struct RouterModelConfig {
 pub struct OllamaRouteConfig {
     pub base_url: String,
     pub model: String,
-    pub num_ctx: usize,
+    pub trim_budget: usize,
     pub temperature: f64,
     pub timeout_seconds: u64,
     pub enabled: bool,
@@ -167,10 +188,7 @@ impl RoutingConfig {
         let classifier = OllamaEndpoint::from_env(
             "OLLAMA_CLASSIFIER_URL",
             "OLLAMA_CLASSIFIER_MODEL",
-            (
-                "http://sakura-wsl.taile41496.ts.net:11434",
-                "qwen3.5-9b:iq4_xs",
-            ),
+            ("http://localhost:11434", "qwen3.5-9b:iq4_xs"),
         );
 
         // Reasoner and coder default to thinking ON. The classifier and
@@ -180,14 +198,14 @@ impl RoutingConfig {
         let mut reasoner = OllamaEndpoint::from_env(
             "OLLAMA_REASONER_URL",
             "OLLAMA_REASONER_MODEL",
-            ("http://sakura-wsl.taile41496.ts.net:11435", "qwen3.5:9b"),
+            ("http://localhost:11435", "qwen3.5:9b"),
         );
         reasoner.think = true;
 
         let mut reasoner_backup = OllamaEndpoint::from_env(
             "OLLAMA_REASONER_BACKUP_URL",
             "OLLAMA_REASONER_BACKUP_MODEL",
-            ("http://meru-wsl.taile41496.ts.net:11434", "qwen3.5:9b"),
+            ("http://localhost:11434", "qwen3.5:9b"),
         );
         reasoner_backup.think = true;
 
@@ -195,7 +213,7 @@ impl RoutingConfig {
             "OLLAMA_CODER_URL",
             "OLLAMA_CODER_MODEL",
             (
-                "http://sakura-wsl.taile41496.ts.net:11435",
+                "http://localhost:11435",
                 "qwen3.5-9b-opus-openclaw-distilled:tools",
             ),
         );
@@ -204,10 +222,7 @@ impl RoutingConfig {
         let compactor = OllamaEndpoint::from_env(
             "OLLAMA_COMPACTOR_URL",
             "OLLAMA_COMPACTOR_MODEL",
-            (
-                "http://sakura-wsl.taile41496.ts.net:11435",
-                "qwen3.5-9b:iq4_xs",
-            ),
+            ("http://localhost:11435", "qwen3.5-9b:iq4_xs"),
         );
 
         Self {
@@ -223,14 +238,14 @@ impl RoutingConfig {
             router: RouterModelConfig {
                 base_url: reasoner.base_url.clone(),
                 model: reasoner.model.clone(),
-                num_ctx: reasoner.num_ctx,
+                trim_budget: reasoner.trim_budget,
                 temperature: 0.0,
                 timeout_seconds: reasoner.timeout_seconds,
             },
             coder: OllamaRouteConfig {
                 base_url: env_or("CODER_OLLAMA_BASE_URL", &reasoner.base_url),
                 model: env_or("CODER_MODEL", &reasoner.model),
-                num_ctx: env_usize("CODER_NUM_CTX", 16384),
+                trim_budget: env_usize("CODER_TRIM_BUDGET", 16384),
                 temperature: env_f64("CODER_TEMPERATURE", 0.1),
                 timeout_seconds: env_u64("CODER_TIMEOUT_SECONDS", 300),
                 enabled: env_bool("ENABLE_LOCAL_CODER", true),
@@ -280,7 +295,7 @@ impl RoutingConfig {
         config.router = RouterModelConfig {
             base_url: config.reasoner.base_url.clone(),
             model: config.reasoner.model.clone(),
-            num_ctx: config.reasoner.num_ctx,
+            trim_budget: config.reasoner.trim_budget,
             temperature: 0.0,
             timeout_seconds: config.reasoner.timeout_seconds,
         };
@@ -297,15 +312,20 @@ fn endpoint_from_role(role: &crate::project_config::ModelRole) -> Option<OllamaE
             endpoint,
             model,
             reasoning,
-            num_ctx,
+            trim_budget,
             tool_subset,
             max_tokens,
             timeout_seconds,
+            temperature,
+            top_p,
+            top_k,
+            repeat_penalty,
+            tool_choice,
         } => {
             let flavor = match provider.as_str() {
                 "ollama" => ClientFlavor::Ollama,
-                "openai-compat" | "openai_compat" | "lmstudio" | "lm-studio"
-                | "lm_studio" | "openai" => ClientFlavor::OpenAICompat,
+                "openai-compat" | "openai_compat" | "lmstudio" | "lm-studio" | "lm_studio"
+                | "openai" => ClientFlavor::OpenAICompat,
                 _ => return None,
             };
             // Normalize 0 → None so `max_tokens = 0` reads as "unlimited"
@@ -317,8 +337,8 @@ fn endpoint_from_role(role: &crate::project_config::ModelRole) -> Option<OllamaE
                     .clone()
                     .unwrap_or_else(|| "http://127.0.0.1:11434".into()),
                 model: model.clone(),
-                num_ctx: num_ctx.unwrap_or(8192),
-                temperature: if reasoning == "off" { 0.0 } else { 0.1 },
+                trim_budget: trim_budget.unwrap_or(8192),
+                temperature: (*temperature).unwrap_or(if reasoning == "off" { 0.0 } else { 0.1 }),
                 timeout_seconds: timeout_seconds.unwrap_or(300),
                 enabled: true,
                 think: reasoning != "off",
@@ -328,6 +348,10 @@ fn endpoint_from_role(role: &crate::project_config::ModelRole) -> Option<OllamaE
                     .unwrap_or_default(),
                 flavor,
                 max_tokens,
+                top_p: *top_p,
+                top_k: *top_k,
+                repeat_penalty: *repeat_penalty,
+                tool_choice: tool_choice.clone(),
             })
         }
         crate::project_config::ModelRole::Weighted { .. } => {

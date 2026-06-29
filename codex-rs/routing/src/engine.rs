@@ -94,9 +94,9 @@ fn build_routing_digest(
             "question_count": metrics.question_count,
             "metadata_key_count": metrics.metadata_key_count,
             "backend_request_tokens": backend_request_tokens,
-            "reasoner_context_limit": config.reasoner.num_ctx,
-            "coder_context_limit": config.coder.num_ctx,
-            "router_context_limit": config.router.num_ctx,
+            "reasoner_context_limit": config.reasoner.trim_budget,
+            "coder_context_limit": config.coder.trim_budget,
+            "router_context_limit": config.router.trim_budget,
         }
     })
 }
@@ -165,10 +165,10 @@ pub async fn route_task(
     let backend_request_tokens = estimate_tokens(&backend_text);
 
     let mut eligible = available.clone();
-    if backend_request_tokens > config.reasoner.num_ctx {
+    if backend_request_tokens > config.reasoner.trim_budget {
         eligible.retain(|r| r != "local_reasoner");
     }
-    if backend_request_tokens > config.coder.num_ctx {
+    if backend_request_tokens > config.coder.trim_budget {
         eligible.retain(|r| r != "local_coder");
     }
 
@@ -185,7 +185,7 @@ pub async fn route_task(
     let digest_str = serde_json::to_string(&digest).unwrap_or_default();
     let router_request_tokens = estimate_tokens(&digest_str);
 
-    if router_request_tokens > config.router.num_ctx {
+    if router_request_tokens > config.router.trim_budget {
         let route = if available.contains(&"codex_cli".to_string()) {
             "codex_cli".to_string()
         } else {
@@ -234,7 +234,7 @@ pub async fn route_task(
     let router_ep = crate::config::OllamaEndpoint {
         base_url: config.router.base_url.clone(),
         model: config.router.model.clone(),
-        num_ctx: config.router.num_ctx,
+        trim_budget: config.router.trim_budget,
         temperature: config.router.temperature,
         timeout_seconds: config.router.timeout_seconds,
         enabled: true,
@@ -242,6 +242,10 @@ pub async fn route_task(
         tool_subset: crate::config::ToolSubset::Focused,
         flavor: crate::config::ClientFlavor::Ollama,
         max_tokens: None,
+        top_p: None,
+        top_k: None,
+        repeat_penalty: None,
+        tool_choice: None,
     };
     let response = ollama
         .chat(
@@ -403,8 +407,8 @@ mod tests {
     fn test_context_window_filtering() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mut config = test_config();
-        config.coder.num_ctx = 10; // Very small — will be filtered
-        config.reasoner.num_ctx = 10; // Very small — will be filtered
+        config.coder.trim_budget = 10; // Very small — will be filtered
+        config.reasoner.trim_budget = 10; // Very small — will be filtered
         config.codex_cli_enabled = true;
         let ollama = OllamaClientPool::new();
 

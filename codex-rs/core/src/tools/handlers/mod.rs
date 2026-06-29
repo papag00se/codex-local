@@ -4,7 +4,6 @@ mod dynamic;
 mod js_repl;
 mod list_dir;
 mod local_web_search;
-mod web_fetch;
 mod mcp;
 mod mcp_resource;
 pub(crate) mod multi_agents;
@@ -20,6 +19,8 @@ mod tool_search;
 mod tool_suggest;
 pub(crate) mod unified_exec;
 mod view_image;
+mod web_fetch;
+mod write_file;
 
 use codex_sandboxing::policy_transforms::intersect_permission_profiles;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
@@ -43,7 +44,6 @@ pub use js_repl::JsReplHandler;
 pub use js_repl::JsReplResetHandler;
 pub use list_dir::ListDirHandler;
 pub use local_web_search::LocalWebSearchHandler;
-pub use web_fetch::WebFetchHandler;
 pub use mcp::McpHandler;
 pub use mcp_resource::McpResourceHandler;
 pub use plan::PlanHandler;
@@ -57,6 +57,8 @@ pub use tool_search::ToolSearchHandler;
 pub use tool_suggest::ToolSuggestHandler;
 pub use unified_exec::UnifiedExecHandler;
 pub use view_image::ViewImageHandler;
+pub use web_fetch::WebFetchHandler;
+pub use write_file::WriteFileHandler;
 
 fn parse_arguments<T>(arguments: &str) -> Result<T, FunctionCallError>
 where

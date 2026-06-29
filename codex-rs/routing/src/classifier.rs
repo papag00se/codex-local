@@ -87,6 +87,10 @@ pub async fn classify_request(
 }
 
 /// Classify a request with additional context from routing history and codebase.
+///
+/// Thin wrapper over [`classify_with_endpoint`] using the configured
+/// `classifier` endpoint, applying the static fallback on failure. Kept for
+/// callers that don't need classifier failover (e.g. the supervisor).
 pub async fn classify_request_with_context(
     prompt_text: &str,
     tool_names: &[&str],
@@ -97,9 +101,36 @@ pub async fn classify_request_with_context(
     routing_profile: &str,
     codebase_context: &str,
 ) -> ClassifyResult {
-    let classifier_ep = &config.classifier;
+    classify_with_endpoint(
+        prompt_text,
+        tool_names,
+        recent_tool_call_count,
+        recent_turn_count,
+        &config.classifier,
+        pool,
+        routing_profile,
+        codebase_context,
+    )
+    .await
+    .unwrap_or_else(|| fallback("classifier failed"))
+}
+
+/// Classify a request using a specific classifier endpoint. Returns `None` when
+/// that endpoint can't produce a usable classification (disabled, unreachable,
+/// timed out, or unparseable) so the caller can fail over to the next role in
+/// the `classification` chain. `Some` only on a successful parse.
+pub async fn classify_with_endpoint(
+    prompt_text: &str,
+    tool_names: &[&str],
+    recent_tool_call_count: usize,
+    recent_turn_count: usize,
+    classifier_ep: &OllamaEndpoint,
+    pool: &OllamaClientPool,
+    routing_profile: &str,
+    codebase_context: &str,
+) -> Option<ClassifyResult> {
     if !classifier_ep.enabled {
-        return fallback("classifier disabled");
+        return None;
     }
 
     // Build the classifier prompt — minimal context, fast
@@ -120,12 +151,16 @@ pub async fn classify_request_with_context(
          Request to classify: {prompt_text}",
     );
 
-    // Short timeout for classifier — if it takes more than 10 seconds,
-    // skip local routing and go to cloud. First call may be slow (cold model load)
-    // but subsequent calls should be fast (<3s).
+    // Bounded timeout for the classifier — it must stay snappy (it gates every
+    // turn), but a hard 10s was too tight for a slow local server (e.g. a model
+    // split onto a slow second GPU): the classifier would time out every turn
+    // while the coder, with a longer timeout, succeeded. Honor the role's
+    // configured `timeout_seconds`, clamped to a sane window so a misconfigured
+    // value can't either fail instantly or stall the turn for minutes.
+    let classify_timeout = classifier_ep.timeout_seconds.clamp(15, 60);
     let mut classifier_override = classifier_ep.clone();
     classifier_override.temperature = 0.0; // Deterministic
-    classifier_override.timeout_seconds = 10; // Hard 10s timeout
+    classifier_override.timeout_seconds = classify_timeout;
     classifier_override.think = false; // Never reason on classify
     let classify_future = pool.chat(
         &classifier_override,
@@ -134,18 +169,25 @@ pub async fn classify_request_with_context(
         Some("json"),
     );
 
-    let response =
-        match tokio::time::timeout(std::time::Duration::from_secs(10), classify_future).await {
-            Ok(r) => r,
-            Err(_) => {
-                warn!("Classifier timed out (>10s), falling back to cloud_coder");
-                return fallback("classifier timeout");
-            }
-        };
+    let response = match tokio::time::timeout(
+        std::time::Duration::from_secs(classify_timeout),
+        classify_future,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            warn!(
+                timeout_s = classify_timeout,
+                "Classifier timed out; advancing chain"
+            );
+            return None;
+        }
+    };
 
     let Some(body) = response else {
         warn!("Classifier LLM unreachable, falling back to cloud_coder");
-        return fallback("classifier unreachable");
+        return None;
     };
 
     let content = body
@@ -154,9 +196,11 @@ pub async fn classify_request_with_context(
         .and_then(|c| c.as_str())
         .unwrap_or("");
 
-    // Strip <think>...</think> tags that qwen3.5 models sometimes add
+    // Strip <think>...</think> tags some models add, then pull out the JSON
+    // object itself — newer models (e.g. Ornith) wrap it in a ```json fence,
+    // which `serde_json::from_str` would otherwise reject.
     let content = strip_think_tags(content);
-    let content = content.trim();
+    let content = extract_json_object(content.trim());
 
     // Parse the JSON response
     let parsed: ClassifierResponse = match serde_json::from_str(content) {
@@ -176,14 +220,14 @@ pub async fn classify_request_with_context(
                         content = %&content[..content.len().min(200)],
                         "Classifier returned JSON without 'route' field, falling back"
                     );
-                    return fallback("no route in response");
+                    return None;
                 }
             } else {
                 warn!(
                     content = %&content[..content.len().min(200)],
                     "Classifier returned non-JSON, falling back"
                 );
-                return fallback("invalid classifier response");
+                return None;
             }
         }
     };
@@ -214,7 +258,7 @@ pub async fn classify_request_with_context(
         "Request classified"
     );
 
-    result
+    Some(result)
 }
 
 /// Strip `<think>...</think>` blocks from model output.
@@ -231,10 +275,85 @@ pub fn strip_think_tags(text: &str) -> String {
     result
 }
 
+/// Extract the outermost JSON object from a model response. Models differ in how
+/// cleanly they emit JSON: some return a bare object, others wrap it in a
+/// markdown code fence (```json … ```) or surround it with prose. Slicing from
+/// the first `{` to the last `}` tolerates all of those without a brittle
+/// fence-stripping ladder. Returns the input unchanged if no object is present.
+pub fn extract_json_object(text: &str) -> &str {
+    match (text.find('{'), text.rfind('}')) {
+        (Some(start), Some(end)) if end > start => &text[start..=end],
+        _ => text,
+    }
+}
+
 fn fallback(reason: &str) -> ClassifyResult {
     ClassifyResult {
         route: RouteTarget::CloudCoder,
         tools_potential: true,
         reason: reason.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ClientFlavor, ToolSubset};
+
+    #[test]
+    fn extract_json_object_unwraps_fences_and_prose() {
+        // The exact Ornith failure: JSON wrapped in a ```json fence.
+        let fenced = "```json\n{\"route\": \"light_coder\", \"tools_potential\": true}\n```";
+        let obj = extract_json_object(fenced);
+        let v: serde_json::Value = serde_json::from_str(obj).expect("parses after unwrap");
+        assert_eq!(v["route"], "light_coder");
+        // Bare JSON is unchanged; prose around the object is stripped.
+        assert_eq!(extract_json_object("{\"a\":1}"), "{\"a\":1}");
+        assert_eq!(
+            extract_json_object("Sure, here it is: {\"route\":\"cloud_fast\"} done"),
+            "{\"route\":\"cloud_fast\"}"
+        );
+        // No object → returned unchanged (caller still fails gracefully).
+        assert_eq!(extract_json_object("no json here"), "no json here");
+    }
+
+    fn disabled_endpoint() -> OllamaEndpoint {
+        OllamaEndpoint {
+            base_url: "http://127.0.0.1:1".to_string(),
+            model: "m".to_string(),
+            trim_budget: 2048,
+            temperature: 0.0,
+            timeout_seconds: 1,
+            enabled: false,
+            think: false,
+            tool_subset: ToolSubset::Focused,
+            flavor: ClientFlavor::OpenAICompat,
+            max_tokens: None,
+            top_p: None,
+            top_k: None,
+            repeat_penalty: None,
+            tool_choice: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn classify_with_endpoint_returns_none_when_disabled() {
+        // The failover contract: a disabled (or otherwise unusable) endpoint
+        // must yield `None`, not a fallback route, so `classify_via_chain` can
+        // advance to the next role in the classification chain instead of
+        // prematurely settling on CloudCoder.
+        let pool = OllamaClientPool::new();
+        let result = classify_with_endpoint(
+            "do something",
+            &["shell"],
+            0,
+            0,
+            &disabled_endpoint(),
+            &pool,
+            "",
+            "",
+        )
+        .await;
+        assert!(result.is_none());
     }
 }

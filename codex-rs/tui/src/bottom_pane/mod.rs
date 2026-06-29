@@ -184,6 +184,9 @@ pub(crate) struct BottomPane {
     /// When a status row exists, this summary is mirrored inline in that row;
     /// when no status row exists, it renders as its own footer row.
     unified_exec_footer: UnifiedExecFooter,
+    /// Live routing readout (current model class + tokens/sec), mirrored into
+    /// the status row while a turn is running.
+    route_readout: Option<String>,
     /// Preview of pending steers and queued drafts shown above the composer.
     pending_input_preview: PendingInputPreview,
     /// Inactive threads with pending approval requests.
@@ -235,6 +238,7 @@ impl BottomPane {
             is_task_running: false,
             status: None,
             unified_exec_footer: UnifiedExecFooter::new(),
+            route_readout: None,
             pending_input_preview: PendingInputPreview::new(),
             pending_thread_approvals: PendingThreadApprovals::new(),
             esc_backtrack_hint: false,
@@ -842,13 +846,33 @@ impl BottomPane {
         }
     }
 
-    /// Copy unified-exec summary text into the active status row, if any.
+    /// Update the live routing readout shown inline in the status row.
+    pub(crate) fn set_route_readout(&mut self, readout: Option<String>) {
+        let readout = readout.filter(|s| !s.is_empty());
+        if self.route_readout != readout {
+            self.route_readout = readout;
+            self.sync_status_inline_message();
+            self.request_redraw();
+        }
+    }
+
+    /// Copy the inline status text (routing readout and/or unified-exec
+    /// summary) into the active status row, if any.
     ///
     /// This keeps status-line inline text synchronized without forcing the
     /// standalone unified-exec footer row to be visible.
     fn sync_status_inline_message(&mut self) {
         if let Some(status) = self.status.as_mut() {
-            status.update_inline_message(self.unified_exec_footer.summary_text());
+            let parts: Vec<String> = [
+                self.route_readout.clone(),
+                self.unified_exec_footer.summary_text(),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .collect();
+            let combined = (!parts.is_empty()).then(|| parts.join(" · "));
+            status.update_inline_message(combined);
         }
     }
 

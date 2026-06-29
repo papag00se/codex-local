@@ -32,6 +32,18 @@ pub struct ExtractedState {
     /// repeatedly. Surfaced prominently in the prelude so the model is
     /// nudged to try a different approach.
     pub repetition: Option<RepetitionAlert>,
+    /// The most recent `apply_patch` attempt FAILED. Drives a directive steering
+    /// the model to rewrite the whole file with `write_file` instead of
+    /// re-patching against a file that doesn't match its mental model.
+    pub patch_failure: Option<PatchFailure>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PatchFailure {
+    /// File the failed patch targeted (from the `*** Update/Add File:` header).
+    pub path: String,
+    /// Short excerpt of the apply_patch error (for the directive's "why").
+    pub excerpt: String,
 }
 
 #[derive(Debug, Clone)]
@@ -40,7 +52,36 @@ pub struct RepetitionAlert {
     pub command_summary: String,
     pub count: usize,
     pub last_output_excerpt: String,
+    /// `call_id` of the most-recent repeated tool call. The renderer uses this
+    /// to replace that call's tool-output with a synthesized "stop repeating"
+    /// result, so the model sees the intervention in the slot it's trained to
+    /// read instead of only as prelude prose it can ignore.
+    pub call_id: String,
+    /// When `true`, the model isn't repeating a byte-identical call — it's
+    /// *thrashing* toward the same goal with varying commands (e.g. editing the
+    /// same file and re-running the same failing test). The renderer turns this
+    /// into a forced-diagnosis directive ("read the failure and explain the root
+    /// cause before acting") instead of a plain STOP, because the model needs to
+    /// engage with the error, not just stop. See [`detect_unproductive_recurrence`].
+    pub force_diagnosis: bool,
+    /// The `(tool_name, signature)`-derived signature of the looping call, when
+    /// the loop is a single repeated signature (empty for same-target thrash
+    /// where args vary). Lets the renderer prune exactly the loop's calls.
+    pub signature: String,
+    /// The loop has persisted past the point where advisory nudges + the hard
+    /// block have demonstrably been ignored (`count >= ESCALATION_THRESHOLD`).
+    /// Triggers context surgery: the renderer excises the loop's own turns and
+    /// replaces them with a single reframe, so the model stops copying the
+    /// pattern out of its own saturated context. Only set for signature-based
+    /// loops (we can prune those precisely).
+    pub escalate: bool,
 }
+
+/// Count at which a repeated loop escalates from advisory nudge + hard block to
+/// context surgery (excise the loop + reframe). Past this, the model has ignored
+/// the gentler interventions, so we change what it *sees* rather than what we
+/// *tell* it.
+const ESCALATION_THRESHOLD: usize = 6;
 
 #[derive(Debug, Clone)]
 pub struct ModifiedFile {
@@ -198,8 +239,10 @@ pub fn extract(parsed: &ParsedTranscript, _active_turn: u32) -> ExtractedState {
     // the same args" loops; the failure-streak detector catches "writing
     // syntactically-different-but-semantically-wrong patches on the same
     // file" loops.
+    state.patch_failure = detect_patch_failure(parsed);
     state.repetition = detect_repetition(parsed)
-        .or_else(|| detect_same_target_failure_repetition(parsed));
+        .or_else(|| detect_same_target_failure_repetition(parsed))
+        .or_else(|| detect_unproductive_recurrence(parsed));
     if let Some(alert) = state.repetition.as_ref() {
         tracing::info!(
             tool_name = %alert.tool_name,
@@ -273,7 +316,7 @@ fn detect_repetition(parsed: &ParsedTranscript) -> Option<RepetitionAlert> {
         return None;
     }
 
-    let (tool_name, _) = last_signature?;
+    let (tool_name, signature) = last_signature?;
     let command_summary = short_args(last_call_args.as_deref().unwrap_or(""), 100);
 
     // Pull the most recent matching output's excerpt for context.
@@ -299,7 +342,190 @@ fn detect_repetition(parsed: &ParsedTranscript) -> Option<RepetitionAlert> {
         command_summary,
         count,
         last_output_excerpt,
+        call_id: last_call_id.unwrap_or_default(),
+        force_diagnosis: false,
+        escalate: count >= ESCALATION_THRESHOLD,
+        signature,
     })
+}
+
+/// Detect interleaved no-progress "thrash": the model working toward the same
+/// end with *varying* commands, so the consecutive-identical detector misses it
+/// — e.g. running the same test 3+ times with edits between, never passing. We
+/// count tool-call signatures across a recent window; a signature whose *failing*
+/// occurrences recur `THRESHOLD`+ times means the model keeps trying the same
+/// thing without progress. Rendered as a forced-diagnosis directive (read the
+/// failure, state the root cause, then make ONE change) rather than a plain STOP.
+///
+/// Crucially this is **productivity-gated**: only occurrences whose output
+/// failed count toward the threshold. A signature that recurs but *succeeds*
+/// (a test that now passes, a routine `ls`/`grep`/`git status` re-run) is
+/// healthy and must not trip the nudge — and "diagnose the failure" is
+/// incoherent when there is no failure to read.
+fn detect_unproductive_recurrence(parsed: &ParsedTranscript) -> Option<RepetitionAlert> {
+    const WINDOW: usize = 24;
+    const THRESHOLD: usize = 3;
+
+    // Outcome lookup, so a recurrence only counts as thrash when it is failing.
+    let mut success_by_call: BTreeMap<String, bool> = BTreeMap::new();
+    for item in &parsed.items {
+        if let TrimItem::ToolOutput {
+            call_id, success, ..
+        } = item
+        {
+            success_by_call.insert(call_id.clone(), *success);
+        }
+    }
+
+    let mut counts: BTreeMap<(String, String), usize> = BTreeMap::new();
+    // Walking from the end, the first time we see a key is its most-recent
+    // occurrence — capture its args + call_id for the diagnosis prompt.
+    let mut most_recent: BTreeMap<(String, String), (String, String)> = BTreeMap::new();
+    let mut window_calls = 0usize;
+
+    for item in parsed.items.iter().rev() {
+        match item {
+            TrimItem::ToolCall {
+                tool_name,
+                signature,
+                args,
+                call_id,
+                ..
+            } => {
+                // The window is the last WINDOW tool calls regardless of outcome,
+                // but only FAILED occurrences accrue toward the threshold. An
+                // unknown outcome (no output recorded yet — an in-flight call) is
+                // treated as not-failed, so we never fire on a pending call.
+                window_calls += 1;
+                if success_by_call.get(call_id) == Some(&false) {
+                    let key = (tool_name.clone(), signature.clone());
+                    *counts.entry(key.clone()).or_insert(0) += 1;
+                    most_recent
+                        .entry(key)
+                        .or_insert_with(|| (args.clone(), call_id.clone()));
+                }
+                if window_calls >= WINDOW {
+                    break;
+                }
+            }
+            // Outputs / narration / reasoning are transparent within the window.
+            TrimItem::ToolOutput { .. }
+            | TrimItem::AssistantText { .. }
+            | TrimItem::Reasoning { .. } => continue,
+            // A user message is a new task boundary — stop the window there.
+            _ => break,
+        }
+    }
+
+    let (key, count) = counts
+        .into_iter()
+        .filter(|(_, c)| *c >= THRESHOLD)
+        .max_by_key(|(_, c)| *c)?;
+    let (tool_name, signature) = key.clone();
+    let (args, call_id) = most_recent.get(&key)?.clone();
+
+    let last_output_excerpt = parsed
+        .items
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            TrimItem::ToolOutput {
+                call_id: cid,
+                content,
+                ..
+            } if *cid == call_id => Some(excerpt(content, 300)),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    Some(RepetitionAlert {
+        tool_name,
+        command_summary: short_args(&args, 100),
+        count,
+        last_output_excerpt,
+        call_id,
+        force_diagnosis: true,
+        escalate: count >= ESCALATION_THRESHOLD,
+        signature,
+    })
+}
+
+/// Did the MOST RECENT `apply_patch` attempt fail? Returns the target file and a
+/// short error excerpt so the prelude can steer the model to a full `write_file`
+/// rewrite. Fires on the *latest* patch outcome (not a streak): a small model
+/// often patches against code it believes it wrote but never landed (an earlier
+/// failed write), so its `Update` context never matches and re-patching fails the
+/// same way — a whole-file rewrite (which overwrites, no context to match) breaks
+/// the cycle on the first failure. If the latest patch SUCCEEDED, returns `None`
+/// (the model recovered on its own), so the directive only persists while stuck.
+fn detect_patch_failure(parsed: &ParsedTranscript) -> Option<PatchFailure> {
+    let mut outputs: BTreeMap<String, (bool, String)> = BTreeMap::new();
+    for item in &parsed.items {
+        if let TrimItem::ToolOutput {
+            call_id,
+            success,
+            content,
+            ..
+        } = item
+        {
+            outputs.insert(call_id.clone(), (*success, content.clone()));
+        }
+    }
+    // Walk reverse and keep only each file's MOST-RECENT edit outcome (keyed by
+    // basename so an absolute apply_patch path and a relative write_file path to
+    // the same file reconcile). Fire only if that latest outcome is a failed
+    // apply_patch — so a later successful `write_file` rewrite (the remedy this
+    // directive asks for) clears it instead of looping forever.
+    let mut settled: BTreeSet<String> = BTreeSet::new();
+    for item in parsed.items.iter().rev() {
+        let TrimItem::ToolCall {
+            tool_name,
+            args,
+            call_id,
+            ..
+        } = item
+        else {
+            continue;
+        };
+        let Some(path) = edit_target_path(tool_name, args) else {
+            continue;
+        };
+        let base = path.rsplit('/').next().unwrap_or(&path).to_string();
+        if !settled.insert(base) {
+            continue; // a more-recent edit to this file already decided its state
+        }
+        match outputs.get(call_id) {
+            // Pending or succeeded → this file is not in a failed-patch state.
+            None => {}
+            Some((true, _)) => {}
+            Some((false, content)) => {
+                if tool_name == "apply_patch" {
+                    return Some(PatchFailure {
+                        path,
+                        excerpt: excerpt(content, 200),
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The file a content-editing tool call targets, across the tools a local model
+/// uses (`apply_patch` Update/Add header, the synthetic `write_file`/`edit_file`
+/// family, and `text_editor`). Used to reconcile edit outcomes per file.
+fn edit_target_path(tool_name: &str, args_raw: &str) -> Option<String> {
+    match tool_name {
+        "apply_patch" | "text_editor" => derive_modification(tool_name, args_raw).map(|(p, _)| p),
+        "write_file" | "create_file" | "edit_file" | "str_replace" => {
+            let v: serde_json::Value = serde_json::from_str(args_raw).ok()?;
+            ["path", "file_path", "file", "filename"]
+                .iter()
+                .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
+                .map(str::to_string)
+        }
+        _ => None,
+    }
 }
 
 /// Walk the parsed transcript looking for 3+ consecutive tool-call failures
@@ -329,6 +555,7 @@ fn detect_same_target_failure_repetition(parsed: &ParsedTranscript) -> Option<Re
     // that target the same file via the same tool.
     let mut streak_tool: Option<String> = None;
     let mut streak_path: Option<String> = None;
+    let mut streak_call_id: Option<String> = None;
     let mut count = 0usize;
     let mut last_output_excerpt = String::new();
 
@@ -364,6 +591,7 @@ fn detect_same_target_failure_repetition(parsed: &ParsedTranscript) -> Option<Re
                     (None, None) => {
                         streak_tool = Some(key.0);
                         streak_path = Some(key.1);
+                        streak_call_id = Some(call_id.clone());
                         last_output_excerpt = excerpt(content, 200);
                         count = 1;
                     }
@@ -396,6 +624,15 @@ fn detect_same_target_failure_repetition(parsed: &ParsedTranscript) -> Option<Re
         command_summary: format!("{count} consecutive failures on {path}"),
         count,
         last_output_excerpt,
+        call_id: streak_call_id.unwrap_or_default(),
+        // Same file, varying attempts, still failing — a thrash, not a literal
+        // repeat. The model needs to read the failure, not just "stop".
+        force_diagnosis: true,
+        // Args vary each attempt, so there's no single signature to prune; and
+        // the model IS editing (making progress attempts), so don't nuke its
+        // context. Forced-diagnosis is the right intervention here, not surgery.
+        escalate: false,
+        signature: String::new(),
     })
 }
 

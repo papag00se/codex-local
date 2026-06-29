@@ -12,8 +12,7 @@ const BRAVE_ENDPOINT: &str = "https://api.search.brave.com/res/v1/web/search";
 /// doesn't supply one. Matches what current Brave Browser sends on Linux
 /// desktop — Brave intentionally identifies as Chrome to avoid being
 /// fingerprinted as a separate browser.
-pub const DEFAULT_USER_AGENT: &str =
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
+pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
 
 /// Result of a single Brave search call.
 #[derive(Debug, Clone)]
