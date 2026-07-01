@@ -2640,6 +2640,7 @@ name = "codex-routing"
 version = "0.0.0"
 dependencies = [
  "assert_matches",
+ "base64 0.22.1",
  "codex-protocol",
  "futures",
  "pretty_assertions",

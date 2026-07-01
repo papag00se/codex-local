@@ -45,9 +45,15 @@ Plain-English summary of every intervention. Numbers match the detailed sections
 22. **Tolerate fenced JSON** — newer control models wrap their JSON verdict in a ```json fence, which silently broke the classifier and completion verifier. We extract the JSON object so the fence doesn't matter.
 23. **Honest local-only signals** — a cloud role skipped by `local_only` no longer logs as "model not found (config error?)"; and the classifier honors its configured timeout instead of a hard-coded 10s, so a slow local server degrades gracefully instead of failing every turn.
 24. **One path for coder and reasoner** — both roles run the same streaming/recovery/overflow path with the **same full tool set** (a reasoning model can code too). The only behavioral difference is one bit: whether a text-only turn is a valid completion (`role_text_is_product` — a coder must act; a reasoner's text can be the answer). Everything else that makes a "reasoner" — temperature, reasoning budget, `max_tokens` — is per-endpoint config. And when the prompt overflows the server's real context, the path re-trims to the server's reported numbers and retries instead of crashing.
-25. **Tool-call constraint** (`tool_choice`) — the baseline (`"auto"`, unset) leaves the tool-call *format* unconstrained, the source of the leak/fence/prefill bugs. We enforce a valid call at the sampler (`tool_choice="required"`, which llama.cpp grammar-constrains) **only on the bail/rumination/quality retry of an actor role** — turning the prose "emit a single tool call" nudge into an enforced one, without blocking text-completion or termination on normal turns. Reasoners are never forced; a per-role config `tool_choice` is an operator override. Large file writes get the same treatment: `write_file` translates to a sandbox-safe, escaping-proof **shell overwrite**, and a synthetic tool whose JSON args failed to parse re-prompts under the constraint instead of dead-ending as `unsupported call`. The A/B (prose-nudge vs enforced) is a paper result.
+25. **Tool-call constraint** (`tool_choice`) — the baseline (`"auto"`, unset) leaves the tool-call *format* unconstrained, the source of the leak/fence/prefill bugs. We enforce a valid call at the sampler (`tool_choice="required"`, which llama.cpp grammar-constrains) **only on the bail/rumination/quality retry of an actor role** — turning the prose "emit a single tool call" nudge into an enforced one, without blocking text-completion or termination on normal turns. Reasoners are never forced; a per-role config `tool_choice` is an operator override. The constraint can also force a **specific** tool, not just "required" — used to force `write_file` when a stuck patch needs a rewrite (see §30). The A/B (prose-nudge vs enforced) is a paper result.
 26. **Loop detection beyond consecutive-identical** — the hard guard only catches the *same* call repeated back-to-back. Three detectors catch the loops it misses, all productivity-gated: (a) the same **assistant preamble** repeated across turns (normalized: stopwords stripped, light-stemmed), (b) a short **cyclic tool pattern** (patch→test→cat→patch…), (c) the **same file re-edited** with near-identical content. (a) re-prompts at turn end (bounded); (b)/(c) block the call at dispatch and redirect. Drawn directly from the Ada-handle thrash that ran 14 min undetected.
 27. **Servability guarantees** — three fixes so a long/looping session can't dead-end: `apply_patch` `*** Add File` on an existing path now **errors** (was a silent overwrite that fed a rewrite loop); a `local_only` failover chain that strips cloud now **appends the other local role** as a backup instead of collapsing to one; and when protected assistant bulk alone exceeds the window, the prompt is reduced **semantic-first** — inline compaction summarizes the over-budget region (older turns, or the active turn's own middle), with a bounded last-resort drop (`drop_to_fit`, always keeping the user request) only as the floor — so the prompt always fits without crudely discarding the turn's history (see §12, §24).
+28. **Real-token calibration** — Stop trusting the `chars/4` estimate (it runs 1.8–2.8× low on dense code/JSON — a prompt the estimator put at ~13k tokenized to **37k** on the server). Learn each model's real÷estimate ratio from the server's reported `prompt_tokens` (and the overflow error), and budget against it, so a dense prompt fits the real window on the **first** attempt instead of overflowing and being re-trimmed. Seeds at a safe default, self-corrects after one response.
+29. **Active-turn compaction** — When a single long agentic turn (no new user message) outgrows the window, summarize its **middle** (keep the request + the last few steps verbatim) instead of crudely dropping it. Compacts whichever region holds the bulk — and since trim already collapses *older* turns to a small prelude, that's almost always the active turn. Fires only when the prompt genuinely won't fit (not preemptively), so it doesn't tax every turn. Ordering: *trim (mechanical) → compact (semantic) → drop (floor)*.
+30. **`write_file` is the default editor; `apply_patch` retired locally** — `apply_patch` never once succeeded for the 9B in our logs (it can't reproduce matching context — 16/16 failures, mostly "Failed to find expected lines"). The local edit path is now **`write_file`** (whole file — nothing to match, nothing to fail) by default, `edit_file` for snippets, with a "keep files small and focused" nudge baked into the tool description. `apply_patch` is unadvertised; an emitted `*** Add File` converts to `write_file` (so it can't hit "Cannot add: exists"); a failed `Update` is steered to a rewrite (§31). Forcing a *specific* tool uses `tool_choice`'s object form (§25).
+31. **Failed-patch → `write_file` rewrite** — When a patch fails (usually the model is editing code an earlier **failed write never landed**, so its `Update` context can't match), the harness pins the file's real on-disk contents, injects a `[PATCH DID NOT APPLY — REWRITE THE FILE]` directive, and for small files **forces** the `write_file` tool so the model rewrites the whole file instead of re-patching. A rewrite overwrites — there's nothing to match — which lands one clean write and re-syncs the model's mental model with disk. Clears the instant a rewrite succeeds (no infinite directive). The old inline hint that said "re-read and re-patch" — the loop-feeding advice — was changed to point at `write_file` too.
+32. **Surfaced harness actions** — compaction, token-ratio calibration, last-resort drops, and patch-rewrite steering now show as TUI nudges (`push_nudge`), not just log lines, so the operator can watch the harness work in real time (e.g. *"Compacted the active turn (148 steps summarized)…"*, *"Calibrated context budget — this model packs ~2.8× the tokens our estimate assumed"*).
+33. **MIME-aware output reduction + `web_fetch` navigation** — large tool outputs are reduced **lossless-first** (HTML→text, JSON minify, then a guarded prose-strip) instead of blind-truncated. `web_fetch` paginates with a copy-paste `cursor=` token, supports `find=` to jump straight to a section, and surfaces the **real HTTP status + body** (a 404's documentation body isn't thrown away) with a stop-guessing nudge only after 3 consecutive failures. The authoritative design lives in [content-reduce.md](content-reduce.md).
 
 ---
 
@@ -302,7 +308,13 @@ Repetition rendering escalates with severity:
 
 **Trigger calibration (the part that made compaction look broken).** The compactor must fire in **estimate space**, against the effective fit budget (`trim::effective_budget` = `trim_budget / SAFETY_FACTOR`), *not* a fraction of the raw `trim_budget`. The token estimate is `chars/4`; on JSON/code-dense content the real BPE count runs **1.8–2.8× higher** (observed live: a trimmed prompt the estimator put at ~13k tokens tokenized to **36.8k** on the server — a 2.84× undercount — and overflowed a 32k window). The old trigger (`0.85 × trim_budget`, real-token space ≈ 20.9k) sat far above any estimate the trimmer produces (~13k), so it **never fired**: the prompt overflowed while the estimate looked comfortably under budget, the server rejected it, and the overflow-retry loop scaled the budget down by the *real* overshoot and retried — repeatedly, per turn, never compacting. Triggering against `effective_budget` closes the dead band: an active turn whose estimate exceeds the fit budget now crosses the threshold and gets summarized **before** the first send.
 
-**We don't have to estimate at all — the server tells us the truth.** Every response carries the real `prompt_tokens`, and an overflow carries `n_prompt_tokens`. So instead of a fixed safety factor we **learn the real ÷ estimate ratio per model** (`record_token_ratio`, EWMA, clamped `[1.8, 3.5]`) and budget against it: `calibrated_trim_budget` pre-scales `trim_budget` by `1.8 / observed_ratio`, so with an observed 2.84 the budget shrinks to ~63% and trim/compaction/`drop_to_fit` all target a prompt that actually fits on the **first** attempt. It seeds at the 1.8 default (so behaviour is unchanged until measured) and converges after the first response; the active turn (where the bulk lives) is what gets compacted, since trim has already collapsed older turns to a small prelude. The chars/4 estimate now only sets the *starting* point — the server's real count corrects it within one turn. Code: `calibrated_trim_budget` / `record_token_ratio` / `observed_token_ratio` and the `fit_budget` threaded through `maybe_inline_compact`.
+**We don't have to estimate at all — the server tells us the truth.** Every response carries the real `prompt_tokens`, and an overflow carries `n_prompt_tokens`. So instead of a fixed safety factor we **learn the real ÷ estimate ratio per model** (`record_token_ratio`, EWMA, clamped `[1.8, 3.5]`) and budget against it: `calibrated_trim_budget` pre-scales the budget by `1.8 / observed_ratio`, so with an observed 2.84 the budget shrinks to ~63% and trim/compaction/`drop_to_fit` all target a prompt that actually fits on the **first** attempt. It seeds at the 1.8 default (so behaviour is unchanged until measured) and converges after the first response. Three details make it actually hold under load (the failure mode where it didn't: real prompts of 50–61k against a 49,664 window, *repeatedly*, while the estimate read ~13–19k):
+
+- **Measure on the FULL prompt, not just messages.** The ratio is `real ÷ (messages + system + tool-schema estimate)`. If tools are left out of the denominator, the learned "ratio" silently absorbs the tool-overhead *fraction*, which swings as the message bulk grows and shrinks — so the number bounced 2.2→3.0 turn to turn and never settled. Including the schemas makes it pure tokenizer density, which is stable.
+- **Reserve tool schemas in REAL tokens.** The schemas aren't in trim's chars/4 estimate at all. The old path subtracted their *estimate* inside the estimate-space budget (so it got ÷1.8'd along with everything else), under-reserving them by ~`ratio`×. We now subtract `tool_est × ratio` from the real window *before* calibrating the remainder, so `messages×ratio + schemas×ratio` lands exactly at the window.
+- **Rise fast, fall slow.** The EWMA is asymmetric (`0.3/0.7` up, `0.8/0.2` down) because the costs are: under-estimating overflows the window (a wasted re-trim round-trip on a slow box); over-estimating just spends a little less context. A denser-than-seen turn pulls the guard up immediately; one light turn barely lowers it.
+
+The active turn (where the bulk lives) is what gets compacted, since trim has already collapsed older turns to a small prelude. The chars/4 estimate now only sets the *starting* point — the server's real count corrects it within one turn. Code: `calibrated_trim_budget` / `record_token_ratio` / `observed_token_ratio`, the `real_tool_reserve` subtraction at the trim call site, and the `fit_budget` threaded through `maybe_inline_compact`. Tests: `token_ratio_rises_fast_and_falls_slow`, `budget_reserves_tools_so_real_prompt_fits_window`.
 
 The same trimmer is also used as the first pass of compaction.
 
@@ -536,7 +548,7 @@ Confirmed on the test server (llama.cpp b8881): a request with `tool_choice: "re
 
 **Large writes (the other half).** The hardest format failure isn't *which* tool but the **JSON-string escaping of large/multiline file content** — a 9B dumps the file with raw newlines and bare double-quotes, so `serde_json` rejects the whole `write_file` object and the write is lost. The fix is to **tolerate the model's known limitation, not re-prompt it to "escape better"** (it can't):
 
-1. `write_file`/`create_file` have **real handlers** (`handlers/write_file.rs`) — the model sees its own tool, not a translated `shell printf` it misreads as mangled.
+1. `write_file`/`create_file` are **lowered to a `shell` base64 write and re-presented inbound as `write_file`** (§34), so the model still only ever sees its own tool — the real handler (`handlers/write_file.rs`) stays registered as a degradation fallback. (The earlier one-way `shell printf` translation, which the model *did* misread as mangled, is superseded: the inbound re-presentation is the half it lacked.)
 2. When the args don't parse, `translate_one_native_call` calls `tool_aliases::recover_write_file_args` to pull `path` + `content` out of the raw text and rebuild a clean `{path, content}` object (content is taken verbatim between its opening quote and the last quote before `}`; recognized escapes are still decoded, so raw, escaped, and mixed all work). The handler then writes the file normally — no retry, no dead-end.
 3. The `surviving_untranslated_synthetic` re-prompt now applies **only to the genuinely translated synthetics** (`edit_file`/`read_file`/`str_replace`/`cat_file`), which have no real handler to fall back to. **Regression fixed:** `write_file`/`create_file` were left in that list after gaining handlers, so *every* `write_file` call was flagged "malformed args" and re-prompted instead of dispatching — the source of a flood of `write_file arguments were malformed JSON` nudges.
 
@@ -592,6 +604,92 @@ The prompt's freshly-generated state prelude is always preserved on top, and the
 **Code:** [trim/mod.rs](../../codex-rs/routing/src/trim/mod.rs) — `compress_system_prompt` + the `system_budget_pct` plumbing; [local_routing.rs](../../codex-rs/core/src/local_routing.rs) — `maybe_summarize_system` / `summarize_system_via_compactor` + `SYSTEM_SUMMARY_CACHE`. **Config:** `[routing] system_budget_pct`.
 
 **Log signal:** `Compressed oversized system prompt via compaction track (cached)`.
+
+---
+
+## 34. `write_file` → shell base64 (the bidirectional massage)
+
+**The agnostic insight.** `write_file` is *not* the portable primitive — `shell` is. Every coding harness exposes command execution; `write_file`-as-a-named-tool is harness-specific convenience (Codex has none natively — we *added* the handler; Claude Code calls it `Write`; others differ). So the portable design is to let the **model** speak the ergonomic `write_file` while Shephard **lowers** it to the one substrate every harness has. This is the "Shephard owns no executors" principle made concrete: rich tools facing the model, irreducible primitives facing the harness.
+
+**Outbound (`translate_one_native_call`).** A `write_file{path, content}` call becomes a `shell` call:
+`mkdir -p '<dir>' && printf %s '<content_b64>' | base64 -d > '<path>' && printf 'write_file: wrote %s bytes…' …  # shephard-write:<path_b64>`.
+**base64, not heredoc/printf-escaping:** the payload is pure `[A-Za-z0-9+/=]`, so it's immune to the entire shell escaping / quoting / heredoc-marker / trailing-newline bug-class — *any* content (quotes, newlines, `$`, backticks, even the literal sentinel text) round-trips byte-exact. The byte-count echo gives a small model positive confirmation the write landed (silent `>` redirects triggered "let me try write_file again" loops).
+
+**Inbound (`represent_shell_writes`, runs before trim).** Codex records the *translated* `shell` call (not the model's `write_file` — confirmed at `ollama_tool_response_to_stream`, which emits the already-translated call). So next turn the transcript would show a base64 shell blob where the model called `write_file`. The inbound pass rewrites those recorded `shell` calls back to `write_file{path, content}` — recognized **statelessly** from the `# shephard-write:<path_b64>` sentinel (survives process restarts; no session map), call_id preserved so the output still matches. This is the half the **old one-way `shell printf` translation lacked** — without it the model saw a mangled shell command and panicked. Running before trim also means state-extraction / current-file pinning still see a `write_file` and recognize the write.
+
+**Fallback.** The real `write_file` handler stays registered; the massage only declines (→ handler) if the args carry no usable `path`. base64 has no other failure mode, so in practice the massage always fires.
+
+**Code:** [tool_aliases.rs](../../codex-rs/routing/src/tool_aliases.rs) — `write_file_to_base64_shell` / `parse_shephard_write`; [local_routing.rs](../../codex-rs/core/src/local_routing.rs) — the `write_file`/`create_file` match arm in `translate_one_native_call`, `represent_shell_writes` / `shell_command_str`. **Tests:** `write_file_base64_round_trips_hostile_content`, `parse_shephard_write_ignores_other_shell_commands`, `represent_shell_writes_restores_write_file`.
+
+**Log signal:** `Translated tool call (native) from=write_file to=shell`.
+
+---
+
+## 35. Compaction: storm, hardening, and the persist endgame
+
+**The storm.** Active-turn compaction (`compact_active_turn`) re-summarized the
+**whole growing turn from scratch every overflow** — the summary lived in the
+transient per-request `trimmed`, never persisted, so each turn trim re-derived the
+full turn and re-ran the 4–5-chunk LLM pipeline. One stuck turn measured: **66 min,
+~half of it inside compaction — 13 from-scratch runs, 60 chunk-extraction LLM
+calls** ≈ the model's own 67 calls. That, not the model "thinking", was what pegged
+the GPU (the model's own churn has only sub-second tool gaps but is at least *its*
+work; compaction is pure overhead).
+
+**Fixes (this layer):**
+- **Incremental rolling summary.** The active turn is append-only, so cache the
+  summary of the unchanged prefix (`ActiveCompactEntry`: prefix len + hash) and only
+  LLM-compact the **new tail**, folding it into the prior summary. On the real loop
+  content: re-compacted items dropped **2340 → 140 (16.7×)**. Falls back to a full
+  compaction the moment the prefix changes (trim dropped/superseded an early item),
+  so it's never wrong, only sometimes slower. Code: `plan_active_compaction`,
+  `hash_prefix`, `active_compact_cache`.
+- **Per-chunk timeout** (`EXTRACTION_TIMEOUT = 60s`) — a small compactor can wedge
+  in a repetition loop (observed: one chunk generating 8+ min, freezing the turn);
+  the deadline turns a wedge into a skipped chunk.
+- **Fence-strip the extractor** — small compactors wrap the object in ```` ```json ````;
+  `parse_extraction` runs `extract_json_object` first ([[project_local_model_fenced_json]]),
+  so chunks stop dying on `expected value at line 1 column 1`.
+
+**Why it's still a workaround.** The summary is transient because we're a stream
+transform, not the conversation's owner. The endgame for a **local-only** harness is
+to **persist** — drive the harness's NATIVE compaction (config-triggered, rewrites
+history) at the real local window, so it's done once. Codex's native compaction
+(`compact.rs::run_inline_auto_compact_task`) fires on
+`total_usage >= model_auto_compact_token_limit` and is blind to the local window
+(reads `model_context_window` from registry/config, never the server). Local turns
+*do* feed its accounting (the local stream emits `Completed { token_usage }`), so the
+tap-in is pure config: set `model_context_window` + `model_auto_compact_token_limit`
+to the local values (we already detect the window via `/props`). See nudge-service.md
+§ "Compaction: persist via the harness".
+
+**Log signals:** `Active turn over budget — compacting its middle (full)` /
+`Active-turn compaction reusing rolling summary (incremental)`;
+`Compactor extraction timed out — skipping chunk`.
+
+---
+
+## 36. Context surgery without swiss cheese
+
+When the context-reset guard **excises** a loop from the active turn, deleting the
+calls into a **gap** is harmful: only the matching-signature calls go, so surviving
+interleaved calls (the test runs) and dangling `<reasoning>` blocks remain with no
+record of the edits between them — which a small model reads as *"I haven't acted
+yet"* and **repeats**. Fix: collapse the excised loop into **one coherent inline
+marker** at its position (`[loop collapsed — N repeated X attempts removed, result
+unchanged, don't repeat]`), so the transcript still reads "I tried this N times".
+Audit of the other surgery sites: older-turn compression renders as prose summaries
+(safe, no protocol pairs); `drop_oldest_until_fit` now strips leading orphan
+tool-results in **both** the OpenAI `role:"tool"` and Ollama `<tool_result>` forms.
+Residual: loop `<reasoning>` blocks aren't keyed by call_id, so they survive — a
+smaller follow-up. Code: `render_messages` (`loop_collapsed`), `drop_oldest_until_fit`.
+
+**Observability fix (matters for diagnosis):** the loop guards surfaced *only* via
+`push_nudge` → the TUI queue, which never reaches the tracing log — so from the logs
+a guard that fired every turn looked like it "never fired". They now also
+`warn!(guard=…, repetition_count=…)`. (This exact gap caused a multi-hour
+misdiagnosis: context-reset *was* firing the whole time; the loop persisted because
+excising can't stop a model that keeps re-attempting a bug it can't solve.)
 
 ---
 

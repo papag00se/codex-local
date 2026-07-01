@@ -32,6 +32,7 @@ pub mod metrics;
 pub mod ollama;
 pub mod project_config;
 pub mod prompt_adapt;
+pub mod prompt_local;
 pub mod quality;
 pub mod rumination_detector;
 pub mod session_memory;

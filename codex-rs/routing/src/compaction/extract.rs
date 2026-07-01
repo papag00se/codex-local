@@ -5,7 +5,13 @@ use super::models::{ChunkExtraction, TranscriptChunk};
 use crate::config::OllamaEndpoint;
 use crate::ollama::OllamaClientPool;
 use std::collections::HashMap;
+use std::time::Duration;
 use tracing::{info, warn};
+
+/// Hard deadline for a single chunk extraction. A healthy extraction finishes in
+/// ~10-20s; anything past this is a wedged/looping compactor and is skipped rather
+/// than allowed to freeze the turn and cook the box.
+const EXTRACTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The extraction system prompt — verbatim from compaction_extraction_system.md.
 const EXTRACTION_SYSTEM_PROMPT: &str = "\
@@ -77,14 +83,32 @@ pub async fn extract_chunk(
 
     let mut extract_ep = endpoint.clone();
     extract_ep.temperature = 0.0;
-    let response = pool
-        .chat(
+    // Bound the call: a small local compactor can wedge in a repetition loop on
+    // dense chunks (observed: one chunk generating 8+ min, pegging the box while
+    // the whole turn — and the TUI — froze). A hard deadline turns that wedge into
+    // a skipped chunk (the same mechanical fallback as a parse failure) instead of
+    // a hang. Peers extract in ~10-20s, so this is generous headroom, not a tax.
+    let response = match tokio::time::timeout(
+        EXTRACTION_TIMEOUT,
+        pool.chat(
             &extract_ep,
             vec![serde_json::json!({"role": "user", "content": payload_str})],
             Some(EXTRACTION_SYSTEM_PROMPT),
             Some("json"),
-        )
-        .await;
+        ),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            warn!(
+                chunk_id = chunk.chunk_id,
+                timeout_s = EXTRACTION_TIMEOUT.as_secs(),
+                "Compactor extraction timed out — skipping chunk (mechanical fallback)"
+            );
+            return Err("Compactor extraction timed out".into());
+        }
+    };
 
     let Some(body) = response else {
         return Err("Compactor LLM unreachable".into());
@@ -108,8 +132,12 @@ fn parse_extraction(
     chunk_id: usize,
     source_tokens: usize,
 ) -> Result<ChunkExtraction, String> {
-    let parsed: serde_json::Value = serde_json::from_str(content.trim())
-        .map_err(|e| format!("Failed to parse extraction JSON: {e}"))?;
+    // Unwrap ```json fences / prose before parsing — small compactors habitually
+    // wrap the object (the [[project_local_model_fenced_json]] failure: every such
+    // chunk died with "expected value at line 1 column 1" and was silently lost).
+    let json = crate::classifier::extract_json_object(content.trim());
+    let parsed: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("Failed to parse extraction JSON: {e}"))?;
 
     let obj = parsed
         .as_object()
@@ -206,4 +234,31 @@ fn compact_events(items: &[serde_json::Value]) -> Vec<serde_json::Value> {
     }
 
     events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_extraction_unwraps_json_fences() {
+        // The exact failure mode from the wedged session: the compactor returns
+        // its object wrapped in a ```json fence, which raw from_str rejected with
+        // "expected value at line 1 column 1" and the chunk was silently lost.
+        let fenced =
+            "```json\n{\"objective\": \"fix the lambda\", \"files_touched\": [\"h.py\"]}\n```";
+        let got = parse_extraction(fenced, 7, 1234).expect("fenced JSON must now parse");
+        assert_eq!(got.objective, "fix the lambda");
+        assert_eq!(got.files_touched, vec!["h.py".to_string()]);
+        assert_eq!(got.chunk_id, 7);
+        assert_eq!(got.source_token_count, 1234);
+    }
+
+    #[test]
+    fn parse_extraction_tolerates_prose_around_object() {
+        let prose =
+            "Here is the state:\n{\"objective\": \"build tests\"}\nLet me know if you need more.";
+        let got = parse_extraction(prose, 1, 10).expect("prose-wrapped JSON must parse");
+        assert_eq!(got.objective, "build tests");
+    }
 }

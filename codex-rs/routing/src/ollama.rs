@@ -51,6 +51,32 @@ fn classify_send_error(status: u16, body: &str) -> SendError {
     SendError::Other
 }
 
+/// Probe a llama.cpp server's REAL context window via `/props` (the startup
+/// `--ctx-size`, which a per-request `num_ctx` does NOT override). Lets us size
+/// the budget from the actual window instead of a hand-set `trim_budget`. Returns
+/// `None` for non-llama.cpp servers (no `/props`) or on any error — the caller
+/// then falls back to its configured budget.
+pub async fn probe_context_window(client: &Client, base_url: &str) -> Option<u64> {
+    let base = base_url.trim_end_matches('/');
+    let root = base.strip_suffix("/v1").unwrap_or(base);
+    let url = format!("{root}/props");
+    let resp = client
+        .get(&url)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: JsonValue = resp.json().await.ok()?;
+    v.get("default_generation_settings")
+        .and_then(|g| g.get("n_ctx"))
+        .and_then(JsonValue::as_u64)
+        .or_else(|| v.get("n_ctx").and_then(JsonValue::as_u64))
+        .filter(|n| *n > 0)
+}
+
 /// Per-endpoint semaphore to serialize Ollama requests.
 /// Ollama struggles with concurrent requests — this was discovered
 /// through testing in the coding-agent-router project.

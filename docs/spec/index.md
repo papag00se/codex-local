@@ -17,6 +17,8 @@
 - [Routing Logic Reference](routing-logic-reference.md) — **Preserved from coding-agent-router:** every heuristic, threshold, fallback path, config knob
 - [Compaction Reference](compaction-reference.md) — **Preserved from coding-agent-router:** full compaction pipeline algorithm
 - [Local Coder Massaging](local-coder-massaging.md) — Every orchestration-layer intervention that props up small local coder models: problem, fix, code pointer, log signal
+- **[Shephard — what it does](shephard.md) — The catalog of every Nudge / Massage / Context-shaping move that keeps a small local model + an agent harness doing real agentic work. One line each.**
+- [Nudge ideas — read-mode loops](nudges.md) — **Proposals:** read-without-write, same-prefix-search (nudge→block), failing-fetch. Governing rule: reset the counter on a change of *approach*, not a change of *target* (the tunnel-vision fix).
 - [Nudge Engine as a Service](nudge-service.md) — **Proposal:** extract the massaging layer into a standalone OpenAI-compatible streaming service (heartbeat keep-alive, session header, harness keeps tool execution + workspace)
 - [Content Reduction (`content_reduce`)](content-reduce.md) — **Proposal:** MIME-aware, lossless-first reducer that bounds large tool outputs at the source (HTML→text, JSON/YAML tree-walk, guarded prose stripper), plus `find=` selection + `cursor=` pagination — replaces trim's destructive truncation
 - [Provider Abstraction](provider-abstraction.md) — Provider types, capability schema, adapter interface

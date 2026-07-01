@@ -13,6 +13,7 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+base64 = { workspace = true }
 codex-protocol = { workspace = true }
 regex = { workspace = true }
 futures = { workspace = true }

@@ -24,6 +24,77 @@ use super::state_extract::RepetitionAlert;
 /// budget. 10 KB is enough for any normal source file.
 const CURRENT_FILE_MAX_BYTES: usize = 10_240;
 
+/// A single tool OUTPUT is "too large to show whole" once it exceeds this
+/// fraction of the trim budget — so the ceiling SCALES with the detected window
+/// (a 32K-ctx model tolerates a bigger dump than an 8K one) instead of a
+/// hardcoded byte count. The bulk of runaway prompts is one giant dump kept
+/// verbatim in the active turn — a `curl … openapi.json | json.tool` (61 KB), a
+/// whole-file `cat`, a verbose test log. The estimate counts these, but they also
+/// tokenize 2–3× and tip the real prompt over the window. Bounding them at the
+/// source is the lever the conversational compactor can't reach.
+const MAX_OUTPUT_FRACTION_PCT: usize = 25;
+/// Floor for the dynamic ceiling, so a tiny budget still shows a usable output.
+const MAX_OUTPUT_FLOOR_CHARS: usize = 6_000;
+
+/// The per-output char ceiling for a given trim budget (`target_ctx`, in chars/4
+/// estimate-tokens). Outputs above it are reduced or omitted by `bound_tool_output`.
+pub(super) fn max_output_chars(target_ctx: usize) -> usize {
+    // target_ctx is estimate-tokens (chars/4); ×4 back to chars.
+    (target_ctx * MAX_OUTPUT_FRACTION_PCT / 100 * 4).max(MAX_OUTPUT_FLOOR_CHARS)
+}
+
+/// Bound an oversized tool output **without ever handing the model a broken or
+/// info-stripped document.** `max_chars` is the dynamic per-output ceiling (a
+/// fraction of the detected window, via [`max_output_chars`]). Two outcomes only:
+///   1. **Lossless reduce** — JSON minify (valid→valid, nothing removed) or
+///      HTML→text / guarded stopword-strip on text. If that gets it under the cap,
+///      the model sees the COMPLETE content, just compact.
+///   2. **Omit with a pointer** — if it's *still* too big to include in full, we do
+///      NOT minify-then-strip-prose (which drops `description`-type fields) and we
+///      do NOT keep a head+tail (which is a syntactically broken fragment). We
+///      replace it with a short, honest stub telling the model how to fetch the
+///      specific part it needs. Dropping > eliding: a clear "it's omitted, here's
+///      how to get it" never confuses, a broken partial document can.
+/// Returns `None` for outputs already small enough to keep verbatim.
+fn bound_tool_output(tool_name: &str, content: &str, max_chars: usize) -> Option<String> {
+    if content.len() <= max_chars {
+        return None;
+    }
+    let t = content.trim_start();
+    let ct = if t.starts_with('{') || t.starts_with('[') {
+        Some("application/json")
+    } else if t.starts_with('<') {
+        Some("text/html")
+    } else {
+        None
+    };
+    // JSON: minify ONLY (reduce_lossless never strips value/description fields).
+    // Everything else: content_reduce (HTML→text, guarded stopword-strip) — both
+    // keep the actual information; neither leaves a broken structure.
+    let reduced = if ct == Some("application/json") {
+        crate::content_reduce::reduce_lossless(content, ct)
+    } else {
+        crate::content_reduce::content_reduce(content, ct, max_chars / 4)
+    };
+    if reduced.chars().count() <= max_chars {
+        return Some(reduced); // complete, just compact
+    }
+    // Still too big to include without cutting content → omit, don't mangle.
+    let kb = content.len() / 1024;
+    let how = match tool_name {
+        "web_fetch" => {
+            "call web_fetch again with find=\"<keyword>\" to jump straight to the part you need"
+        }
+        "read_file" | "cat_file" => "read_file again with a start_line/end_line range",
+        _ => {
+            "re-run it more narrowly — pipe through `grep <pattern>`, `sed -n 'A,Bp'`, `head`, or `tail` — to see only the part you need"
+        }
+    };
+    Some(format!(
+        "[output omitted: ~{kb} KB, too large to include in full without breaking it. {how}.]"
+    ))
+}
+
 /// Render the full prelude block. Empty if there's nothing to say (e.g. an
 /// empty transcript with no user instructions). The `active_turn` is used to
 /// compute "turns since last modification" hints in the world-state block.
@@ -93,20 +164,23 @@ pub fn render_prelude(
     sections.join("\n\n")
 }
 
-/// When the model's most recent `apply_patch` failed, steer it to a whole-file
-/// `write_file` rewrite instead of re-patching a file whose contents don't match
-/// its mental model. The authoritative file is pinned just above this directive.
+/// When the model's most recent edit failed to apply (an `edit_file` snippet that
+/// didn't match — executed via `apply_patch` underneath, which the model never
+/// sees), steer it to a whole-file `write_file` rewrite instead of re-trying a
+/// snippet against a file whose contents don't match its mental model. Phrased in
+/// the model's OWN vocabulary — it called `edit_file`/`write_file`, not
+/// `apply_patch`, so the directive never mentions the executor underneath. The
+/// authoritative file is pinned just above this directive.
 fn render_patch_rewrite_directive(state: &ExtractedState) -> Option<String> {
     let pf = state.patch_failure.as_ref()?;
     Some(format!(
-        "[PATCH DID NOT APPLY — REWRITE THE FILE]\n\
-         Your last `apply_patch` to `{path}` FAILED: its target lines are not in the file as \
-         written (commonly because an earlier edit never actually landed, so the code you tried to \
-         change was never created). Re-running apply_patch will keep failing the same way.\n\
+        "[EDIT DID NOT APPLY — REWRITE THE WHOLE FILE]\n\
+         Your last edit to `{path}` could not be applied: the text you tried to change is not in the \
+         file as written (commonly because an earlier edit never actually landed, so the code you \
+         tried to change was never there). Editing the same snippet again will keep failing.\n\
          The file's CURRENT on-disk contents are pinned above — rewrite from those. Output the \
          COMPLETE intended file and save it with `write_file` (path=\"{path}\", content=<the entire \
-         file>). A full rewrite overwrites the file, so there is nothing to match. Do NOT call \
-         apply_patch on `{path}` again.",
+         file>). A full rewrite overwrites the file, so there is nothing to match.",
         path = pf.path,
     ))
 }
@@ -175,82 +249,88 @@ fn short_hash(s: &str) -> String {
     format!("{raw:016x}")[..8].to_string()
 }
 
-fn render_repetition_alert(state: &ExtractedState) -> Option<String> {
-    let alert = state.repetition.as_ref()?;
-    if alert.escalate {
-        // Top tier: the advisory nudge and the hard block were both ignored.
-        // The loop's own turns have been excised from the messages (see
-        // `render_messages`); restate its single, unchanging result once and
-        // point the model at the live state (current file + last test result,
-        // rendered elsewhere in this prelude) so it acts instead of copying the
-        // loop it can no longer see.
-        return Some(format!(
-            "[HARNESS — STUCK; LOOP REMOVED FROM CONTEXT]\n\
-             You ran `{}` {} times and the result never changed, so those repeated calls were REMOVED from this conversation. Here is that result once — it will NOT change, do not run it again:\n{}\n\n\
-             The current file contents and latest test results are in your context above. Use them: make EXACTLY ONE edit to fix the failing test, then run the test once. Do not repeat any command you have already run.",
-            alert.command_summary, alert.count, alert.last_output_excerpt
-        ));
-    }
-    if alert.force_diagnosis {
-        // Thrash: same goal, varying commands, still failing. The model is
-        // guessing edits without reading the failure. Force it to diagnose
-        // before it's allowed to act again — this is the agent coaching the
-        // model through a problem it keeps bouncing off.
-        return Some(format!(
-            "[NO PROGRESS — DIAGNOSE BEFORE YOUR NEXT ACTION]\n\
-             You have attempted `{}` {} times now and the result keeps coming back the same. \
-             Your changes are NOT fixing it — you are guessing instead of reading the failure.\n\
-             Before you call ANY tool, reply in PLAIN TEXT with exactly these three things:\n\
-             1. Quote the exact error or failing line from the output below.\n\
-             2. State the single root cause of that specific error.\n\
-             3. State the ONE concrete change that fixes that root cause — and how it differs from what you already tried.\n\n\
-             Most recent result:\n{}\n\n\
-             Do not repeat a variation of an edit you have already made. Diagnose first, then make exactly one targeted change.",
-            alert.command_summary, alert.count, alert.last_output_excerpt
-        ));
-    }
-    Some(format!(
-        "[STOP — REPETITION DETECTED]\n\
-         You have called `{}` with identical arguments {} times in a row. The result will not change. STOP making this call.\n\
-         Last call: {}\n\
-         Last output excerpt: {}\n\
-         You MUST try a different approach now: change the arguments, use a different tool, or report what you've learned to the user. Repeating the same call is a wasted turn.",
-        alert.tool_name, alert.count, alert.command_summary, alert.last_output_excerpt
-    ))
-}
-
-/// Synthesized tool-output for the most-recent call in a detected repetition
-/// loop. Replaces the real (identical) result so the model reads, in the
-/// tool-output slot it actually attends to, an unambiguous "stop repeating"
-/// signal. The prelude alert ([`render_repetition_alert`]) stays as a
-/// reinforcing nudge, but this is the part a looping local model can't talk
-/// past — it's the result of its own last call.
-fn render_repetition_override(alert: &RepetitionAlert, content: &str) -> String {
-    if alert.force_diagnosis {
-        // Thrash override: planted in the tool-output slot the model actually
-        // attends to, demanding a diagnosis before its next move. This is the
-        // part a guessing local model can't talk past — it's the result of its
-        // own last call.
+/// The SINGLE source of the "you're looping" directive. The TRIGGER and the
+/// escalation TIER differ — footprint stalled → CIRCLING; a literal repeat → STOP;
+/// same-goal thrash → DIAGNOSE; the loop ignored past threshold → EXCISE + reframe
+/// — but the message is one thing, not five. `result` is the unchanging output to
+/// show once (an excerpt in the prelude, the full last output in the tool-output
+/// slot). Both delivery mechanisms ([`render_repetition_alert`] = prelude,
+/// [`render_repetition_override`] = the tool-output slot a looping model can't talk
+/// past) call this, so they always say the same thing.
+fn render_loop_directive(alert: &RepetitionAlert, result: &str) -> String {
+    let what = if alert.command_summary.is_empty() {
+        alert.tool_name.as_str()
+    } else {
+        alert.command_summary.as_str()
+    };
+    let n = alert.count;
+    // Footprint stalled — circling a fixed set of targets without expanding (see
+    // `detect_tunnel_vision`). Checked FIRST because tunnel-vision also sets
+    // `force_diagnosis`; this gives it its own specific, target-naming framing.
+    if alert.tunnel_vision {
+        let targets = if what.is_empty() {
+            "the same places"
+        } else {
+            what
+        };
         return format!(
-            "[HARNESS: NO PROGRESS — DIAGNOSE BEFORE ACTING]\n\
-             You have attempted this {} times and the outcome has not changed. More guesses will not help.\n\
-             Your NEXT reply must be PLAIN TEXT (no tool call) containing:\n\
-             1. The exact error/failing line, quoted from the result below.\n\
-             2. The single root cause.\n\
-             3. The one specific change that fixes it, and why it's different from what you already tried.\n\n\
-             The result you keep getting:\n{}",
-            alert.count, content
+            "[STUCK — CIRCLING THE SAME PLACES]\n\
+             Your last {n} tool calls kept returning to {targets} without touching anything new — you are circling, not progressing. Another edit to the same place will not break the loop.\n\
+             Before your NEXT tool call, reply in PLAIN TEXT:\n\
+             1. What you are trying to make happen, and the EXACT evidence it isn't (quote the real output — do not assume).\n\
+             2. Why it isn't working — and look where you have NOT: the spot you keep returning to is apparently not the cause.\n\
+             3. ONE next step that is genuinely DIFFERENT — a new file, or a check that proves the actual state (print the real value / run the failing thing and read it) — NOT another pass over {targets}.\n\n\
+             Most recent result:\n{result}"
         );
     }
+    if alert.escalate {
+        // Tier 3 — advisory + STOP both ignored. The loop's calls have been excised
+        // from the messages (see `render_messages`); restate the one result and
+        // point at the live state so the model acts instead of copying a loop it
+        // can no longer see.
+        return format!(
+            "[HARNESS — STUCK; LOOP REMOVED FROM CONTEXT]\n\
+             You ran `{what}` {n} times and the result never changed, so those repeated calls were removed from this conversation. Here it is once — it will NOT change, do not run it again:\n\n{result}\n\n\
+             The current file and latest results are in your context above. Make EXACTLY ONE different change now; do not reproduce the loop you can no longer see."
+        );
+    }
+    if alert.force_diagnosis {
+        // Tier 2 — same goal, varying attempts, still failing: guessing without
+        // reading the failure. Force a diagnosis, aimed where it helps — the edits
+        // aren't moving the result, so the cause is elsewhere; observe, don't deduce.
+        return format!(
+            "[NO PROGRESS — DIAGNOSE BEFORE YOUR NEXT ACTION]\n\
+             You've tried `{what}` {n} times and the result keeps coming back the same — your changes are NOT moving it, which means the cause is NOT where you keep editing.\n\
+             Before you call ANY tool, reply in PLAIN TEXT with:\n\
+             1. The exact error or failing line, quoted from the result below.\n\
+             2. Its single root cause — and look where you HAVEN'T: the error names the symptom, not the cause.\n\
+             3. The ONE change that fixes that cause, and how it differs from what you already tried.\n\
+             If you can't tell why it fails, stop guessing — print the actual value and type right before the point that fails, run it once, and read what you really get.\n\n\
+             The result you keep getting:\n{result}"
+        );
+    }
+    // Tier 1 — a literal repeat.
     format!(
-        "[REPEATED CALL BLOCKED BY HARNESS]\n\
-         You have now called `{}` {} times in a row in the exact same way and gotten the exact same result every time ({}). \
-         Calling it again will produce the identical result — this is a no-op loop and a wasted turn.\n\n\
-         You MUST change approach now: use different arguments, switch to a different tool, or stop and report to the user what you've learned and what is blocking you. \
-         Do NOT issue this same `{}` call again.\n\n\
-         The identical result you already received (unchanged):\n{}",
-        alert.tool_name, alert.count, alert.command_summary, alert.tool_name, content
+        "[STOP — REPETITION DETECTED]\n\
+         You've called `{what}` {n} times in a row the same way and gotten the same result every time. Calling it again is a no-op — a wasted turn.\n\
+         Change approach now: different arguments, a different tool, or stop and tell the user what you've learned and what's blocking you.\n\n\
+         The unchanged result:\n{result}"
     )
+}
+
+fn render_repetition_alert(state: &ExtractedState) -> Option<String> {
+    let alert = state.repetition.as_ref()?;
+    Some(render_loop_directive(alert, &alert.last_output_excerpt))
+}
+
+/// Synthesized tool-output for the most-recent call in a detected repetition loop,
+/// planted in the slot the model actually attends to — a looping local model talks
+/// past the prelude but not the result of its own last call. Same directive as the
+/// prelude (via [`render_loop_directive`]); the difference is placement and that it
+/// shows the FULL last output, not the excerpt. (Escalated loops are excised before
+/// this runs, so only the STOP / DIAGNOSE tiers reach here.)
+fn render_repetition_override(alert: &RepetitionAlert, content: &str) -> String {
+    render_loop_directive(alert, content)
 }
 
 fn render_world_state(state: &ExtractedState, active_turn: u32) -> String {
@@ -372,6 +452,7 @@ pub fn render_messages(
     active_turn: u32,
     flavor: crate::config::ClientFlavor,
     repetition: Option<&RepetitionAlert>,
+    max_chars: usize,
 ) -> (Vec<JsonValue>, usize) {
     let mut messages: Vec<JsonValue> = Vec::new();
 
@@ -467,6 +548,9 @@ pub fn render_messages(
 
     // Active turn: pass through verbatim, preserving the original
     // role/structure as best Ollama can represent it.
+    // When a loop is excised (context reset), collapse it into ONE inline marker
+    // the first time we hit it rather than deleting into a gap — see the prune below.
+    let mut loop_collapsed = false;
     for item in &parsed.items {
         if item.turn_id() != active_turn {
             continue;
@@ -493,6 +577,25 @@ pub fn render_messages(
                 ..
             } => {
                 if pruned_loop.contains(call_id.as_str()) {
+                    // Don't delete into a gap. Collapse the whole excised loop into
+                    // ONE coherent inline marker the first time we hit it, so the
+                    // transcript still reads "I tried this N times, it didn't work"
+                    // — instead of leaving the surviving interleaved calls (e.g. the
+                    // test runs) with no record of the edits between them, which a
+                    // small model reads as "I haven't acted yet" and repeats. The
+                    // rest of the loop's calls + outputs are dropped silently.
+                    if !loop_collapsed {
+                        loop_collapsed = true;
+                        if let Some(alert) = repetition {
+                            messages.push(serde_json::json!({
+                                "role": "user",
+                                "content": format!(
+                                    "[loop collapsed — {} repeated `{}` attempts here were removed to break a loop; each returned the same result, shown once. Do NOT repeat them; make a different change.]\n{}",
+                                    alert.count, alert.tool_name, alert.last_output_excerpt
+                                ),
+                            }));
+                        }
+                    }
                     continue; // loop call excised by context reset
                 }
                 // Wire format for `arguments` differs by flavor:
@@ -569,6 +672,14 @@ pub fn render_messages(
                 let repetition_override = repetition
                     .filter(|alert| !alert.call_id.is_empty() && alert.call_id == *call_id)
                     .map(|alert| render_repetition_override(alert, content));
+                // Bound an oversized output so one 60 KB dump can't dominate the
+                // prompt and tip it over the window (the dominant overflow cause).
+                let bounded = if repetition_override.is_none() {
+                    bound_tool_output(tool_name, content, max_chars)
+                } else {
+                    None
+                };
+                let content: &str = bounded.as_deref().unwrap_or(content);
                 let success = *success && repetition_override.is_none();
                 let body: &str = repetition_override.as_deref().unwrap_or(content);
                 let tag = if success { "tool_result" } else { "tool_error" };
@@ -626,10 +737,15 @@ pub fn render_messages(
 fn short(s: &str, n: usize) -> String {
     let cleaned = s.replace(['\n', '\r'], " ");
     if cleaned.len() <= n {
-        cleaned
-    } else {
-        format!("{}…", &cleaned[..n])
+        return cleaned;
     }
+    // Char-boundary-safe: a raw `&cleaned[..n]` panics if `n` splits a multibyte
+    // char (tool outputs are arbitrary UTF-8 — e.g. a `·` in web-search results).
+    let mut end = n;
+    while end > 0 && !cleaned.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &cleaned[..end])
 }
 
 /// Produce a follow-up hint for a failed tool output, matched on tool name
@@ -638,27 +754,6 @@ fn short(s: &str, n: usize) -> String {
 fn tool_failure_hint(tool_name: &str, content: &str) -> String {
     let prefix = "\n\n→ Hint: ";
     match tool_name {
-        "apply_patch" => {
-            if content.contains("Failed to find context")
-                || content.contains("Failed to find expected lines")
-            {
-                format!(
-                    "{prefix}The patch's target lines aren't in the file as written — often because an earlier edit never actually landed. Re-patching will keep failing. The file's current contents are pinned above; rewrite the WHOLE file with `write_file` instead."
-                )
-            } else if content.contains("first line of the patch must be '*** Begin Patch'") {
-                format!(
-                    "{prefix}Add `*** Begin Patch` as the very first line of the `input` string."
-                )
-            } else if content.contains("last line of the patch must be '*** End Patch'") {
-                format!("{prefix}Add `*** End Patch` as the very last line of the `input` string.")
-            } else if content.contains("not a valid hunk header") {
-                format!(
-                    "{prefix}Hunk content lines must be prefixed with `+` (additions), `-` (deletions), or ` ` (context). Headers are `*** Add File: <path>`, `*** Update File: <path>`, `*** Delete File: <path>`, or `@@ ... @@`."
-                )
-            } else {
-                String::new()
-            }
-        }
         "shell" | "exec_command" | "shell_command" | "local_shell" => {
             if content.contains("regex parse error")
                 || content.contains("repetition operator missing expression")

@@ -75,6 +75,13 @@ pub struct RepetitionAlert {
     /// pattern out of its own saturated context. Only set for signature-based
     /// loops (we can prune those precisely).
     pub escalate: bool,
+    /// The model's *footprint stopped expanding*: several tool calls in a row that
+    /// only revisit already-seen well-defined targets (files/urls/queries) without
+    /// touching anything new — a structural, content-blind stuck signal, distinct
+    /// from an exact repeat or a same-target failure streak. The renderer turns it
+    /// into a forceful "you're circling these — do ONE genuinely different thing"
+    /// directive. See [`detect_tunnel_vision`].
+    pub tunnel_vision: bool,
 }
 
 /// Count at which a repeated loop escalates from advisory nudge + hard block to
@@ -242,7 +249,11 @@ pub fn extract(parsed: &ParsedTranscript, _active_turn: u32) -> ExtractedState {
     state.patch_failure = detect_patch_failure(parsed);
     state.repetition = detect_repetition(parsed)
         .or_else(|| detect_same_target_failure_repetition(parsed))
-        .or_else(|| detect_unproductive_recurrence(parsed));
+        .or_else(|| detect_unproductive_recurrence(parsed))
+        // Broadest, last: structural "footprint stopped expanding" — catches
+        // circling a fixed set of files/urls even when individual calls neither
+        // repeat byte-for-byte nor record an explicit failure.
+        .or_else(|| detect_tunnel_vision(parsed));
     if let Some(alert) = state.repetition.as_ref() {
         tracing::info!(
             tool_name = %alert.tool_name,
@@ -346,6 +357,7 @@ fn detect_repetition(parsed: &ParsedTranscript) -> Option<RepetitionAlert> {
         force_diagnosis: false,
         escalate: count >= ESCALATION_THRESHOLD,
         signature,
+        tunnel_vision: false,
     })
 }
 
@@ -447,6 +459,7 @@ fn detect_unproductive_recurrence(parsed: &ParsedTranscript) -> Option<Repetitio
         force_diagnosis: true,
         escalate: count >= ESCALATION_THRESHOLD,
         signature,
+        tunnel_vision: false,
     })
 }
 
@@ -526,6 +539,133 @@ fn edit_target_path(tool_name: &str, args_raw: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// The well-defined target a tool call acts on, for the footprint detector — a
+/// file path, a url, or a search query. Returns `None` for tools whose target we
+/// cannot classify without guessing (notably `shell`/`exec_command`): those calls
+/// are ABSTAINED — counted as neither progress nor non-progress — because reading
+/// an ad-hoc command line for "what it touched" is exactly the flaky guess we
+/// refuse to make. Only clean, unambiguous targets move the tunnel-vision counter.
+fn well_defined_target(tool_name: &str, args_raw: &str) -> Option<String> {
+    if let Some(path) = edit_target_path(tool_name, args_raw) {
+        return Some(format!("file:{path}"));
+    }
+    let v: serde_json::Value = serde_json::from_str(args_raw).ok()?;
+    match tool_name {
+        "read_file" | "cat_file" => v
+            .get("path")
+            .and_then(|x| x.as_str())
+            .map(|p| format!("file:{p}")),
+        "web_fetch" => v
+            .get("url")
+            .and_then(|x| x.as_str())
+            .map(|u| format!("url:{u}")),
+        "web_search" | "local_web_search" => v
+            .get("query")
+            .or_else(|| v.get("q"))
+            .and_then(|x| x.as_str())
+            .map(|q| format!("search:{q}")),
+        _ => None,
+    }
+}
+
+/// Tunnel-vision / "footprint stopped expanding" detector — the broadest stuck
+/// signal, run only after the exact-repeat and same-target-failure detectors find
+/// nothing. Structural and content-blind: it watches whether the model keeps
+/// reaching NEW well-defined targets (healthy) or churns within a fixed set
+/// (stuck), without reading the code or the outcomes.
+///
+/// The counter is "verified revisits since the last new target": walking the
+/// active turn forward, a NEW well-defined target resets it to 0 (the footprint
+/// expanded = progress), an already-seen one increments it (circling), and a call
+/// with no classifiable target (`shell`, …) is ABSTAINED. Fires at `THRESHOLD`.
+///
+/// A low threshold is safe BECAUSE of the reset: progressing work — even tightly
+/// focused work — keeps touching new targets and never accumulates; only
+/// non-expanding churn climbs. And firing is cheap and self-pacing: the signal is
+/// recomputed from the transcript each turn, so the moment the model touches
+/// anything new it clears (no persistent state to leak, no treadmill). `escalate`
+/// stays false — context surgery / "is it hopeless" is a separate backstop's job.
+fn detect_tunnel_vision(parsed: &ParsedTranscript) -> Option<RepetitionAlert> {
+    const THRESHOLD: usize = 8;
+
+    // Active turn only: collect tool calls back to the last user message (a new
+    // task is a fresh footprint), then process them in order.
+    let mut calls: Vec<(&str, &str, &str)> = Vec::new();
+    for item in parsed.items.iter().rev() {
+        match item {
+            TrimItem::ToolCall {
+                tool_name,
+                args,
+                call_id,
+                ..
+            } => calls.push((tool_name, args, call_id)),
+            TrimItem::ToolOutput { .. }
+            | TrimItem::AssistantText { .. }
+            | TrimItem::Reasoning { .. } => continue,
+            _ => break, // user message → task boundary
+        }
+    }
+    calls.reverse();
+
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut streak = 0usize;
+    let mut cycled: Vec<String> = Vec::new();
+    let mut last_call_id = String::new();
+    for (tool_name, args, call_id) in &calls {
+        let Some(target) = well_defined_target(tool_name, args) else {
+            continue; // abstain on shell / unclassifiable
+        };
+        if seen.insert(target.clone()) {
+            // Footprint expanded → progress → reset the streak.
+            streak = 0;
+            cycled.clear();
+        } else {
+            streak += 1;
+            if !cycled.contains(&target) {
+                cycled.push(target.clone());
+            }
+            last_call_id = (*call_id).to_string();
+        }
+    }
+
+    if streak < THRESHOLD {
+        return None;
+    }
+
+    // Display targets without the internal `file:`/`url:`/`search:` tag.
+    let targets = cycled
+        .iter()
+        .map(|t| t.splitn(2, ':').nth(1).unwrap_or(t.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let last_output_excerpt = parsed
+        .items
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            TrimItem::ToolOutput {
+                call_id: cid,
+                content,
+                ..
+            } if *cid == last_call_id => Some(excerpt(content, 300)),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    Some(RepetitionAlert {
+        tool_name: String::new(),
+        command_summary: targets,
+        count: streak,
+        last_output_excerpt,
+        call_id: last_call_id,
+        force_diagnosis: true,
+        escalate: false,
+        signature: String::new(),
+        tunnel_vision: true,
+    })
 }
 
 /// Walk the parsed transcript looking for 3+ consecutive tool-call failures
@@ -633,6 +773,7 @@ fn detect_same_target_failure_repetition(parsed: &ParsedTranscript) -> Option<Re
         // context. Forced-diagnosis is the right intervention here, not surgery.
         escalate: false,
         signature: String::new(),
+        tunnel_vision: false,
     })
 }
 
@@ -837,20 +978,27 @@ fn shell_exit_code(output: &str) -> Option<i32> {
         })
 }
 
-fn excerpt(s: &str, n: usize) -> String {
+/// Truncate `s` to at most `n` bytes, ending on a CHAR BOUNDARY, with an ellipsis.
+/// A raw byte slice `&s[..n]` PANICS when `n` lands inside a multibyte char (e.g. a
+/// `·` at bytes 199..201 in a web-search result) — the crash this guards against.
+/// Tool outputs are arbitrary UTF-8, so every truncation here must be boundary-safe.
+fn truncate_ellipsis(s: &str, n: usize) -> String {
     if s.len() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..n])
+        return s.to_string();
     }
+    let mut end = n;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
+fn excerpt(s: &str, n: usize) -> String {
+    truncate_ellipsis(s, n)
 }
 
 fn short_str(s: &str, n: usize) -> String {
-    if s.len() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..n])
-    }
+    truncate_ellipsis(s, n)
 }
 
 fn short_args(s: &str, n: usize) -> String {
@@ -870,4 +1018,27 @@ fn stringify_command(v: &serde_json::Value) -> String {
             .join(" ");
     }
     v.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_ellipsis_does_not_split_a_multibyte_char() {
+        // Reproduces the live crash: a `·` (U+00B7, bytes 199..201) straddling the
+        // cut at byte 200. A raw `&s[..200]` panicked ("not a char boundary") and
+        // took down the whole session when a web-search result was excerpted.
+        let s = format!("{}·{}", "a".repeat(199), "b".repeat(100));
+        let out = truncate_ellipsis(&s, 200); // must not panic
+        assert!(out.ends_with('…'));
+        // Backed off to the boundary before the `·` (byte 199).
+        assert_eq!(out, format!("{}…", "a".repeat(199)));
+    }
+
+    #[test]
+    fn truncate_ellipsis_keeps_short_or_exact_strings_whole() {
+        assert_eq!(truncate_ellipsis("héllo", 100), "héllo");
+        assert_eq!(truncate_ellipsis("abc", 3), "abc");
+    }
 }

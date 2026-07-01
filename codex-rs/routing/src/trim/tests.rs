@@ -475,7 +475,7 @@ fn repetition_injects_synthetic_tool_result_on_most_recent_call() {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
-    let hits = joined.matches("[REPEATED CALL BLOCKED BY HARNESS]").count();
+    let hits = joined.matches("[STOP — REPETITION DETECTED]").count();
     assert_eq!(
         hits, 1,
         "synthetic stop result should appear exactly once (on the last call):\n{joined}"
@@ -489,7 +489,7 @@ fn repetition_injects_synthetic_tool_result_on_most_recent_call() {
     assert!(
         c3_output
             .to_string()
-            .contains("[REPEATED CALL BLOCKED BY HARNESS]"),
+            .contains("[STOP — REPETITION DETECTED]"),
         "c3's output should be the one overridden:\n{c3_output}"
     );
 }
@@ -534,13 +534,15 @@ fn enforces_token_budget_by_truncating_bulky_tool_output() {
             .is_some_and(|s| s.contains("do the thing"))),
         "user request must be preserved"
     );
-    // The bulky tool output must show the truncation marker.
+    // The bulky tool output must be bounded with a marker — either the
+    // render-time content_reduce/elision pass (which now bounds large outputs at
+    // the source) or the budget-enforcement truncation.
     assert!(
         result.messages.iter().any(|m| m
             .get("content")
             .and_then(|c| c.as_str())
-            .is_some_and(|s| s.contains("truncated to fit"))),
-        "bulky tool output should be truncated with a marker"
+            .is_some_and(|s| s.contains("truncated to fit") || s.contains("output omitted"))),
+        "bulky tool output should be bounded with a marker"
     );
 }
 
@@ -618,13 +620,142 @@ fn apply_patch_failure_gets_recovery_hint() {
         .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
         .collect::<Vec<_>>()
         .join("\n");
+    let _ = combined;
+    // The recovery lives in the prelude directive (a single source), phrased in the
+    // model's own vocabulary — it called `edit_file`, never `apply_patch` — and it
+    // steers to a whole-file `write_file` rewrite, not a re-read.
     assert!(
-        combined.contains("→ Hint:"),
-        "failed apply_patch should get a recovery hint:\n{combined}"
+        result.system.contains("[EDIT DID NOT APPLY") && result.system.contains("write_file"),
+        "failed edit should steer to a write_file rewrite via the prelude directive:\n{}",
+        result.system
+    );
+    // The DIRECTIVE we author must speak the model's vocabulary (it called
+    // `edit_file`, never `apply_patch`). The tool's own error text may still say
+    // "apply_patch" — that's the executor's factual output, which we don't scrub —
+    // so we assert on the directive line, not all of `result.system`.
+    let directive_line = result
+        .system
+        .lines()
+        .find(|l| l.contains("could not be applied"))
+        .unwrap_or_default();
+    assert!(
+        !directive_line.contains("apply_patch"),
+        "our directive must not mention apply_patch:\n{directive_line}"
+    );
+}
+
+#[test]
+fn tunnel_vision_fires_when_footprint_stops_expanding() {
+    // Nine edits to the SAME file with DIFFERENT args and SUCCESSFUL outputs — so
+    // neither the exact-repeat detector (args vary) nor the failure-streak/thrash
+    // detectors (nothing fails) fire. The footprint never expands → the structural
+    // stuck detector catches it (1 new target + 8 revisits = streak 8 = threshold).
+    let mut items = vec![user_msg("fix the bug in foo.py")];
+    for i in 0..9 {
+        let cid = format!("e{i}");
+        items.push(function_call(
+            &cid,
+            "edit_file",
+            &format!(r#"{{"path":"foo.py","old_string":"v{i}","new_string":"w{i}"}}"#),
+        ));
+        items.push(function_output(&cid, "ok", true));
+    }
+    let result = trim_for_local(
+        &TrimInput {
+            items: &items,
+            system_prompt: "SYS",
+            user_instructions: None,
+            current_files: None,
+            flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
+        },
+        16384,
     );
     assert!(
-        combined.contains("write_file"),
-        "hint should steer to a write_file rewrite, not a re-read:\n{combined}"
+        result.system.contains("[STUCK — CIRCLING THE SAME PLACES]"),
+        "tunnel-vision directive should fire:\n{}",
+        result.system
+    );
+    assert!(
+        result.system.contains("foo.py"),
+        "the directive should name the cycled file:\n{}",
+        result.system
+    );
+}
+
+#[test]
+fn tunnel_vision_does_not_fire_when_footprint_keeps_expanding() {
+    // Six edits, each to a DIFFERENT file — the footprint keeps expanding, so the
+    // counter resets every call and never reaches the threshold. Progressing work
+    // (even rapid) must not be nudged.
+    let mut items = vec![user_msg("touch several files")];
+    for i in 0..6 {
+        let cid = format!("e{i}");
+        items.push(function_call(
+            &cid,
+            "edit_file",
+            &format!(r#"{{"path":"f{i}.py","old_string":"a","new_string":"b"}}"#),
+        ));
+        items.push(function_output(&cid, "ok", true));
+    }
+    let result = trim_for_local(
+        &TrimInput {
+            items: &items,
+            system_prompt: "SYS",
+            user_instructions: None,
+            current_files: None,
+            flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
+        },
+        16384,
+    );
+    assert!(
+        !result.system.contains("[STUCK — CIRCLING THE SAME PLACES]"),
+        "expanding footprint must not fire tunnel-vision:\n{}",
+        result.system
+    );
+}
+
+#[test]
+fn oversized_tool_output_is_bounded() {
+    // A 60 KB dump (e.g. `curl … openapi.json | json.tool`) kept verbatim is the
+    // dominant overflow cause. It must be bounded in the rendered prompt.
+    let huge = "abcd ".repeat(12_000); // ~60 KB
+    let items = vec![
+        user_msg("fetch the spec"),
+        function_call(
+            "c1",
+            "exec_command",
+            r#"{"cmd":"curl -s url | python3 -m json.tool"}"#,
+        ),
+        function_output("c1", &huge, true),
+    ];
+    let result = trim_for_local(
+        &TrimInput {
+            items: &items,
+            system_prompt: "SYS",
+            user_instructions: None,
+            current_files: None,
+            flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
+        },
+        16384,
+    );
+    let combined: String = result
+        .messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        combined.chars().count() < 20_000,
+        "a 60 KB tool output must be bounded; rendered {} chars",
+        combined.chars().count()
+    );
+    assert!(
+        combined.contains("output omitted"),
+        "an unshrinkable output is omitted with a pointer, never a broken fragment:\n{}",
+        &combined[..combined.len().min(400)]
     );
 }
 
@@ -670,7 +801,7 @@ fn failed_patch_steers_to_write_file_rewrite() {
     assert!(
         result
             .system
-            .contains("[PATCH DID NOT APPLY — REWRITE THE FILE]"),
+            .contains("[EDIT DID NOT APPLY — REWRITE THE WHOLE FILE]"),
         "prelude should carry the rewrite directive:\n{}",
         result.system
     );
@@ -1183,6 +1314,21 @@ fn escalation_excises_the_loop_and_reframes() {
         .filter(|m| m.get("tool_calls").is_some())
         .count();
     assert_eq!(tool_call_msgs, 0, "no loop tool-calls should remain");
+    // The excised loop is replaced by ONE coherent inline collapse marker — not
+    // deleted into a gap that reads as "I haven't acted yet".
+    let collapse_markers = result
+        .messages
+        .iter()
+        .filter(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| s.contains("loop collapsed"))
+        })
+        .count();
+    assert_eq!(
+        collapse_markers, 1,
+        "excised loop must leave exactly one inline collapse marker:\n{result:#?}"
+    );
 }
 
 // --- helpers ------------------------------------------------------------

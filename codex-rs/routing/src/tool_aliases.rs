@@ -12,7 +12,16 @@
 //! the boundary between the model's dialect and Codex's tool registry —
 //! exactly the layer where translation belongs.
 
+use base64::Engine;
 use serde_json::Value as JsonValue;
+
+/// base64 engine for the write_file→shell massage (standard alphabet, no wrap).
+const B64: base64::engine::general_purpose::GeneralPurpose =
+    base64::engine::general_purpose::STANDARD;
+
+/// Marker that tags a `shell` command we synthesized from a `write_file` call, so
+/// the inbound pass can recognize and re-present it. Followed by the base64 path.
+const SHEPHARD_WRITE_MARKER: &str = "# shephard-write:";
 
 /// Names the local model may emit as tool names that should actually be
 /// executed via the `shell` tool. Comprehensive Linux developer environment
@@ -443,6 +452,82 @@ pub fn normalize_write_file_call(args: &JsonValue) -> Option<TranslatedCall> {
     })
 }
 
+/// Wrap a string for safe use as a single shell argument: surround with single
+/// quotes, escaping any interior single quote as `'\''`.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Parent directory of a path (everything up to the last `/`), or `""` if none.
+fn parent_dir(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(i) => &path[..i],
+        None => "",
+    }
+}
+
+/// Lower a `write_file` call to the **agent-agnostic** substrate: a `shell`
+/// invocation that writes the content via base64. The model emits the high-level
+/// `write_file`; we translate it to `shell` — the one primitive every coding
+/// harness exposes — and the inbound pass ([`parse_shephard_write`]) re-presents
+/// the recorded shell call AS `write_file`, so the model only ever sees its own
+/// tool. base64 makes the write byte-exact and immune to the ENTIRE shell
+/// escaping / quoting / heredoc-marker / trailing-newline bug-class (the payload
+/// is pure `[A-Za-z0-9+/=]`), so any file content round-trips. A
+/// `# shephard-write:<path_b64>` sentinel makes the call recognizable statelessly
+/// (survives process restarts). Parent dirs are created; a byte-count line is
+/// echoed so a small model gets positive confirmation the write landed.
+///
+/// Accepts `{path|file|file_path|filename, content|contents|text|body}`. Returns
+/// `None` only if `path` is missing/empty (caller then keeps the real handler).
+pub fn write_file_to_base64_shell(args: &JsonValue) -> Option<TranslatedCall> {
+    let obj = args.as_object()?;
+    let get = |keys: &[&str]| -> Option<String> {
+        keys.iter()
+            .find_map(|k| obj.get(*k).and_then(|v| v.as_str()))
+            .map(str::to_string)
+    };
+    let path = get(&["path", "file", "file_path", "filename"])?;
+    if path.is_empty() {
+        return None;
+    }
+    let content = get(&["content", "contents", "text", "body"]).unwrap_or_default();
+    let content_b64 = B64.encode(content.as_bytes());
+    let path_b64 = B64.encode(path.as_bytes());
+    let q = shell_single_quote(&path);
+    let dir = parent_dir(&path);
+    let mkdir = if dir.is_empty() {
+        String::new()
+    } else {
+        format!("mkdir -p {} && ", shell_single_quote(dir))
+    };
+    let cmd = format!(
+        "{mkdir}printf %s '{content_b64}' | base64 -d > {q} && \
+         printf 'write_file: wrote %s bytes to %s\\n' \"$(wc -c < {q})\" {q}  {SHEPHARD_WRITE_MARKER}{path_b64}"
+    );
+    Some(TranslatedCall {
+        name: "shell",
+        args: serde_json::json!({ "command": ["bash", "-lc", cmd] }),
+        command_line: format!("write_file -> shell base64 (overwrite {path})"),
+    })
+}
+
+/// Inbound half of the write_file massage: recognize a `shell` command string
+/// produced by [`write_file_to_base64_shell`] and recover the original
+/// `(path, content)`. Detection + extraction are purely from the command text
+/// (stateless), so re-presentation survives restarts. `None` for any other
+/// command.
+pub fn parse_shephard_write(command: &str) -> Option<(String, String)> {
+    // Path: base64 after the sentinel marker (no shell-special chars, unambiguous).
+    let path_b64 = command.rsplit_once(SHEPHARD_WRITE_MARKER)?.1.trim();
+    let path = String::from_utf8(B64.decode(path_b64).ok()?).ok()?;
+    // Content: base64 between `printf %s '` and the closing quote.
+    let after = command.split_once("printf %s '")?.1;
+    let content_b64 = after.split_once('\'')?.0;
+    let content = String::from_utf8(B64.decode(content_b64).ok()?).ok()?;
+    Some((path, content))
+}
+
 /// Best-effort recovery of a `write_file`/`create_file` call whose JSON arguments
 /// the model botched. A small model cannot reliably JSON-escape an entire file as
 /// a string argument: it emits raw (unescaped) newlines and bare double-quotes in
@@ -547,6 +632,35 @@ fn decode_lenient(s: &str) -> String {
         }
     }
     out
+}
+
+/// A local model sometimes emits `exec_command` with `cmd` set to `shell`'s ARRAY
+/// form — `["bash","-lc","..."]`, as a real array OR a stringified one — instead
+/// of the plain command STRING `exec_command` expects. The runner then tries to
+/// execute a program literally named `[` and fails with "No such file or
+/// directory". Detect that shape and route it to `shell`, which takes the array
+/// natively. Returns `None` for a normal string `cmd` (passes through unchanged).
+pub fn normalize_exec_command_array(args: &JsonValue) -> Option<TranslatedCall> {
+    let cmd = args.get("cmd").or_else(|| args.get("command"))?;
+    let arr: Vec<String> = match cmd {
+        JsonValue::Array(_) => serde_json::from_value(cmd.clone()).ok()?,
+        JsonValue::String(s) => {
+            let t = s.trim_start();
+            if !t.starts_with('[') {
+                return None; // a normal command string — leave exec_command alone
+            }
+            serde_json::from_str(t).ok()?
+        }
+        _ => return None,
+    };
+    if arr.is_empty() {
+        return None;
+    }
+    Some(TranslatedCall {
+        name: "shell",
+        args: serde_json::json!({ "command": arr }),
+        command_line: "exec_command (array cmd) -> shell".to_string(),
+    })
 }
 
 /// Normalize a read-only `read_file` call into a `shell` invocation that prints
@@ -1570,6 +1684,73 @@ pub fn strip_leaked_tool_calls(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shell_cmd_of(t: &TranslatedCall) -> String {
+        // The translated shell call carries {command: ["bash","-lc", CMD]}.
+        t.args
+            .get("command")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.last())
+            .and_then(|s| s.as_str())
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn write_file_base64_round_trips_hostile_content() {
+        // Content packed with everything that breaks naive shell escaping:
+        // single + double quotes, raw newlines, $, backticks, and the literal
+        // sentinel/heredoc-marker text itself.
+        let nasty = "line1 'sq' \"dq\" $VAR `cmd`\nEOF\n# shephard-write:fake\nprintf %s 'x'\n";
+        let path = "src/a b/wei'rd.py"; // space + single quote in the path
+        let t = write_file_to_base64_shell(&serde_json::json!({ "path": path, "content": nasty }))
+            .expect("a normal write_file must translate");
+        assert_eq!(t.name, "shell");
+        let cmd = shell_cmd_of(&t);
+        // It must actually be a base64 write to the right (quoted) path.
+        assert!(cmd.contains("| base64 -d > "), "uses base64 decode: {cmd}");
+        assert!(cmd.contains("mkdir -p "), "creates the parent dir: {cmd}");
+        // The inbound parse recovers the ORIGINAL path + content byte-exact.
+        let (got_path, got_content) =
+            parse_shephard_write(&cmd).expect("the sentinel'd command must parse back");
+        assert_eq!(got_path, path);
+        assert_eq!(got_content, nasty);
+    }
+
+    #[test]
+    fn write_file_base64_needs_a_path() {
+        assert!(write_file_to_base64_shell(&serde_json::json!({ "content": "x" })).is_none());
+        assert!(
+            write_file_to_base64_shell(&serde_json::json!({ "path": "", "content": "x" }))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_shephard_write_ignores_other_shell_commands() {
+        assert!(parse_shephard_write("pytest -q && ls -la").is_none());
+        assert!(parse_shephard_write("printf %s 'aGk=' | base64 -d > x").is_none()); // no sentinel
+    }
+
+    #[test]
+    fn exec_command_array_cmd_routes_to_shell() {
+        // Stringified array (the observed failure: cmd is a JSON array string).
+        let t = normalize_exec_command_array(
+            &serde_json::json!({"cmd": "[\"bash\", \"-lc\", \"pytest -q\"]"}),
+        )
+        .expect("array-shaped cmd should route to shell");
+        assert_eq!(t.name, "shell");
+        assert_eq!(
+            t.args["command"],
+            serde_json::json!(["bash", "-lc", "pytest -q"])
+        );
+        // A real array value works too.
+        let t2 = normalize_exec_command_array(&serde_json::json!({"cmd": ["ls", "-la"]}))
+            .expect("real array should route to shell");
+        assert_eq!(t2.args["command"], serde_json::json!(["ls", "-la"]));
+        // A normal string command is left alone (passes through as exec_command).
+        assert!(normalize_exec_command_array(&serde_json::json!({"cmd": "ls -la"})).is_none());
+    }
 
     #[test]
     fn apply_patch_add_becomes_write_file() {

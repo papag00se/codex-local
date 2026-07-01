@@ -225,6 +225,13 @@ pub(crate) async fn handle_output_item_done(
                 payload_preview
             );
 
+            // The write_file → shell base64 massage records a 30 KB+ base64 command;
+            // the TUI re-renders the whole transcript each frame, so accumulating those
+            // blobs freezes it. Re-present the RECORDED item as the clean `write_file`
+            // the model made — routing the TUI to its efficient file-write renderer
+            // instead of a giant shell line. Execution already used the real shell
+            // `call` built above; a no-op for every non-shephard-write item.
+            let item = crate::local_routing::represent_shell_write_item(item);
             record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
                 .await;
 

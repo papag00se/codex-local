@@ -40,7 +40,7 @@ The agent BAILED if any of the following are true:\n\
 - The agent says \"now I'll X\" or \"let me X\" or \"next I'll X\" and stops\n\
 - The agent restates findings but doesn't apply them when applying them was the obvious next step\n\
 \n\
-**Code blocks are never actions.** A ```...``` fence containing source code is a *suggestion* — it only counts as completed work if it was passed to a tool like `apply_patch` or written to disk via `shell`. An agent that pastes code without a tool call BAILED, regardless of how confident the prose is.\n\
+**Code blocks are never actions.** A ```...``` fence containing source code is a *suggestion* — it only counts as completed work if it was passed to a tool like `write_file` or written to disk via `shell`. An agent that pastes code without a tool call BAILED, regardless of how confident the prose is.\n\
 \n\
 **The closing matters most.** Read the final sentence or paragraph carefully. If it contains \"I will X\", \"I'll X\", \"now I'll X\", \"next I will X\", \"let me X\", \"I'm going to X\", or any other future-tense first-person action language, and no tool call was produced, it is BAIL — even if earlier paragraphs describe findings or results. A correctly-completed response ends with a statement of what *was* done, not what *will* be done. A long message that opens with findings and ends with announced intent is still a bail — the opening findings don't launder the closing bail.";
 

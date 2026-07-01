@@ -337,7 +337,11 @@ fn endpoint_from_role(role: &crate::project_config::ModelRole) -> Option<OllamaE
                     .clone()
                     .unwrap_or_else(|| "http://127.0.0.1:11434".into()),
                 model: model.clone(),
-                trim_budget: trim_budget.unwrap_or(8192),
+                // Unset `trim_budget` now means AUTO: 0 tells the budget logic to
+                // use the server's full detected window (from /props) minus output
+                // + tool reserves. A non-zero value is an explicit cap. (Was 8192,
+                // which silently capped the budget far below the real window.)
+                trim_budget: trim_budget.unwrap_or(0),
                 temperature: (*temperature).unwrap_or(if reasoning == "off" { 0.0 } else { 0.1 }),
                 timeout_seconds: timeout_seconds.unwrap_or(300),
                 enabled: true,

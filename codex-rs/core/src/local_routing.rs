@@ -14,18 +14,25 @@ struct StreamToolCallAcc {
     arguments: String,
 }
 
-use crate::client_common::{Prompt, ResponseStream};
+use crate::client_common::Prompt;
+use crate::client_common::ResponseStream;
 use codex_api::ResponseEvent;
-use codex_protocol::models::{ContentItem, ResponseItem};
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
 use codex_routing::OllamaClientPool;
 use codex_routing::classifier::RouteTarget;
-use codex_routing::config::{OllamaEndpoint, RoutingConfig};
-use codex_routing::failover::{self, FailoverAction, FailureType};
+use codex_routing::config::OllamaEndpoint;
+use codex_routing::config::RoutingConfig;
+use codex_routing::failover::FailoverAction;
+use codex_routing::failover::FailureType;
+use codex_routing::failover::{self};
 use codex_routing::local_dispatch::OllamaTextResponse;
 use std::sync::Arc;
-use tokio::sync::{OnceCell, mpsc};
-use tracing::{info, warn};
+use tokio::sync::OnceCell;
+use tokio::sync::mpsc;
+use tracing::info;
+use tracing::warn;
 
 /// Tools exposed to the LightCoder route — same in regular and local-only
 /// modes. Curated to fit comfortably in a small local model's context window
@@ -52,17 +59,35 @@ use tracing::{info, warn};
 // `tool_aliases` translates back into `apply_patch` bodies — so the model gets
 // a forgiving "find this snippet / write this file" interface while we keep the
 // battle-tested apply_patch executor underneath. `shell` stays as a fallback.
+// MODEL-FACING tool names, ordered as the model should prefer them — specific
+// tools first, generic `shell` LAST so it reaches for write_file/edit_file/
+// web_search/web_fetch before a raw command. `web_search` is what we present for
+// Codex's Brave `local_web_search` (mapped to the native name by `native_tool_name`
+// for the `prompt.tools` filter; renamed back for display in `present_local_tools`,
+// which also governs the final order the model actually sees).
 const LIGHT_CODER_TOOL_NAMES: &[&str] = &[
-    "shell",
     "list_dir",
     "view_image",
     "update_plan",
-    "local_web_search",
+    "web_search",
     "web_fetch",
     "request_permissions",
     "exec_command",
     "write_stdin",
+    "shell",
 ];
+
+/// Map a model-facing curated name ([`LIGHT_CODER_TOOL_NAMES`]) to the native Codex
+/// registry name it resolves to when filtering `prompt.tools`. Identity for every
+/// tool except `web_search`, which we present to the model but Codex registers as
+/// `local_web_search` (the Brave backend); [`present_local_tools`] does the reverse
+/// rename on the pulled tool for display.
+fn native_tool_name(curated: &str) -> &str {
+    match curated {
+        "web_search" => "local_web_search",
+        other => other,
+    }
+}
 
 /// Synthetic, content-based editing tools exposed to Focused local coders in
 /// place of `apply_patch`. They are not real Codex tools — `translate_one_native_call`
@@ -78,7 +103,7 @@ fn synthetic_local_edit_tools() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create OR completely overwrite a file with its full content. This is the DEFAULT, most reliable way to write or change a file — you supply the entire file, so there is nothing to match and nothing to fail. Keep files small and focused (prefer several small modules over one big file) so a full rewrite stays cheap. Do NOT use apply_patch, diff, or patch syntax — that path is unavailable and will fail.",
+                "description": "Create OR completely overwrite a file with its full content. This is the DEFAULT, most reliable way to write or change a file — you supply the entire file, so there is nothing to match and nothing to fail. Keep files small and focused (prefer several small modules over one big file) so a full rewrite stays cheap.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -141,6 +166,97 @@ fn translate_native_tool_calls(raw_calls: Vec<serde_json::Value>) -> Vec<serde_j
         .collect()
 }
 
+/// Inbound half of the write_file massage: rewrite recorded `shell` calls that WE
+/// synthesized from `write_file` (the base64 lowering in [`translate_one_native_call`])
+/// back into `write_file` calls, so the model only ever sees its own high-level
+/// tool — never the shell substrate underneath. Without this the model finds a
+/// base64 shell blob where it called write_file and loses the thread (the exact
+/// failure the old one-way translation hit). Runs BEFORE trim so state-extraction
+/// and current-file pinning still recognize the write. Idempotent — real
+/// write_file calls and every other item pass through untouched.
+fn represent_shell_writes(items: &[ResponseItem]) -> Vec<ResponseItem> {
+    items
+        .iter()
+        .cloned()
+        .map(represent_shell_write_item)
+        .collect()
+}
+
+/// The per-item transform behind [`represent_shell_writes`]: if `item` is a `shell`
+/// call WE synthesized from `write_file` (it carries the `# shephard-write:`
+/// sentinel), rewrite it back into the `write_file` the model actually made. Used
+/// both to rebuild the model's prompt AND to re-present the RECORDED item for the
+/// rollout/TUI (`handle_output_item_done`) — otherwise the TUI re-renders a 30 KB
+/// base64 shell line every frame and freezes. Idempotent: real `write_file` calls
+/// and every other item pass through untouched.
+pub(crate) fn represent_shell_write_item(item: ResponseItem) -> ResponseItem {
+    if let ResponseItem::FunctionCall {
+        id,
+        name,
+        namespace,
+        arguments,
+        call_id,
+    } = &item
+        && name == "shell"
+        && let Some(cmd) = shell_command_str(arguments)
+        && let Some((path, content)) = codex_routing::tool_aliases::parse_shephard_write(&cmd)
+    {
+        ResponseItem::FunctionCall {
+            id: id.clone(),
+            name: "write_file".to_string(),
+            namespace: namespace.clone(),
+            arguments: serde_json::json!({ "path": path, "content": content }).to_string(),
+            call_id: call_id.clone(),
+        }
+    } else {
+        item
+    }
+}
+
+/// Re-present recorded `local_web_search` calls as `web_search` in the history
+/// shown to the model. The local coder is shown the Brave tool as `web_search`
+/// (see `present_local_tools`); `translate_one_native_call` routes the name back
+/// to the registered `local_web_search` handler for dispatch, so the RECORDED call
+/// carries the internal name. Swap it back so the model sees its own tool name in
+/// its history, consistent with the tool list. Idempotent.
+fn represent_web_search_names(items: Vec<ResponseItem>) -> Vec<ResponseItem> {
+    items
+        .into_iter()
+        .map(|item| match item {
+            ResponseItem::FunctionCall {
+                id,
+                name,
+                namespace,
+                arguments,
+                call_id,
+            } if name == "local_web_search" => ResponseItem::FunctionCall {
+                id,
+                name: "web_search".to_string(),
+                namespace,
+                arguments,
+                call_id,
+            },
+            other => other,
+        })
+        .collect()
+}
+
+/// Extract the executed command string from a `shell` call's arguments — the
+/// `{command: ["bash","-lc", CMD]}` array form (take the last string), or a bare
+/// `{command: "CMD"}` string.
+fn shell_command_str(arguments: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let c = v.get("command")?;
+    if let Some(s) = c.as_str() {
+        return Some(s.to_string());
+    }
+    c.as_array()?
+        .iter()
+        .filter_map(|x| x.as_str())
+        .last()
+        .map(str::to_string)
+}
+
 /// Convert a recovered [`codex_routing::tool_recovery::ToolCall`] into the Ollama
 /// wire shape that [`translate_native_tool_calls`] consumes, so recovered and
 /// structured calls flow through the exact same normalization + shell-alias
@@ -197,7 +313,7 @@ fn translate_one_native_call(mut call: serde_json::Value) -> serde_json::Value {
         .fold(Some(&call), |v, k| v.and_then(|v| v.get(*k)))
         .and_then(|v| v.get("arguments"));
     let raw_args_str: Option<String> = raw_arguments.and_then(|v| v.as_str().map(str::to_string));
-    let args_value: serde_json::Value = raw_arguments
+    let mut args_value: serde_json::Value = raw_arguments
         .map(|v| {
             if let Some(s) = v.as_str() {
                 serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
@@ -207,24 +323,32 @@ fn translate_one_native_call(mut call: serde_json::Value) -> serde_json::Value {
         })
         .unwrap_or(serde_json::Value::Null);
 
-    // `write_file`/`create_file` have real handlers and are not translated — but a
-    // small model often emits file content the JSON parser rejects (raw newlines,
-    // bare quotes). Repair it here so the handler receives valid `{path, content}`
-    // instead of erroring and triggering a re-prompt loop. Valid args fall through
-    // untouched.
-    if matches!(name.as_str(), "write_file" | "create_file") {
-        if args_value.is_null()
-            && let Some(raw) = raw_args_str.as_deref()
-            && let Some(repaired) = codex_routing::tool_aliases::recover_write_file_args(raw)
-        {
-            info!(
-                tool = %name,
-                bytes = repaired.get("content").and_then(|c| c.as_str()).map(str::len).unwrap_or(0),
-                "Recovered botched write_file JSON arguments (raw newlines / unescaped quotes)"
-            );
-            set_call_arguments(&mut call, &name, &repaired.to_string());
-        }
+    // The local coder is shown Codex's Brave search as `web_search` (see
+    // `present_local_tools`); route that name back to the registered
+    // `local_web_search` handler so the call dispatches. Args pass through.
+    if name == "web_search" {
+        let args = raw_args_str
+            .clone()
+            .unwrap_or_else(|| args_value.to_string());
+        set_call_arguments(&mut call, "local_web_search", &args);
         return call;
+    }
+
+    // A small model often emits file content the JSON parser rejects (raw
+    // newlines, bare quotes). Repair it here so we have clean `{path, content}`
+    // BEFORE lowering write_file to the shell+base64 massage below (the match's
+    // `write_file` arm). Valid args fall through untouched.
+    if matches!(name.as_str(), "write_file" | "create_file")
+        && args_value.is_null()
+        && let Some(raw) = raw_args_str.as_deref()
+        && let Some(repaired) = codex_routing::tool_aliases::recover_write_file_args(raw)
+    {
+        info!(
+            tool = %name,
+            bytes = repaired.get("content").and_then(|c| c.as_str()).map(str::len).unwrap_or(0),
+            "Recovered botched write_file JSON arguments (raw newlines / unescaped quotes)"
+        );
+        args_value = repaired;
     }
 
     // Try shell-alias / shell-shape translation first; then the content-based
@@ -236,12 +360,23 @@ fn translate_one_native_call(mut call: serde_json::Value) -> serde_json::Value {
             "edit_file" | "str_replace" => {
                 codex_routing::tool_aliases::normalize_edit_file_call(&args_value)
             }
-            // `write_file`/`create_file` are NOT translated — they have a real
-            // handler (handlers/write_file.rs) so the model sees its own call,
-            // not a `shell` printf it misreads as mangled. See the diagnosis in
-            // that file.
+            // `write_file`/`create_file` are lowered to the agent-agnostic
+            // shell+base64 substrate — `shell` is the one primitive every harness
+            // exposes, base64 makes the write byte-exact and escaping-proof. The
+            // inbound `represent_shell_writes` pass re-presents the recorded shell
+            // call AS write_file, so the model only ever sees its own tool. The
+            // real handler (handlers/write_file.rs) stays registered as the
+            // degradation fallback (used only if translation yields no path).
+            "write_file" | "create_file" => {
+                codex_routing::tool_aliases::write_file_to_base64_shell(&args_value)
+            }
             "read_file" | "cat_file" => {
                 codex_routing::tool_aliases::normalize_read_file_call(&args_value)
+            }
+            // exec_command with a shell-style array `cmd` → route to shell (else
+            // the runner tries to exec a program named `[` → "No such file").
+            "exec_command" => {
+                codex_routing::tool_aliases::normalize_exec_command_array(&args_value)
             }
             // apply_patch is being phased out for local models (it chronically
             // fails — the 9B can't produce matching context). A pure Add File is
@@ -291,7 +426,7 @@ fn build_local_tools(
         codex_routing::config::ToolSubset::Focused => prompt
             .tools
             .iter()
-            .filter(|t| names.contains(&t.name()))
+            .filter(|t| names.iter().any(|n| native_tool_name(n) == t.name()))
             .filter_map(|t| serde_json::to_value(t).ok())
             .collect(),
         codex_routing::config::ToolSubset::Full => prompt
@@ -312,8 +447,44 @@ fn build_local_tools(
         if include_edit_tools {
             ollama_tools.extend(synthetic_local_edit_tools());
         }
+        present_local_tools(&mut ollama_tools);
     }
     ollama_tools
+}
+
+/// Final shaping of the local coder's tool list, applied after the native +
+/// synthetic tools are assembled (Focused subset only). The usage hint is derived
+/// from THIS list (names + order — see the `tool_names` collection at the call
+/// site), so shaping here is the single authoritative source for BOTH the schema
+/// the model receives and the hint:
+/// 1. Codex's Brave `local_web_search` is presented to the model as plain
+///    `web_search` — the only web search this path exposes. Inbound,
+///    `translate_one_native_call` routes the name back to the registered
+///    `local_web_search` handler; `represent_web_search_names` re-presents it in
+///    history. Codex's native cloud `web_search` is never sent here.
+/// 2. `shell` is moved LAST so the model reaches for the specific tools
+///    (`write_file`/`edit_file`/`web_search`/`web_fetch`) before the generic shell.
+///
+/// (`web_fetch` already advertises its `find`/`cursor` navigation params in its
+/// own schema — see `web_fetch_tool.rs` — so the schema needs nothing here; the
+/// usage hint is what surfaces them to the model.)
+fn present_local_tools(tools: &mut Vec<serde_json::Value>) {
+    // 1. Present the Brave search tool to the model as `web_search`.
+    for tool in tools.iter_mut() {
+        let is_brave_search =
+            tool.pointer("/function/name").and_then(|v| v.as_str()) == Some("local_web_search");
+        if is_brave_search && let Some(n) = tool.pointer_mut("/function/name") {
+            *n = serde_json::Value::String("web_search".to_string());
+        }
+    }
+    // 2. `shell` last so the model prefers the specific tools before falling back.
+    if let Some(pos) = tools
+        .iter()
+        .position(|t| t.pointer("/function/name").and_then(|v| v.as_str()) == Some("shell"))
+    {
+        let shell = tools.remove(pos);
+        tools.push(shell);
+    }
 }
 
 fn build_tool_hint(tool_names: &[&str]) -> String {
@@ -322,20 +493,14 @@ fn build_tool_hint(tool_names: &[&str]) -> String {
 
     if has("write_file") || has("edit_file") {
         lines.push(
-            "CRITICAL — writing files: to create or change a file you MUST call `write_file` (new file) or `edit_file` (existing file). Code, diffs, or file contents placed in your REPLY TEXT are NOT saved to disk — only tool calls modify files. Never satisfy a \"write/create/fix this file\" request by pasting a code block in your message; always emit the corresponding tool call instead.".to_string(),
+            "CRITICAL — writing files: to create or change a file you MUST call `write_file` (new file) or `edit_file` (existing file).".to_string(),
         );
     }
 
     for name in tool_names {
         let block = match *name {
-            "shell" => {
-                "- `shell`: Run any shell command. Use this for `ls`, `cat`, `rg`, `grep`, `find`, `mkdir`, `rm`, `cd`, `pwd`, build/test commands, package installs, writing files via heredoc — anything you would type at a terminal.\n  REQUIRED ARG SHAPE: `command` MUST be a JSON array of strings, ALWAYS prefixed with `[\"bash\", \"-lc\", \"<your command line>\"]`.\n  Correct example: `{\"command\": [\"bash\", \"-lc\", \"ls -la\"]}`.\n  WRONG: `{\"command\": \"ls -la\"}` (must be an array).\n  WRONG: `{\"command\": [\"bash\", \"-lc\", \"[bash, -lc, ls]\"]}` (do NOT nest the bash invocation; the third element is your literal shell command)."
-            }
-            "apply_patch" => {
-                "- `apply_patch`: Create, modify, or delete files via a structured patch. Prefer this over `shell echo > file` for writing files.\n\n  TWO FORMATS ACCEPTED — pick whichever is most natural:\n\n  FORMAT A: standard unified diff (the format `git diff` produces). This works as-is — file headers `--- a/path` / `+++ b/path` and hunk headers `@@ -L,N +L,N @@` are fine. Example:\n  ```\n  --- a/handler.py\n  +++ b/handler.py\n  @@ -17,7 +17,7 @@\n   def lambda_handler(event, context):\n  -    url = \"https://api.handle.me/resolve/{handle}\"\n  +    url = \"https://api.handle.me/handles/{handle}\"\n       return requests.get(url)\n  ```\n  `/dev/null` for one side means create or delete: `--- /dev/null` + `+++ b/new.py` adds a new file; `--- a/old.py` + `+++ /dev/null` deletes one.\n\n  FORMAT B: Codex native format. Use this when you want explicit anchor-by-context matching:\n  ```\n  *** Begin Patch\n  *** Update File: handler.py\n  @@ def lambda_handler(event, context):\n  -    url = \"https://api.handle.me/resolve/{handle}\"\n  +    url = \"https://api.handle.me/handles/{handle}\"\n  *** End Patch\n  ```\n  Use `*** Add File: <path>` for new files (every body line prefixed `+`), `*** Update File: <path>` for edits, `*** Delete File: <path>` for deletes.\n\n  PREFIX RULE (both formats) — every non-empty line in a hunk body MUST start with EXACTLY ONE of:\n    `+` ... a line you are ADDING\n    `-` ... a line you are REMOVING (Update only)\n    ` ` (a single space) ... a line that is UNCHANGED, included only as context to anchor the change (Update only)\n  Bare code lines without one of these prefixes are INVALID."
-            }
             "write_file" => {
-                "- `write_file`: Create OR overwrite a file with its FULL contents. Args: `{\"path\": \"<file>\", \"content\": \"<entire file>\"}`. This is the DEFAULT and most reliable way to write or change a file — you supply the whole file, so there is nothing to match and nothing to fail. Keep files SMALL and focused (prefer several small modules over one big file) so rewriting a whole file stays cheap. Do NOT use apply_patch, diff, or patch syntax — that path is unavailable here and will fail."
+                "- `write_file`: Create OR overwrite a file with its FULL contents. Args: `{\"path\": \"<file>\", \"content\": \"<entire file>\"}`. This is the DEFAULT and most reliable way to write or change a file — you supply the whole file, so there is nothing to match and nothing to fail. Keep files SMALL and focused (prefer several small modules over one big file) so rewriting a whole file stays cheap."
             }
             "edit_file" => {
                 "- `edit_file`: Replace one exact snippet in an existing file (use when rewriting the whole file would be wasteful). Args: `{\"path\": \"<file>\", \"old_string\": \"<exact text to replace>\", \"new_string\": \"<replacement>\"}`. Copy `old_string` VERBATIM from the file content pinned in your prompt — do NOT retype it from memory, and include enough surrounding text to make it unique. To delete code, set `new_string` to \"\". If an edit won't apply, fall back to `write_file` with the whole file."
@@ -352,11 +517,11 @@ fn build_tool_hint(tool_names: &[&str]) -> String {
             "update_plan" => {
                 "- `update_plan`: Track a multi-step task plan. Args: `{\"plan\": [{\"status\": \"in_progress\", \"step\": \"...\"}]}`."
             }
-            "local_web_search" => {
-                "- `local_web_search`: Search the web via Brave; returns titles, URLs, and short descriptions. Args: `{\"query\": \"<search terms>\", \"count\": 10}` (count optional, 1-20). Pair this with `web_fetch` to read a specific result."
+            "web_search" => {
+                "- `web_search`: Search the web via Brave; returns titles, URLs, and short descriptions. Args: `{\"query\": \"<search terms>\", \"count\": 10}` (count optional, 1-20). Pair this with `web_fetch` to read a specific result."
             }
             "web_fetch" => {
-                "- `web_fetch`: Fetch a single http(s) URL and return the page body as text. Use this BEFORE writing code against an unfamiliar API or library — read the docs page rather than guessing the endpoint shape. Args: `{\"url\": \"https://...\"}`. Body is capped at 512KB; binary responses return a placeholder."
+                "- `web_fetch`: Fetch a single http(s) URL and return the page body as text. Use this BEFORE writing code against an unfamiliar API or library — read the docs page rather than guessing the endpoint shape. Args: `{\"url\": \"https://...\"}`. For a long page, narrow it: add `\"find\": \"<text>\"` to return ONLY the matching section, or pass `\"cursor\": \"<token>\"` from a previous response to page through. Body is capped at 512KB; binary responses return a placeholder."
             }
             "request_permissions" => {
                 "- `request_permissions`: Ask for sandbox escalation when a command would otherwise be blocked (network access for `npm install`/`pip install`/`apt`, writing to a path outside cwd, etc.). Call this BEFORE the command that would fail, with a short justification."
@@ -366,6 +531,9 @@ fn build_tool_hint(tool_names: &[&str]) -> String {
             }
             "write_stdin" => {
                 "- `write_stdin`: Send input to a shell session previously started by `exec_command` (e.g. answer an interactive prompt from `npm init`). Args include the session id and the text to write."
+            }
+            "shell" => {
+                "- `shell`: Run any shell command. Use this for `ls`, `cat`, `rg`, `grep`, `find`, `mkdir`, `rm`, `cd`, `pwd`, build/test commands, package installs, writing files via heredoc — anything you would type at a terminal.\n  REQUIRED ARG SHAPE: `command` MUST be a JSON array of strings, ALWAYS prefixed with `[\"bash\", \"-lc\", \"<your command line>\"]`.\n  Correct example: `{\"command\": [\"bash\", \"-lc\", \"ls -la\"]}`.\n  WRONG: `{\"command\": \"ls -la\"}` (must be an array).\n  WRONG: `{\"command\": [\"bash\", \"-lc\", \"[bash, -lc, ls]\"]}` (do NOT nest the bash invocation; the third element is your literal shell command)."
             }
             _ => continue,
         };
@@ -399,6 +567,13 @@ struct RoutingState {
     /// the older history is unchanged from request to request within a
     /// session. Prevents recompacting the same history each turn.
     inline_compact_cache: std::sync::Mutex<Option<InlineCompactCacheEntry>>,
+    /// Rolling cache for ACTIVE-turn compaction. The active turn is append-only, so
+    /// once we've summarized its first `prefix_len` steps we reuse that summary and
+    /// only LLM-compact the new tail — instead of re-summarizing the whole (growing)
+    /// turn from scratch on every overflow. This is what kills the compaction storm
+    /// (observed: 13 from-scratch active-turn compactions / 60 chunk calls in one
+    /// stuck turn, ~half the wall-clock).
+    active_compact_cache: std::sync::Mutex<Option<ActiveCompactEntry>>,
     /// Pending local-model "nudge" notices — each time a guard intervenes
     /// (repetition guard, rumination guard, quality gate, completion verifier)
     /// it queues a one-line message here. The TUI drains these via
@@ -421,6 +596,72 @@ impl RoutingState {
 struct InlineCompactCacheEntry {
     older_content_hash: u64,
     summary_message: serde_json::Value,
+}
+
+/// One rolling active-turn summary. Covers the first `prefix_len` messages of the
+/// active-turn middle (identified by `prefix_hash`); the next compaction reuses it
+/// and only folds in `middle[prefix_len..]`.
+#[derive(Clone)]
+struct ActiveCompactEntry {
+    prefix_len: usize,
+    prefix_hash: u64,
+    summary: String,
+}
+
+/// How to compact the active-turn `middle`, given any cached rolling summary.
+#[derive(Debug, PartialEq)]
+enum ActiveCompactPlan {
+    /// No reusable prefix — compact the whole middle (cold start, or the leading
+    /// messages changed, e.g. trim dropped one).
+    Full,
+    /// Reuse `summary` for `middle[..from]`; only LLM-compact `middle[from..]`.
+    Incremental { summary: String, from: usize },
+}
+
+/// Robust per-message hash for the active-turn prefix: role + content + tool_calls
+/// (the plain [`hash_messages`] ignores tool_calls, which is most of an active
+/// turn). Two prefixes hash equal only when their leading steps are byte-identical.
+fn hash_prefix(messages: &[serde_json::Value]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hash;
+    use std::hash::Hasher;
+    let mut h = DefaultHasher::new();
+    for m in messages {
+        m.get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .hash(&mut h);
+        m.get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .hash(&mut h);
+        if let Some(tc) = m.get("tool_calls") {
+            tc.to_string().hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// Decide how to compact the active-turn `middle`, reusing a prior rolling summary
+/// for the unchanged leading prefix. The active turn is append-only across overflow
+/// rounds (the model appends tool calls/outputs; it never rewrites history), so once
+/// the first `prefix_len` steps are summarized we only need to fold in the new tail
+/// — turning each re-compaction from O(whole turn) into O(delta).
+fn plan_active_compaction(
+    middle: &[serde_json::Value],
+    cache: Option<&ActiveCompactEntry>,
+) -> ActiveCompactPlan {
+    if let Some(c) = cache
+        && c.prefix_len > 0
+        && c.prefix_len <= middle.len()
+        && hash_prefix(&middle[..c.prefix_len]) == c.prefix_hash
+    {
+        return ActiveCompactPlan::Incremental {
+            summary: c.summary.clone(),
+            from: c.prefix_len,
+        };
+    }
+    ActiveCompactPlan::Full
 }
 
 /// Initialize the global routing state.
@@ -509,6 +750,7 @@ async fn get_routing_state() -> &'static Option<RoutingState> {
                 budget,
                 claude_sessions,
                 inline_compact_cache: std::sync::Mutex::new(None),
+                active_compact_cache: std::sync::Mutex::new(None),
                 nudges: std::sync::Mutex::new(Vec::new()),
             })
         })
@@ -1462,47 +1704,53 @@ async fn try_local_model(
         )
     };
 
-    // System-prompt compression (Stage 2): if the base prompt exceeds its budget,
-    // summarize it via the compaction track and CACHE by content hash, so a
-    // harness sending the same prompt every turn pays the cost once. The
-    // deterministic head/tail elision in trim stays the floor — we still pass
-    // `system_budget_pct`, so trim hard-enforces the budget even if the summary
-    // overshoots or the compactor is unreachable.
-    let system_budget_tokens = if state.project_config.routing.system_budget_pct == 0 {
-        0
-    } else {
-        endpoint
-            .trim_budget
-            .saturating_mul(state.project_config.routing.system_budget_pct as usize)
-            / 100
-    };
-    let summarized_system =
-        maybe_summarize_system(&prompt.base_instructions.text, system_budget_tokens, state).await;
-    let system_prompt_ref: &str = summarized_system
-        .as_deref()
-        .unwrap_or(&prompt.base_instructions.text);
+    // Local models get OUR OWN concise base prompt, NOT Codex's ~351-line
+    // apply_patch-heavy one. The Codex prompt teaches `apply_patch` so heavily a
+    // 9B emits it no matter what shorter hints we add, and the bulk also costs
+    // ~3–5k tokens every turn. Ours is small and write_file-first, so there's
+    // nothing to summarize (the old Stage-2 system-prompt compression is moot).
+    // See codex_routing::prompt_local (the text is a portable .md asset).
+    let system_prompt_ref: &str = codex_routing::prompt_local::LOCAL_CODER_SYSTEM_PROMPT;
+
+    // Inbound half of the write_file massage: re-present the `shell` base64 writes
+    // we synthesized last turn back as `write_file`, so the model sees only its own
+    // tool and so trim's state-extraction/file-pinning recognize the writes. Done
+    // before trim consumes the transcript.
+    let represented_input = represent_web_search_names(represent_shell_writes(&prompt.input));
 
     let trim_input = codex_routing::trim::TrimInput {
-        items: &prompt.input,
+        items: &represented_input,
         system_prompt: system_prompt_ref,
         user_instructions: project_instructions.as_deref(),
         current_files: current_files.as_ref(),
         flavor: endpoint.flavor,
         system_budget_pct: state.project_config.routing.system_budget_pct,
     };
-    // Budget against the model's LEARNED real÷estimate ratio, not the raw
-    // trim_budget — the chars/4 estimate undercounts dense content ~1.8–2.8×, so
-    // the configured budget overflowed the real window. Seeds at the default and
-    // self-corrects from the server's reported prompt_tokens (see record below).
-    let fit_budget = calibrated_trim_budget(&endpoint.model, endpoint.trim_budget);
-    let trimmed = codex_routing::trim::trim_for_local(
-        &trim_input,
-        fit_budget.saturating_sub(tool_reserve_tokens),
-    );
+    // Size the budget from the server's REAL context window (detected from
+    // /props, cached) minus reserves — not the hand-set trim_budget. Then scale by
+    // the model's LEARNED real÷estimate ratio (the chars/4 estimate undercounts
+    // dense content ~1.8–2.8×). trim_budget is now an optional cap (0 = full
+    // window). Falls back to trim_budget if the window can't be detected.
+    let server_ctx = resolve_server_ctx(endpoint, state).await;
+    let window = effective_window(endpoint.trim_budget, endpoint.max_tokens, server_ctx);
+    // Tool schemas tokenize at the model's learned ratio and are NOT part of
+    // trim's chars/4 estimate. Reserve them in REAL tokens out of the real window
+    // FIRST, then calibrate the remainder to estimate space. The old path
+    // subtracted their estimate INSIDE the estimate-space budget (so it got
+    // ÷ DEFAULT'd too), under-reserving them ~ratio× and letting the real prompt
+    // overflow. See docs/spec/local-coder-massaging §12.
+    let ratio = observed_token_ratio(&endpoint.model);
+    let real_tool_reserve = (tool_reserve_tokens as f64 * ratio) as usize;
+    let fit_budget =
+        calibrated_trim_budget(&endpoint.model, window.saturating_sub(real_tool_reserve));
+    let trimmed = codex_routing::trim::trim_for_local(&trim_input, fit_budget);
     info!(
         trim_summary = %trimmed.summary.to_log_line(),
+        server_ctx = server_ctx.unwrap_or(0),
+        window,
         fit_budget,
-        observed_token_ratio = observed_token_ratio(&endpoint.model),
+        real_tool_reserve,
+        observed_token_ratio = ratio,
         "Trimmed transcript for local model"
     );
 
@@ -1517,15 +1765,37 @@ async fn try_local_model(
     //  - context reset → loop excised from context + reframed (nudge+block ignored)
     //  - exact repeat → STOP directive
     //  - thrash (same goal, varying commands, still failing) → forced diagnosis
+    //
+    // ALSO log it (not just push_nudge → TUI): the guard notices go to the TUI
+    // queue, which never reaches the tracing log — so from the logs alone a guard
+    // looks like it "never fired" even when it fires every turn. (That gap led to
+    // a real misdiagnosis: a loop where context-reset WAS firing repeatedly read as
+    // "escalation never fires" because we were grepping the log for TUI-only text.)
+    let rep_count = trimmed.repetition_count.map(|c| c as i64).unwrap_or(-1);
     if trimmed.system.contains("[HARNESS — STUCK; LOOP REMOVED") {
+        warn!(
+            guard = "context_reset",
+            repetition_count = rep_count,
+            "Loop guard fired: excised the loop from context and reframed (advisory + STOP both ignored)"
+        );
         state.push_nudge(
             "Context-reset guard fired — model ignored the nudges and the hard block; excised the loop from its context and reframed it to the unsolved step".to_string(),
         );
     } else if trimmed.system.contains("[STOP — REPETITION DETECTED]") {
+        info!(
+            guard = "repetition_stop",
+            repetition_count = rep_count,
+            "Loop guard fired: injected a STOP directive (identical call repeated)"
+        );
         state.push_nudge(
             "Repetition guard fired — model was repeating an identical tool call; injected a stop directive".to_string(),
         );
     } else if trimmed.system.contains("[NO PROGRESS — DIAGNOSE") {
+        warn!(
+            guard = "forced_diagnosis",
+            repetition_count = rep_count,
+            "Loop guard fired: forcing a diagnosis before the next action (thrash, still failing)"
+        );
         state.push_nudge(
             "Forced-diagnosis guard fired — model was thrashing; requiring it to read the failure and state the root cause before acting".to_string(),
         );
@@ -1686,7 +1956,13 @@ async fn try_local_model(
                     // a prompt we estimated at `sent_estimate`. Learn the ratio so the
                     // NEXT turn budgets correctly and never reaches this overflow. (The
                     // overflow itself is surfaced below; no separate calibration nudge.)
-                    let _ = record_token_ratio(&endpoint.model, n_prompt_tokens, sent_estimate);
+                    let _ = record_token_ratio(
+                        &endpoint.model,
+                        n_prompt_tokens,
+                        sent_estimate + tool_reserve_tokens,
+                    );
+                    // Learn the real window too (in case /props was unreachable).
+                    record_server_ctx(&endpoint.base_url, n_ctx);
                     // The tokenized prompt overflowed the server's context window.
                     // The server hands us the real numbers, so re-trim to fit and
                     // retry the SAME coder — context maxing out must NOT crash the
@@ -1696,7 +1972,7 @@ async fn try_local_model(
                     const OVERFLOW_MARGIN: u64 = 2048;
                     const MIN_CODER_BUDGET: usize = 4096;
                     let reserve = endpoint.max_tokens.unwrap_or(0) as u64
-                        + tool_reserve_tokens as u64
+                        + real_tool_reserve as u64
                         + OVERFLOW_MARGIN;
                     // Aim for 80% of the window, not 100%. We scale the MESSAGE
                     // budget, but the overflow figure is the REAL total — which
@@ -1733,10 +2009,10 @@ async fn try_local_model(
                         "Context overflow ({n_prompt_tokens} tok > {n_ctx} ctx) — re-trimmed the prompt to fit and retried; no crash"
                     ));
                     coder_budget = new_budget;
-                    let re = codex_routing::trim::trim_for_local(
-                        &trim_input,
-                        coder_budget.saturating_sub(tool_reserve_tokens),
-                    );
+                    // coder_budget is already the MESSAGE budget (tool schemas are
+                    // reserved separately in real tokens via `reserve` above), so
+                    // don't subtract the tool estimate again here.
+                    let re = codex_routing::trim::trim_for_local(&trim_input, coder_budget);
                     let re = maybe_inline_compact(re, coder_budget, endpoint, state).await;
                     system = Some(format!("{}\n\n{hint}", re.system));
                     effective_messages = re.messages;
@@ -1946,9 +2222,12 @@ async fn try_local_model(
                 .record_timed(&model_name, input_tokens, output_tokens, prompt_ms, gen_ms);
             // Learn the real÷estimate token ratio from this response's actual
             // prompt_tokens, so the next turn budgets against truth, not chars/4.
-            if let Some(ratio) = record_token_ratio(&endpoint.model, input_tokens, sent_estimate) {
+            // Measure against the FULL prompt estimate (messages + tool schemas) so
+            // the ratio is pure tokenizer density, not skewed by the tool fraction.
+            let full_estimate = sent_estimate + tool_reserve_tokens;
+            if let Some(ratio) = record_token_ratio(&endpoint.model, input_tokens, full_estimate) {
                 state.push_nudge(format!(
-                    "Calibrated context budget — this model packs ~{ratio:.1}× the tokens our estimate assumed ({input_tokens} real vs ~{sent_estimate} est)"
+                    "Calibrated context budget — this model packs ~{ratio:.1}× the tokens our estimate assumed ({input_tokens} real vs ~{full_estimate} est)"
                 ));
             }
 
@@ -2258,7 +2537,8 @@ pub(crate) async fn handle_cloud_failover(
 /// Simple random u32 — no external crate dependency.
 fn rand_u32() -> u32 {
     use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use std::hash::Hash;
+    use std::hash::Hasher;
     let mut hasher = DefaultHasher::new();
     std::time::Instant::now().hash(&mut hasher);
     std::thread::current().id().hash(&mut hasher);
@@ -2653,10 +2933,16 @@ fn observed_token_ratio(model: &str) -> f64 {
 }
 
 /// Feed the server's REAL prompt-token count back. `ratio = real / estimate`,
-/// EWMA per model, clamped to `[DEFAULT, MAX]` so we never provision below the
-/// safe default nor over-react to a single outlier. Returns `Some(new_ratio)`
-/// only when the value shifted notably (so the caller can surface "learned X"
-/// without spamming a nudge every turn once it has converged).
+/// where `estimate` is the FULL prompt estimate (messages + system + tool
+/// schemas) so the value is pure tokenizer density, not conflated with the
+/// tool-overhead fraction (which would swing the ratio as the message bulk grows
+/// and shrinks). Updated with an ASYMMETRIC EWMA — rise fast, fall slow — because
+/// the costs are asymmetric: under-estimating the ratio overflows the window (a
+/// wasted re-trim round-trip on a slow box), while over-estimating only spends a
+/// little less context. So a denser-than-seen turn pulls the ratio up hard; a
+/// lighter turn barely lowers our guard. Clamped to `[DEFAULT, MAX]`. Returns
+/// `Some(new_ratio)` only when the value shifted notably (so the caller surfaces
+/// "learned X" once, not every turn after it converges).
 fn record_token_ratio(model: &str, real_tokens: u64, estimate: usize) -> Option<f64> {
     if real_tokens == 0 || estimate == 0 {
         return None;
@@ -2666,11 +2952,16 @@ fn record_token_ratio(model: &str, real_tokens: u64, estimate: usize) -> Option<
     let mut m = TOKEN_RATIO.lock().ok()?;
     let cur = m.entry(model.to_string()).or_insert(DEFAULT_SAFETY_FACTOR);
     let before = *cur;
-    *cur = *cur * 0.5 + observed * 0.5;
+    *cur = if observed > *cur {
+        *cur * 0.3 + observed * 0.7 // rise fast toward a denser turn
+    } else {
+        *cur * 0.8 + observed * 0.2 // fall slow — one light turn shouldn't drop our guard
+    };
     ((*cur - before).abs() > 0.15).then_some(*cur)
 }
 
-/// The configured `trim_budget`, pre-scaled by the learned ratio so trim's
+/// A real-token budget (the window already net of the tool-schema reserve — the
+/// caller subtracts that first), pre-scaled by the learned ratio so trim's
 /// internal (estimate-space, ÷`DEFAULT_SAFETY_FACTOR`) math lands on a prompt that
 /// actually fits the server. With a learned ratio of 2.84 and a 1.8 default, this
 /// shrinks the budget to ~63%, so the real prompt fits on the first attempt
@@ -2681,126 +2972,75 @@ fn calibrated_trim_budget(model: &str, trim_budget: usize) -> usize {
     ((trim_budget as f64) * DEFAULT_SAFETY_FACTOR / observed) as usize
 }
 
-/// Cache of compressed system prompts, keyed by a hash of (system, budget). The
-/// base system prompt is stable per harness/session, so summarizing it once and
-/// reusing it makes the (slow) compaction call a one-time cost — important once
-/// this runs as a service, where the same prompt arrives on every request.
-/// Global so it survives across sessions; cleared when it hits a small cap.
-static SYSTEM_SUMMARY_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<u64, Option<String>>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-const SYSTEM_SUMMARY_CACHE_CAP: usize = 64;
+// ---------------------------------------------------------------------------
+// Server context window: detect the REAL n_ctx instead of trusting trim_budget.
+// The server's window (llama.cpp `--ctx-size`) is fixed at startup; the per-
+// request `num_ctx` we send is ignored. We read it once from `/props` (and learn
+// it from overflow errors), then size the prompt budget from it.
+// ---------------------------------------------------------------------------
 
-fn system_summary_key(system: &str, budget_tokens: usize) -> u64 {
-    use std::hash::Hash;
-    use std::hash::Hasher;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    system.hash(&mut h);
-    budget_tokens.hash(&mut h);
-    h.finish()
+/// Reserve for the model's OWN output when `max_tokens` is unset (it generates
+/// into the same window, so the prompt can't fill it).
+const CTX_OUTPUT_RESERVE_DEFAULT: usize = 4096;
+/// Slop for chat-template / BOS-EOS tokens not in our estimate.
+const CTX_MARGIN: usize = 512;
+/// Budget when the window is unknown AND no `trim_budget` is configured.
+const CTX_FALLBACK: usize = 8192;
+
+static SERVER_CTX: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Real context window for `endpoint`, cached per base URL. Probes `/props` once;
+/// also fed by the overflow handler. `None` if the server doesn't report it.
+async fn resolve_server_ctx(endpoint: &OllamaEndpoint, state: &RoutingState) -> Option<u64> {
+    if let Some(c) = SERVER_CTX
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&endpoint.base_url).copied())
+    {
+        return Some(c);
+    }
+    let probed =
+        codex_routing::ollama::probe_context_window(state.pool.client(), &endpoint.base_url).await;
+    if let Some(n) = probed {
+        record_server_ctx(&endpoint.base_url, n);
+    }
+    probed
 }
 
-/// Compress an oversized system prompt via the compaction track, cached by
-/// content hash. Returns `None` to mean "use the original" — when it already
-/// fits, compression is disabled (`budget_tokens == 0`), or the compactor was
-/// unreachable (the deterministic head/tail tier in `trim_for_local` then
-/// enforces the budget). The summary is the higher-fidelity path; the
-/// deterministic tier is the always-available floor.
-async fn maybe_summarize_system(
-    system: &str,
-    budget_tokens: usize,
-    state: &RoutingState,
-) -> Option<String> {
-    if budget_tokens == 0 || codex_routing::metrics::estimate_tokens(system) <= budget_tokens {
-        return None;
-    }
-    let key = system_summary_key(system, budget_tokens);
-    // Cache stores the OUTCOME, including a negative (`None`) result, so the
-    // compactor runs at most once per unique (system, budget). The earlier bug:
-    // only successes were cached, so a non-shrinking summary re-ran the full
-    // (slow) compactor call EVERY turn and silently dominated the turn.
-    if let Ok(cache) = SYSTEM_SUMMARY_CACHE.lock()
-        && let Some(hit) = cache.get(&key)
+fn record_server_ctx(base_url: &str, n_ctx: u64) {
+    if n_ctx > 0
+        && let Ok(mut m) = SERVER_CTX.lock()
     {
-        return hit.clone();
+        m.insert(base_url.to_string(), n_ctx);
     }
-    let summary = summarize_system_via_compactor(system, budget_tokens, state).await;
-    if let Ok(mut cache) = SYSTEM_SUMMARY_CACHE.lock() {
-        if cache.len() >= SYSTEM_SUMMARY_CACHE_CAP {
-            cache.clear();
+}
+
+/// The real-token budget for the whole prompt (system + messages + tool schemas),
+/// derived from the server's window minus the output reserve and a margin.
+/// `trim_budget` is now an OPTIONAL CAP: `0` = use the full detected window;
+/// non-zero = cap there (but never above the real window). When the window is
+/// unknown, fall back to the configured `trim_budget` (today's behavior).
+fn effective_window(
+    trim_budget: usize,
+    max_tokens: Option<usize>,
+    server_ctx: Option<u64>,
+) -> usize {
+    let output_reserve = max_tokens
+        .filter(|n| *n > 0)
+        .unwrap_or(CTX_OUTPUT_RESERVE_DEFAULT);
+    match server_ctx {
+        Some(ctx) => {
+            let derived = (ctx as usize).saturating_sub(output_reserve + CTX_MARGIN);
+            if trim_budget == 0 {
+                derived
+            } else {
+                trim_budget.min(derived)
+            }
         }
-        cache.insert(key, summary.clone());
+        None if trim_budget > 0 => trim_budget,
+        None => CTX_FALLBACK,
     }
-    match &summary {
-        Some(s) => info!(
-            orig_tokens = codex_routing::metrics::estimate_tokens(system),
-            summary_tokens = codex_routing::metrics::estimate_tokens(s),
-            budget_tokens,
-            "Compressed oversized system prompt via compaction track (cached once)"
-        ),
-        None => info!(
-            budget_tokens,
-            "Compactor did not shrink the system prompt; caching miss, using deterministic tier"
-        ),
-    }
-    summary
-}
-
-/// One-shot system-prompt summarization through the `compactor` endpoint. Returns
-/// `None` if the compactor is disabled/unreachable or didn't actually shrink it,
-/// so the caller falls back to the deterministic tier.
-async fn summarize_system_via_compactor(
-    system: &str,
-    budget_tokens: usize,
-    state: &RoutingState,
-) -> Option<String> {
-    let compactor = &state.config.compactor;
-    if !compactor.enabled {
-        return None;
-    }
-    // Keep this single-goal and ACHIEVABLE. An earlier version asked the model
-    // to "preserve VERBATIM every rule" AND "make it smaller" — a contradiction
-    // (verbatim = don't change any words), especially on an already-tight prompt
-    // with little prose to cut. The 9B burned 28k tokens reasoning about how to
-    // satisfy both and never produced output. "Shorten the wording" (not the
-    // content) is coherent and the model just does it.
-    const SUMMARIZER_SYSTEM: &str = "You compress an AI coding agent's SYSTEM PROMPT to fit a small context window. \
-Keep the rules and instructions; shorten the wording. Output ONLY the compressed system prompt — no commentary.";
-    let user =
-        format!("Reduce the following system prompt to about {budget_tokens} tokens:\n\n{system}");
-    let mut ep = compactor.clone();
-    ep.think = false; // summarization, not reasoning
-    // Cap output length. Without this the compactor inherits "unbounded" and
-    // generates until the context window is full (observed: 28,158 tokens =
-    // n_ctx − prompt, `finish_reason: length`). A summary should never exceed the
-    // budget anyway, so cap a little above it to leave room for the answer. Wall
-    // time is governed by the compactor's configured `timeout_seconds`.
-    ep.max_tokens = Some(budget_tokens.saturating_add(512));
-    let body = state
-        .pool
-        .chat(
-            &ep,
-            vec![serde_json::json!({"role": "user", "content": user})],
-            Some(SUMMARIZER_SYSTEM),
-            None,
-        )
-        .await?;
-    let content = body
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or_default();
-    let content = codex_routing::classifier::strip_think_tags(content);
-    let content = content.trim();
-    // Only accept it if it genuinely shrank — otherwise fall back so we don't
-    // swap the real prompt for a same-size (or larger) paraphrase.
-    if content.is_empty()
-        || codex_routing::metrics::estimate_tokens(content)
-            >= codex_routing::metrics::estimate_tokens(system)
-    {
-        return None;
-    }
-    Some(content.to_string())
 }
 
 /// If the trimmed transcript still exceeds the local model's context budget,
@@ -2842,14 +3082,14 @@ async fn maybe_inline_compact(
             let older_est = estimate_combined_tokens("", &trimmed.messages[..older_count]);
             let active_est = estimate_combined_tokens("", &trimmed.messages[older_count..]);
             trimmed = if active_est >= older_est {
-                compact_active_turn(trimmed, older_count, endpoint, state).await
+                compact_active_turn(trimmed, older_count, fit_budget, endpoint, state).await
             } else {
-                compact_older_turns(trimmed, older_count, endpoint, state).await
+                compact_older_turns(trimmed, older_count, fit_budget, endpoint, state).await
             };
         } else {
             warn!(
                 estimated_tokens = trimmed.summary.estimated_input_tokens,
-                target_ctx = endpoint.trim_budget,
+                fit_budget,
                 "Trimmed transcript over budget but compactor endpoint is disabled — relying on last-resort drop"
             );
         }
@@ -2875,6 +3115,7 @@ async fn maybe_inline_compact(
 async fn compact_older_turns(
     mut trimmed: codex_routing::trim::TrimResult,
     older_count: usize,
+    fit_budget: usize,
     endpoint: &OllamaEndpoint,
     state: &RoutingState,
 ) -> codex_routing::trim::TrimResult {
@@ -2904,9 +3145,7 @@ async fn compact_older_turns(
 
     info!(
         estimated_tokens = trimmed.summary.estimated_input_tokens,
-        target_ctx = endpoint.trim_budget,
-        older_count,
-        "Trimmed transcript over budget — running inline compaction"
+        fit_budget, older_count, "Trimmed transcript over budget — running inline compaction"
     );
 
     let compaction_config = codex_routing::compaction::CompactionConfig::default();
@@ -3019,6 +3258,7 @@ fn plan_active_turn_split(
 async fn compact_active_turn(
     mut trimmed: codex_routing::trim::TrimResult,
     active_start: usize,
+    fit_budget: usize,
     endpoint: &OllamaEndpoint,
     state: &RoutingState,
 ) -> codex_routing::trim::TrimResult {
@@ -3027,7 +3267,7 @@ async fn compact_active_turn(
     else {
         warn!(
             estimated_tokens = trimmed.summary.estimated_input_tokens,
-            target_ctx = endpoint.trim_budget,
+            fit_budget,
             "Active turn over budget but too short to compact — deferring to last-resort drop"
         );
         return trimmed;
@@ -3040,15 +3280,43 @@ async fn compact_active_turn(
         .unwrap_or("(current task)")
         .to_string();
 
-    info!(
-        estimated_tokens = trimmed.summary.estimated_input_tokens,
-        target_ctx = endpoint.trim_budget,
-        middle = middle.len(),
-        "Active turn over budget — compacting its middle"
-    );
+    // Reuse a rolling summary for the unchanged prefix; only LLM-compact the new
+    // tail. Without this, every overflow re-summarizes the whole (growing) turn
+    // from scratch — the compaction storm. With it, each re-compaction is O(delta).
+    let cache = state
+        .active_compact_cache
+        .lock()
+        .ok()
+        .and_then(|g| g.clone());
+    let plan = plan_active_compaction(&middle, cache.as_ref());
+    let to_compact: Vec<serde_json::Value> = match &plan {
+        ActiveCompactPlan::Incremental { summary, from } => {
+            info!(
+                middle = middle.len(),
+                reused_prefix = *from,
+                new_tail = middle.len() - *from,
+                "Active-turn compaction reusing rolling summary (incremental)"
+            );
+            let mut v = vec![serde_json::json!({
+                "role": "user",
+                "content": format!("[summary of earlier steps in this task]\n\n{summary}"),
+            })];
+            v.extend_from_slice(&middle[*from..]);
+            v
+        }
+        ActiveCompactPlan::Full => {
+            info!(
+                estimated_tokens = trimmed.summary.estimated_input_tokens,
+                fit_budget,
+                middle = middle.len(),
+                "Active turn over budget — compacting its middle (full)"
+            );
+            middle.clone()
+        }
+    };
 
     let summary_text = match codex_routing::compaction::compact_transcript(
-        &middle,
+        &to_compact,
         &anchor,
         &state.pool,
         &state.config.compactor,
@@ -3062,6 +3330,16 @@ async fn compact_active_turn(
             return trimmed;
         }
     };
+
+    // Store the rolling summary now covering the WHOLE current middle, so the next
+    // overflow reuses it and only folds in whatever the model appended since.
+    if let Ok(mut g) = state.active_compact_cache.lock() {
+        *g = Some(ActiveCompactEntry {
+            prefix_len: middle.len(),
+            prefix_hash: hash_prefix(&middle),
+            summary: summary_text.clone(),
+        });
+    }
 
     let summary_message = serde_json::json!({
         "role": "user",
@@ -3176,6 +3454,242 @@ mod tests {
     use super::*;
 
     #[test]
+    fn present_local_tools_renames_web_search_and_moves_shell_last() {
+        let tool = |name: &str| {
+            serde_json::json!({
+                "type": "function",
+                "function": { "name": name, "parameters": {"type": "object", "properties": {}} }
+            })
+        };
+        let mut tools = vec![
+            tool("shell"),
+            tool("local_web_search"),
+            tool("web_fetch"),
+            tool("write_file"),
+        ];
+        present_local_tools(&mut tools);
+
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(|v| v.as_str()))
+            .collect();
+        // The Brave search tool is presented to the model as plain `web_search`;
+        // the internal name never reaches it.
+        assert!(names.contains(&"web_search"), "names: {names:?}");
+        assert!(!names.contains(&"local_web_search"), "names: {names:?}");
+        // `shell` is last so the model reaches for the specific tools first.
+        assert_eq!(names.last(), Some(&"shell"), "names: {names:?}");
+    }
+
+    #[test]
+    fn effective_window_derives_from_server_ctx() {
+        // 32768 window − 2048 output − 512 margin = 30208 when trim_budget=0 (auto).
+        assert_eq!(effective_window(0, Some(2048), Some(32768)), 30208);
+        // A trim_budget below the derived window caps there.
+        assert_eq!(effective_window(24576, Some(2048), Some(32768)), 24576);
+        // A trim_budget above the window can't exceed it.
+        assert_eq!(effective_window(40000, Some(2048), Some(32768)), 30208);
+        // Unset max_tokens uses the default output reserve.
+        assert_eq!(
+            effective_window(0, None, Some(32768)),
+            32768 - CTX_OUTPUT_RESERVE_DEFAULT - CTX_MARGIN
+        );
+        // Window unknown → configured trim_budget, or the fallback when it's 0.
+        assert_eq!(effective_window(24576, None, None), 24576);
+        assert_eq!(effective_window(0, None, None), CTX_FALLBACK);
+    }
+
+    #[test]
+    fn token_ratio_rises_fast_and_falls_slow() {
+        // Unique model key isolates this test's slot in the global ratio map.
+        let model = "test-ewma-asymmetric-9b";
+        // From the 1.8 default, a dense turn (observed 3.0) must jump most of the way.
+        record_token_ratio(model, 3000, 1000);
+        let dense = observed_token_ratio(model);
+        assert!(
+            dense > 2.5,
+            "a dense turn must pull the ratio up hard: {dense}"
+        );
+        // A following light turn (observed 1.8) should ease it down only slightly —
+        // one cheap turn must not drop our guard and re-open the overflow door.
+        record_token_ratio(model, 1800, 1000);
+        let light = observed_token_ratio(model);
+        assert!(
+            light < dense,
+            "a light turn eases the ratio down: {light} vs {dense}"
+        );
+        assert!(
+            light > dense - 0.4,
+            "but only slightly — fall slow: {light} vs {dense}"
+        );
+    }
+
+    #[test]
+    fn budget_reserves_tools_so_real_prompt_fits_window() {
+        // Converge a unique model's ratio to ~2.5 (dense JSON/code territory).
+        let model = "test-budget-fits-9b";
+        for _ in 0..8 {
+            record_token_ratio(model, 2500, 1000);
+        }
+        let ratio = observed_token_ratio(model);
+        let window = 45056usize; // e.g. 49664 ctx − 4096 output − 512 margin
+        let tool_est = 3000usize;
+        // Mirror the production budget math: reserve tools in REAL tokens, then
+        // calibrate the remainder to estimate space.
+        let real_tools = (tool_est as f64 * ratio) as usize;
+        let fit = calibrated_trim_budget(model, window - real_tools);
+        let messages_est = (fit as f64 / DEFAULT_SAFETY_FACTOR) as usize;
+        // What the server will actually see: (messages + tools) tokenized at `ratio`.
+        let real_total = ((messages_est + tool_est) as f64 * ratio) as usize;
+        assert!(
+            real_total <= window + 64,
+            "real prompt must fit the window: {real_total} > {window}"
+        );
+        assert!(
+            real_total > window * 9 / 10,
+            "and should use most of it, not starve context: {real_total}"
+        );
+    }
+
+    #[test]
+    fn represent_shell_writes_restores_write_file() {
+        // A write_file the model emitted last turn was lowered to a base64 shell
+        // call and RECORDED as shell. The inbound pass must turn it back into
+        // write_file (same call_id, original path+content) so the model sees its
+        // own tool and trim's state-extraction recognizes the write.
+        let t = codex_routing::tool_aliases::write_file_to_base64_shell(
+            &serde_json::json!({"path": "src/x.py", "content": "print('hi')\n"}),
+        )
+        .unwrap();
+        let items = vec![
+            ResponseItem::FunctionCall {
+                id: Some("fc0".into()),
+                name: "shell".into(),
+                namespace: None,
+                arguments: t.args.to_string(),
+                call_id: "call0".into(),
+            },
+            // A real (non-massage) shell call must pass through untouched.
+            ResponseItem::FunctionCall {
+                id: Some("fc1".into()),
+                name: "shell".into(),
+                namespace: None,
+                arguments: serde_json::json!({"command": ["bash", "-lc", "pytest -q"]}).to_string(),
+                call_id: "call1".into(),
+            },
+        ];
+        let out = represent_shell_writes(&items);
+        match &out[0] {
+            ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            } => {
+                assert_eq!(name, "write_file", "the base64 shell write is re-presented");
+                assert_eq!(
+                    call_id, "call0",
+                    "call_id preserved so its output still matches"
+                );
+                let v: serde_json::Value = serde_json::from_str(arguments).unwrap();
+                assert_eq!(v["path"], "src/x.py");
+                assert_eq!(v["content"], "print('hi')\n");
+            }
+            other => panic!("expected write_file, got {other:?}"),
+        }
+        match &out[1] {
+            ResponseItem::FunctionCall { name, .. } => {
+                assert_eq!(name, "shell", "a genuine shell call is left alone")
+            }
+            other => panic!("expected shell, got {other:?}"),
+        }
+    }
+
+    /// The actual transcript content from the hour-long stuck loop
+    /// (session 019f15a2): 140 real messages — web_fetch/exec/shell/apply_patch.
+    const LOOP_FIXTURE: &str = include_str!("compaction_loop_fixture.json");
+
+    fn loop_messages() -> Vec<serde_json::Value> {
+        serde_json::from_str(LOOP_FIXTURE).expect("fixture parses")
+    }
+
+    #[test]
+    fn active_compaction_reuses_rolling_summary_on_real_loop_content() {
+        let msgs = loop_messages();
+        assert!(msgs.len() >= 64, "fixture has the real loop content");
+
+        // Round 1 — cold cache: must compact the whole middle.
+        let round1: Vec<_> = msgs[..60].to_vec();
+        assert_eq!(
+            plan_active_compaction(&round1, None),
+            ActiveCompactPlan::Full
+        );
+
+        // Store the round-1 rolling summary (what compact_active_turn would cache).
+        let entry = ActiveCompactEntry {
+            prefix_len: round1.len(),
+            prefix_hash: hash_prefix(&round1),
+            summary: "ROLLING SUMMARY v1".to_string(),
+        };
+
+        // Round 2 — the append-only turn grew by 4 real steps. Must reuse the
+        // 60-message prefix and only re-compact the 4 new ones.
+        let round2: Vec<_> = msgs[..64].to_vec();
+        match plan_active_compaction(&round2, Some(&entry)) {
+            ActiveCompactPlan::Incremental { summary, from } => {
+                assert_eq!(from, 60, "reuse the whole prior prefix");
+                assert_eq!(summary, "ROLLING SUMMARY v1");
+                assert_eq!(
+                    round2.len() - from,
+                    4,
+                    "only the 4 new steps are re-compacted"
+                );
+            }
+            ActiveCompactPlan::Full => panic!("append-only growth must be incremental"),
+        }
+
+        // Correctness: if an EARLIER step changes (e.g. trim dropped one and the
+        // prefix shifted), the cache must invalidate and recompact fully.
+        let mut mutated = round2.clone();
+        mutated[10] = serde_json::json!({"role": "user", "content": "CHANGED"});
+        assert_eq!(
+            plan_active_compaction(&mutated, Some(&entry)),
+            ActiveCompactPlan::Full,
+            "a changed prefix must fall back to full compaction"
+        );
+    }
+
+    #[test]
+    fn incremental_compaction_collapses_the_storm_on_real_content() {
+        // Simulate the real loop: the active turn grows a few steps between each
+        // overflow, and compaction runs each time. Compare total work re-compacted
+        // under the OLD (always-full) path vs the NEW (incremental) path.
+        let msgs = loop_messages();
+        let mut cache: Option<ActiveCompactEntry> = None;
+        let (mut full_work, mut incr_work) = (0usize, 0usize);
+        let mut size = 40;
+        while size <= msgs.len() {
+            let middle = &msgs[..size];
+            full_work += middle.len(); // old: re-summarize the whole growing turn
+            incr_work += match plan_active_compaction(middle, cache.as_ref()) {
+                ActiveCompactPlan::Full => middle.len(),
+                ActiveCompactPlan::Incremental { from, .. } => middle.len() - from,
+            };
+            cache = Some(ActiveCompactEntry {
+                prefix_len: middle.len(),
+                prefix_hash: hash_prefix(middle),
+                summary: format!("s{size}"),
+            });
+            size += 4;
+        }
+        println!("re-compacted items — old(full)={full_work}  new(incremental)={incr_work}");
+        assert!(
+            incr_work * 3 < full_work,
+            "incremental must do far less work on the real loop: {incr_work} vs {full_work}"
+        );
+    }
+
+    #[test]
     fn plan_active_turn_split_keeps_request_and_recent() {
         let msg = |role: &str, body: &str| serde_json::json!({ "role": role, "content": body });
         // [request, step0 .. step7] — one user request + 8 agentic steps.
@@ -3258,23 +3772,6 @@ mod tests {
         assert!(role_text_is_product("light_reasoner_backup"));
         // A cloud role served locally falls through to coder behavior (must act).
         assert!(!role_text_is_product("cloud_mini"));
-    }
-
-    #[test]
-    fn system_summary_key_is_stable_and_content_sensitive() {
-        // Same inputs → same key (cache hits); different content or budget → miss.
-        assert_eq!(
-            system_summary_key("You are Codex.", 1000),
-            system_summary_key("You are Codex.", 1000)
-        );
-        assert_ne!(
-            system_summary_key("You are Codex.", 1000),
-            system_summary_key("You are a different agent.", 1000)
-        );
-        assert_ne!(
-            system_summary_key("You are Codex.", 1000),
-            system_summary_key("You are Codex.", 2000)
-        );
     }
 
     #[test]

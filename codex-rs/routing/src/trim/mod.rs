@@ -82,6 +82,11 @@ pub struct TrimResult {
     /// prelude is steering it to rewrite with `write_file`. Lets the caller
     /// surface a nudge and force the `write_file` tool on the next call.
     pub patch_rewrite_path: Option<String>,
+    /// The repetition/thrash count behind the loop-guard directive in `system`
+    /// this turn (if any). Surfaced so the caller can LOG which guard fired and how
+    /// deep the loop is — the guard notices themselves only reach the TUI, so
+    /// without this the logs make a firing guard look like it never fired.
+    pub repetition_count: Option<usize>,
 }
 
 /// Diagnostics emitted by `trim_for_local`. Logged by the caller; not seen by
@@ -160,6 +165,7 @@ pub fn trim_for_local(input: &TrimInput, target_ctx: usize) -> TrimResult {
         active_turn,
         input.flavor,
         extracted.repetition.as_ref(),
+        render::max_output_chars(target_ctx),
     );
 
     let mut summary = TrimSummary {
@@ -234,6 +240,7 @@ pub fn trim_for_local(input: &TrimInput, target_ctx: usize) -> TrimResult {
         messages,
         summary,
         patch_rewrite_path: extracted.patch_failure.as_ref().map(|pf| pf.path.clone()),
+        repetition_count: extracted.repetition.as_ref().map(|a| a.count),
     }
 }
 
@@ -315,7 +322,19 @@ fn drop_oldest_until_fit(system: &str, messages: &mut Vec<JsonValue>, target_ctx
         let removed = messages.remove(0);
         dropped = dropped.saturating_add(message_content_len(&removed));
     }
-    while messages.len() > 1 && messages.first().is_some_and(|m| is_role(m, "tool")) {
+    // Strip leading orphan tool results so a drop that removed the matching
+    // assistant tool_call doesn't leave a result with no call. Catch BOTH the
+    // OpenAI `role:"tool"` form and our Ollama `role:"user"` `<tool_result>` wrapper
+    // (the latter was previously missed — a silent orphan-result swiss-cheese).
+    let is_orphan_result = |m: &JsonValue| {
+        is_role(m, "tool")
+            || (is_role(m, "user")
+                && m.get("content").and_then(|c| c.as_str()).is_some_and(|s| {
+                    let t = s.trim_start();
+                    t.starts_with("<tool_result") || t.starts_with("<tool_error")
+                }))
+    };
+    while messages.len() > 1 && messages.first().is_some_and(|m| is_orphan_result(m)) {
         let removed = messages.remove(0);
         dropped = dropped.saturating_add(message_content_len(&removed));
     }

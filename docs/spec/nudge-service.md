@@ -42,6 +42,7 @@ Rationale:
   the harness runs them and sends results back next turn. The nudge loop is
   LLM-only, so the service never needs to execute tools or touch the workspace.
 
+
 ## Keep-alive: heartbeats + idle-timeout
 
 The nudge loop can run for minutes (re-prompts, rumination aborts, overflow
@@ -98,6 +99,31 @@ Design:
    or accept the TUI goes quieter and log them service-side.
 5. **Privacy.** The full transcript (code, possibly secrets) crosses the wire
    each request. Localhost/LAN: non-issue. Beyond that: a data-egress decision.
+
+## Compaction: persist via the harness, don't reinvent
+
+The fork does its own **transient** inline compaction every turn (re-summarizing a
+growing turn from scratch — the GPU-pegging "storm"; mitigated with an incremental
+rolling-summary cache, but that's a workaround). The right model for a **local-only**
+service is to **persist**: summarize once, write it back, never re-do it.
+
+Compaction is always **trigger → summarize → persist**, and the split is:
+- **Capable harness (Codex-grade native compaction):** *tap it.* Configure its
+  trigger at the **real local window** and hand it the summarization prompt; the
+  harness persists. Shephard's job is **trigger + shape**, not *do*. Codex knobs:
+  `model_context_window`, `model_auto_compact_token_limit`, `compact_prompt`. The
+  catch is the harness learns the window from its **config/registry, not the
+  server** — so it's blind to a small local model until told.
+- **Bare harness (no native compaction):** there's nothing to tap → Shephard does
+  it, and to persist (not storm) it must hold **session state** (the conversation,
+  keyed by `X-Nudge-Session-Id`). So *stateful vs stateless is decided by whether
+  the target harness compacts + persists.*
+
+**Window-reporting is the universal lever.** Shephard knows the real window (probe
+`/props`); it either tells the operator to configure it (Codex reads config) or
+exposes it on `/v1/models` (harnesses that read context length there auto-configure).
+This also makes the harness's **context-% gauge** honest (gauge = real usage ÷ real
+window; Shephard reports the real usage in the response).
 
 ## Recommended first cut
 
