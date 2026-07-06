@@ -296,7 +296,14 @@ pub async fn fetch_nav(
         let offset = cursor.and_then(parse_cursor).unwrap_or(0);
         render_page(url, status, ct.as_deref(), &reduced, offset, cap_tokens)
     };
-    Ok(append_guess_hint(out, status, streak))
+    // The guess-nag is for EXTERNAL URL-roulette only. A localhost/LAN dev server
+    // that's momentarily down (connection refused / 5xx) is the model waiting for
+    // its OWN server — not guessing — so never nag internal hosts.
+    if is_internal_url(url) {
+        Ok(out)
+    } else {
+        Ok(append_guess_hint(out, status, streak))
+    }
 }
 
 /// Consecutive non-2xx fetches in this process. A 2xx resets it; the count is how
@@ -329,13 +336,98 @@ fn status_label(status: u16) -> String {
     }
 }
 
+/// Decided BEFORE a fetch runs, by [`gate_fetch`].
+pub enum FetchGate {
+    Proceed,
+    /// An exact repeat of a fetch already made this turn (same url + find + cursor)
+    /// to an EXTERNAL host — refused as an HTTP 400 so the model stops burning
+    /// ~60s of inference re-requesting the identical thing. Internal hosts are
+    /// never blocked (the model may be polling its own dev server).
+    Block {
+        message: String,
+    },
+}
+
+/// Per-session set of `(url, find, cursor)` already fetched this turn, so an exact
+/// repeat can be refused. Turn-scoped + session-scoped; see [`crate::guard_state`].
+static FETCH_SEEN: std::sync::LazyLock<
+    crate::guard_state::SessionTurnStore<std::collections::HashSet<(String, String, String)>>,
+> = std::sync::LazyLock::new(crate::guard_state::SessionTurnStore::new);
+
+/// Refuse an EXACT repeat fetch (same url + find + cursor) to an external host: it
+/// can only return what the model already has, and the real cost is the inference
+/// spent re-deciding to fetch, not the request. Internal hosts (a dev server it
+/// may be polling) are ALWAYS allowed. Navigating the same doc with a DIFFERENT
+/// `find`/`cursor` is not a repeat, so it proceeds (and `DOC_CACHE` serves it).
+pub fn gate_fetch(
+    session: &str,
+    turn: &str,
+    url: &str,
+    find: Option<&str>,
+    cursor: Option<&str>,
+) -> FetchGate {
+    if is_internal_url(url) {
+        return FetchGate::Proceed;
+    }
+    let key = (
+        url.to_string(),
+        find.unwrap_or("").to_string(),
+        cursor.unwrap_or("").to_string(),
+    );
+    FETCH_SEEN.with(session, turn, |seen| {
+        if seen.contains(&key) {
+            FetchGate::Block {
+                message: format!(
+                    "HTTP 400 Bad Request \u{b7} web_fetch {url}\n\
+                     You already fetched this exact request (same url, find, and cursor) — the result won't differ. Use what you have, or fetch something different."
+                ),
+            }
+        } else {
+            seen.insert(key);
+            FetchGate::Proceed
+        }
+    })
+}
+
+/// True for localhost / loopback / RFC-1918 private / `.local` hosts — a server
+/// the model may legitimately be polling while it builds it, so it's never
+/// guarded (no block, no guess-nag).
+pub fn is_internal_url(url: &str) -> bool {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let hostport = authority.rsplit('@').next().unwrap_or(authority); // strip userinfo
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest) // [ipv6]:port
+    } else {
+        hostport.split(':').next().unwrap_or(hostport)
+    }
+    .to_ascii_lowercase();
+
+    if host == "localhost"
+        || host == "::1"
+        || host == "0.0.0.0"
+        || host.ends_with(".local")
+        || host.ends_with(".localhost")
+    {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        let o = ip.octets();
+        return o[0] == 127
+            || o[0] == 10
+            || (o[0] == 192 && o[1] == 168)
+            || (o[0] == 172 && (16..=31).contains(&o[1]));
+    }
+    false
+}
+
 /// After several non-2xx fetches in a row, the model is guessing — tell it to
 /// stop and change tactic. Below the threshold, a failure stands on its own (the
 /// status + body are enough; no scolding for a single bad URL).
 fn append_guess_hint(mut out: String, status: u16, streak: usize) -> String {
     if !(200..300).contains(&status) && streak >= GUESS_STREAK_THRESHOLD {
         out.push_str(&format!(
-            "\n\n\u{26a0} {streak} web_fetch calls in a row have failed (non-2xx). If you're guessing URLs, STOP — more variants on the same host will keep failing. Find the correct URL via local_web_search or a known source, or take a different step."
+            "\n\n\u{26a0} {streak} fetches in a row failed (non-2xx). If you're guessing URLs, stop — find the right one via search, or take a different step."
         ));
     }
     out
@@ -469,7 +561,7 @@ mod tests {
         assert!(!append_guess_hint(base.clone(), 404, 2).contains("guessing"));
         // 3rd consecutive failure: the stop-guessing nudge appears.
         let hinted = append_guess_hint(base.clone(), 404, 3);
-        assert!(hinted.contains("3 web_fetch calls in a row"));
+        assert!(hinted.contains("3 fetches in a row"));
         assert!(hinted.contains("guessing"));
         // A 2xx never gets the nudge, regardless of streak.
         assert!(
@@ -509,5 +601,64 @@ mod tests {
         assert!(is_text_content_type(None));
         assert!(!is_text_content_type(Some("image/png")));
         assert!(!is_text_content_type(Some("application/octet-stream")));
+    }
+
+    #[test]
+    fn internal_hosts_are_recognized() {
+        for u in [
+            "http://localhost:3000/health",
+            "http://127.0.0.1/api",
+            "http://[::1]:8080/",
+            "http://192.168.1.10/status",
+            "http://10.0.0.5:9000/x",
+            "http://172.16.4.4/",
+            "http://myapp.local/",
+        ] {
+            assert!(is_internal_url(u), "should be internal: {u}");
+        }
+        for u in [
+            "https://api.handle.me/swagger.json",
+            "https://raw.githubusercontent.com/x/y",
+            "http://172.32.0.1/", // just outside the private range
+            "https://example.com",
+        ] {
+            assert!(!is_internal_url(u), "should be external: {u}");
+        }
+    }
+
+    #[test]
+    fn gate_blocks_exact_external_repeat_but_allows_navigation_and_internal() {
+        let (s, t) = ("sess-fetch", "turn-1");
+        let u = "https://api.handle.me/swagger.json";
+        // First fetch runs.
+        assert!(matches!(
+            gate_fetch(s, t, u, None, None),
+            FetchGate::Proceed
+        ));
+        // Exact repeat (same url + find + cursor) is refused.
+        assert!(matches!(
+            gate_fetch(s, t, u, None, None),
+            FetchGate::Block { .. }
+        ));
+        // Same url with a DIFFERENT find is navigation, not a repeat → allowed.
+        assert!(matches!(
+            gate_fetch(s, t, u, Some("Holder"), None),
+            FetchGate::Proceed
+        ));
+        // Internal host is always allowed, even on an exact repeat.
+        let local = "http://localhost:8080/health";
+        assert!(matches!(
+            gate_fetch(s, t, local, None, None),
+            FetchGate::Proceed
+        ));
+        assert!(matches!(
+            gate_fetch(s, t, local, None, None),
+            FetchGate::Proceed
+        ));
+        // New turn resets — the earlier external fetch is allowed again.
+        assert!(matches!(
+            gate_fetch(s, "turn-2", u, None, None),
+            FetchGate::Proceed
+        ));
     }
 }

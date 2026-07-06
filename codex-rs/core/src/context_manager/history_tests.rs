@@ -319,6 +319,55 @@ fn for_prompt_preserves_inter_agent_assistant_messages() {
 }
 
 #[test]
+fn for_prompt_drops_local_reasoning_but_keeps_provider_reasoning() {
+    use codex_protocol::models::ReasoningItemContent;
+    use codex_protocol::models::ReasoningItemReasoningSummary;
+    // Local reasoning: plaintext ReasoningText, NO provider encrypted_content —
+    // single-use exhaust that the Responses API rejects on input; must be dropped.
+    let local = ResponseItem::Reasoning {
+        id: String::new(),
+        summary: vec![ReasoningItemReasoningSummary::SummaryText {
+            text: "Plan-first".into(),
+        }],
+        content: Some(vec![ReasoningItemContent::ReasoningText {
+            text: "1. list the dir\n2. read config".into(),
+        }]),
+        encrypted_content: None,
+    };
+    // Provider reasoning: has encrypted_content — round-trips, must be kept.
+    let provider = ResponseItem::Reasoning {
+        id: String::new(),
+        summary: vec![ReasoningItemReasoningSummary::SummaryText { text: "s".into() }],
+        content: None,
+        encrypted_content: Some("opaque-blob".into()),
+    };
+    let user = user_msg("hi");
+    let history = create_history_with_items(vec![local, provider, user]);
+
+    let out = history.for_prompt(&default_input_modalities());
+    assert!(
+        !out.iter().any(|i| matches!(
+            i,
+            ResponseItem::Reasoning {
+                encrypted_content: None,
+                ..
+            }
+        )),
+        "local reasoning (no encrypted_content) must be dropped from the prompt"
+    );
+    assert!(
+        out.iter().any(|i| matches!(
+            i,
+            ResponseItem::Reasoning {
+                encrypted_content: Some(_),
+                ..
+            }
+        )),
+        "provider reasoning (with encrypted_content) must be preserved"
+    );
+}
+
+#[test]
 fn drop_last_n_user_turns_treats_inter_agent_assistant_messages_as_instruction_turns() {
     let first_turn = user_input_text_msg("first");
     let first_reply = assistant_msg("done");

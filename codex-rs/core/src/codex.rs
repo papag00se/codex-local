@@ -576,6 +576,11 @@ impl Codex {
         // 1. config.base_instructions override
         // 2. conversation history => session_meta.base_instructions
         // 3. base_instructions for current model
+        // Detect the local coder's real context window up front so the model's
+        // advertised (far larger) default doesn't suppress Codex's native
+        // auto-compaction on the first turn. Populates the value that
+        // `to_models_manager_config` folds into `model_info.context_window`.
+        crate::local_routing::ensure_coder_context_window().await;
         let model_info = models_manager
             .get_model_info(model.as_str(), &config.to_models_manager_config())
             .await;
@@ -6607,7 +6612,7 @@ async fn run_auto_compact(
     turn_context: &Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
 ) -> CodexResult<()> {
-    if should_use_remote_compact_task(&turn_context.provider) {
+    if should_use_remote_compact_task(&turn_context.provider).await {
         run_inline_remote_auto_compact_task(
             Arc::clone(sess),
             Arc::clone(turn_context),

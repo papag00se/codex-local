@@ -49,13 +49,23 @@ pub enum ModelRole {
         /// catalog without losing focus.
         #[serde(default)]
         tool_subset: Option<String>,
-        /// Hard ceiling on output tokens per response. Maps to
-        /// `max_tokens` for OpenAI-compat and `options.num_predict` for
-        /// Ollama. Unset — or explicitly `0` — means no cap (server
-        /// default applies). Useful to prevent runaway reasoning loops
-        /// on thinking-capable models.
+        /// Hard ceiling on output tokens per response — the CONVENTIONAL
+        /// `max_tokens` meaning (OpenAI `max_tokens` / Ollama `num_predict`).
+        /// Unset (the default) — or explicitly `0` — means NO cap: the model
+        /// generates into whatever room the window has. Setting it opts into a
+        /// hard cap, which risks truncating a large `write_file` mid-content, so
+        /// leave it unset unless you specifically want a ceiling. Runaway is
+        /// bounded by the live rumination detector + `timeout_seconds`, not this.
         #[serde(default)]
         max_tokens: Option<usize>,
+        /// Tokens of the context window to RESERVE for the model's output when
+        /// sizing the input budget (see `effective_window`): input is trimmed to
+        /// `n_ctx − output_reserve − margin`, so the model always has ≥ this much
+        /// room to generate. This is NOT a hard cap (that's `max_tokens`) — it's
+        /// the input/output split of a fixed window. Unset → a built-in default.
+        /// Give file-writing roles (coder) a generous value so big writes fit.
+        #[serde(default)]
+        output_reserve: Option<usize>,
         /// Per-request HTTP timeout in seconds. Defaults to 300. Raise
         /// for slow reasoning models, lower for fast-fail behavior.
         #[serde(default)]

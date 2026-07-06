@@ -411,6 +411,57 @@ pub fn normalize_edit_file_call(args: &JsonValue) -> Option<TranslatedCall> {
     })
 }
 
+/// Repair `write_file` content that a model DOUBLE-escaped — emitting `\n` / `\t` /
+/// etc. as the literal two-character sequences (backslash + letter) instead of real
+/// control characters, which lands the ENTIRE file as one physical line (for Python,
+/// a single `#!`-comment line → zero code). Observed with Fabliq, which double-escapes
+/// every write; Qwythos/Gemma emit real newlines and are untouched.
+///
+/// Applied ONLY when unambiguous — the content has a literal `\n` but NO real newline.
+/// A correctly-escaped multi-line file always contains real newlines, so this can
+/// never corrupt a model that writes newlines properly. The C-style single pass makes
+/// `\\` consume both backslashes before an `n`, so a genuinely-intended literal `\n`
+/// (emitted as `\\n`) survives as `\n`. (Residual risk: a real source file that is a
+/// SINGLE line embedding a `\n` string literal — which effectively never happens.)
+pub(crate) fn repair_double_escaped_content(content: &str) -> String {
+    if content.contains('\n') || !content.contains("\\n") {
+        return content.to_string();
+    }
+    decode_backslash_escapes(content)
+}
+
+/// Decode C-style backslash escapes (`\n \t \r \" \' \\ \0`) to their literal
+/// bytes, unconditionally. `repair_double_escaped_content` gates on the
+/// whole-content-collapsed signature before calling this; the collapsed-Update
+/// apply_patch path ([`collapsed_update_patch_parts`]) calls it on already-isolated
+/// hunk content that the caller then verifies byte-for-byte against disk, so it
+/// needs no gate of its own.
+fn decode_backslash_escapes(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut chars = content.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('"') => out.push('"'),
+            Some('\'') => out.push('\''),
+            Some('\\') => out.push('\\'),
+            Some('0') => out.push('\0'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 /// Translate a `write_file` call into a `shell` invocation that writes the
 /// content to disk, **creating or overwriting** the file. We route through
 /// `shell` (not `apply_patch`) for two reasons: `apply_patch`'s `Add File` now
@@ -433,7 +484,7 @@ pub fn normalize_write_file_call(args: &JsonValue) -> Option<TranslatedCall> {
     if path.is_empty() || path.contains('\'') {
         return None;
     }
-    let content = get(&["content", "contents", "text", "body"]).unwrap_or_default();
+    let content = repair_double_escaped_content(&get(&["content", "contents", "text", "body"]).unwrap_or_default());
     // Wrap content in single quotes; the only sequence that needs escaping
     // inside single quotes is the single quote itself.
     let escaped = content.replace('\'', "'\\''");
@@ -491,7 +542,7 @@ pub fn write_file_to_base64_shell(args: &JsonValue) -> Option<TranslatedCall> {
     if path.is_empty() {
         return None;
     }
-    let content = get(&["content", "contents", "text", "body"]).unwrap_or_default();
+    let content = repair_double_escaped_content(&get(&["content", "contents", "text", "body"]).unwrap_or_default());
     let content_b64 = B64.encode(content.as_bytes());
     let path_b64 = B64.encode(path.as_bytes());
     let q = shell_single_quote(&path);
@@ -559,11 +610,38 @@ pub fn recover_write_file_args(raw: &str) -> Option<JsonValue> {
         &["content", "contents", "text", "body", "data", "file_text"],
     )?;
     let tail = &raw[content_at..];
-    // content is the last field → its closing quote is the last quote in the tail.
-    let close = tail.rfind('"')?;
+    // content is the last field. Find its REAL closing quote: the last `"` whose only
+    // suffix is optional whitespace and an optional closing `}`. A plain `rfind('"')`
+    // grabs the last INTERNAL quote of the (unescaped, malformed-JSON) code — e.g. the
+    // `"` after `body` in `result["body"]` — and silently drops everything after it, a
+    // SECOND truncation on top of the model's that turns a partly-truncated write into
+    // a ~217-byte unterminated fragment (the "chopped file" footgun). When the write is
+    // genuinely truncated (no such closing quote exists), keep the model's content to
+    // the END rather than chop it further; the syntax floor / output-truncation guard
+    // then deals with the still-incomplete file — we don't add truncation of our own.
+    let close = content_close_quote(tail).unwrap_or(tail.len());
     let content = decode_lenient(&tail[..close]);
 
     Some(serde_json::json!({ "path": path, "content": content }))
+}
+
+/// Byte index of the content field's real closing quote: the last `"` followed by only
+/// optional whitespace and an optional `}` to end-of-string. `None` when the value has
+/// no such terminator (a truncated write) — the caller then keeps everything to EOF
+/// instead of dropping the tail at an internal quote.
+fn content_close_quote(tail: &str) -> Option<usize> {
+    let bytes = tail.as_bytes();
+    for i in (0..bytes.len()).rev() {
+        if bytes[i] != b'"' {
+            continue;
+        }
+        let mut suffix = tail[i + 1..].trim_start();
+        suffix = suffix.strip_prefix('}').unwrap_or(suffix).trim();
+        if suffix.is_empty() {
+            return Some(i);
+        }
+    }
+    None
 }
 
 /// Byte index just AFTER the opening quote of the first matching `"key": "…"`
@@ -758,6 +836,148 @@ pub fn apply_patch_add_to_write_file(args: &JsonValue) -> Option<TranslatedCall>
         args: serde_json::json!({ "path": path, "content": content }),
         command_line: format!("apply_patch Add -> write_file ({path})"),
     })
+}
+
+/// Reconstruct `(path, old_content, new_content)` from an `apply_patch` Update whose
+/// hunk body was DOUBLE-ESCAPED — the whole file collapsed onto `-`/`+` lines with
+/// LITERAL `\n` separators instead of real newlines (the shape the reasoning-tuned
+/// Fabliq emits, which makes apply_patch's context never match; observed in session
+/// 019f359b). PURE — it never touches disk. The caller PROVES the reconstruction is a
+/// COMPLETE file replacement by comparing `old_content` to the file on disk before
+/// rewriting to `write_file`, so a partial or ambiguous patch can never silently
+/// truncate. This function only fires on the double-escape SIGNATURE, so a
+/// well-formed patch is left to normal normalization.
+///
+/// Returns `None` unless: exactly one `*** Update File:` (no Add/Delete/multi-file),
+/// every body line is properly prefixed, and at least one body line carries a literal
+/// `\n` (the double-escape tell — without it, this is an ordinary patch).
+pub fn collapsed_update_patch_parts(input: &str) -> Option<(String, String, String)> {
+    if input.contains("*** Add File:") || input.contains("*** Delete File:") {
+        return None;
+    }
+    let updates: Vec<&str> = input
+        .lines()
+        .filter_map(|l| l.strip_prefix("*** Update File: "))
+        .collect();
+    if updates.len() != 1 {
+        return None; // zero, or multi-file — not the clean single-Update shape
+    }
+    let path = updates[0].trim().to_string();
+    if path.is_empty() || path.contains('\n') {
+        return None;
+    }
+
+    let mut old_parts: Vec<&str> = Vec::new();
+    let mut new_parts: Vec<&str> = Vec::new();
+    let mut in_body = false;
+    let mut saw_escape = false;
+    for line in input.lines() {
+        if line.starts_with("*** Update File:") {
+            in_body = true;
+            continue;
+        }
+        if line.starts_with("*** ") {
+            in_body = false; // *** End Patch / another envelope marker
+            continue;
+        }
+        if !in_body || line.starts_with("@@") {
+            continue;
+        }
+        if line.contains("\\n") {
+            saw_escape = true;
+        }
+        if let Some(rest) = line.strip_prefix('-') {
+            old_parts.push(rest);
+        } else if let Some(rest) = line.strip_prefix('+') {
+            new_parts.push(rest);
+        } else if let Some(rest) = line.strip_prefix(' ') {
+            old_parts.push(rest);
+            new_parts.push(rest);
+        } else if line.is_empty() {
+            old_parts.push("");
+            new_parts.push("");
+        } else {
+            // A bare, unprefixed body line means this isn't the clean shape we can
+            // trust to reconstruct — bail rather than guess.
+            return None;
+        }
+    }
+    if !saw_escape || (old_parts.is_empty() && new_parts.is_empty()) {
+        return None;
+    }
+    let old_content = decode_backslash_escapes(&old_parts.join("\n"));
+    let new_content = decode_backslash_escapes(&new_parts.join("\n"));
+    Some((path, old_content, new_content))
+}
+
+/// Expand a COLLAPSED apply_patch — one where the model crammed several file lines onto
+/// a single `-`/`+`/context line with LITERAL `\n` (the double-escape habit) — into a
+/// real multi-line hunk apply_patch can actually match. This is the DOMINANT apply_patch
+/// failure (~2/3 of all failures observed): a `-` line
+/// `import json\nimport requests\nfrom functools import wraps` can never match three
+/// real lines in the file, so it fails "could not find expected lines". Unlike
+/// [`collapsed_update_patch_parts`] (which only rescues a WHOLE-FILE replacement into a
+/// write_file), this handles PARTIAL hunks by expanding them in place.
+///
+/// SAFE by verification: the expanded OLD block (`-` and context lines) must appear
+/// verbatim in `file_content`, else we return `None` and leave the patch untouched (no
+/// worse than before). That verification also rejects the false-positive — a `-`/`+`
+/// line whose `\n` is a genuine string literal (`"\n"`) — because splitting it would
+/// not match the file.
+pub fn expand_collapsed_patch(input: &str, file_content: &str) -> Option<String> {
+    let mut out = String::with_capacity(input.len());
+    let mut old_block = String::new();
+    let mut changed = false;
+    for raw in input.split_inclusive('\n') {
+        let (line, nl) = match raw.strip_suffix('\n') {
+            Some(s) => (s, "\n"),
+            None => (raw, ""),
+        };
+        let prefix = match line.as_bytes().first() {
+            Some(b'-') if !line.starts_with("---") => Some('-'),
+            Some(b'+') if !line.starts_with("+++") => Some('+'),
+            Some(b' ') => Some(' '),
+            _ => None,
+        };
+        match prefix {
+            Some(p) if line.contains("\\n") => {
+                changed = true;
+                let decoded = decode_backslash_escapes(&line[1..]);
+                for (i, piece) in decoded.split('\n').enumerate() {
+                    if i > 0 {
+                        out.push('\n');
+                    }
+                    out.push(p);
+                    out.push_str(piece);
+                    if p != '+' {
+                        old_block.push_str(piece);
+                        old_block.push('\n');
+                    }
+                }
+                out.push_str(nl);
+            }
+            Some(p) => {
+                out.push_str(line);
+                out.push_str(nl);
+                if p != '+' {
+                    old_block.push_str(&line[1..]);
+                    old_block.push('\n');
+                }
+            }
+            None => {
+                out.push_str(line);
+                out.push_str(nl);
+            }
+        }
+    }
+    if !changed {
+        return None;
+    }
+    let needle = old_block.trim_end_matches('\n');
+    if needle.is_empty() || !file_content.contains(needle) {
+        return None; // expansion unverified → leave the patch as-is
+    }
+    Some(out)
 }
 
 /// Returns `Some(translated)` only when at least one normalization fired.
@@ -1547,9 +1767,10 @@ fn shell_quote_if_needed(s: &str) -> String {
 const TOOL_CALL_OPEN: &str = "<tool_call>";
 const TOOL_CALL_CLOSE: &str = "</tool_call>";
 
-/// Cheap pre-check: does the content carry a leaked `<tool_call>` block?
+/// Cheap pre-check: does the content carry a leaked tool call — Hermes/XML
+/// `<tool_call>` or the Gemma `<|tool_call>` dialect?
 pub fn has_leaked_tool_call(content: &str) -> bool {
-    content.contains(TOOL_CALL_OPEN)
+    content.contains(TOOL_CALL_OPEN) || content.contains(GEMMA_TC_OPEN)
 }
 
 /// Parse every `<tool_call>{json}</tool_call>` block in `content` into the
@@ -1568,6 +1789,11 @@ pub fn parse_leaked_tool_calls(content: &str) -> Vec<JsonValue> {
         }
         rest = &after[close + TOOL_CALL_CLOSE.len()..];
     }
+    // Gemma-fable dialect (`<|tool_call>call:NAME{…}<tool_call|>`). A message
+    // carries one format or the other, so this appends to (an otherwise empty)
+    // `out`; the two open tokens are non-overlapping substrings so they never
+    // cross-match.
+    out.extend(parse_gemma_tool_calls(content));
     out
 }
 
@@ -1661,16 +1887,218 @@ fn parse_param_value(raw: &str) -> JsonValue {
     JsonValue::String(raw.to_string())
 }
 
-/// Remove the `<tool_call>...</tool_call>` blocks from `content` so the leaked
-/// JSON doesn't also show up as prose once it's been promoted to a real call.
+// --- Gemma-fable dialect --------------------------------------------------
+//
+// The "agentic-fable" Gemma fine-tunes (gemma-toggle.jinja) emit tool calls in a
+// bespoke syntax, NOT Hermes JSON or XML:
+//   <|tool_call>call:NAME{key:<|"|>string val<|"|>,key2:123,key3:[<|"|>a<|"|>]}<tool_call|>
+// STRING values are delimited by the `<|"|>` token, so a value may itself contain
+// `}`, `,`, quotes — anything but `<|"|>`. Bare tokens are bools/numbers; `{…}` and
+// `[…]` nest. llama.cpp doesn't parse this format (it isn't one of its known
+// dialects), so the calls leak into the assistant's text — in the coder's args AND
+// the reasoner's plan. This recovers them into the same wire shape the Hermes/XML
+// paths produce. The `<|channel>thought … <channel|>` reasoning wrapper is stripped
+// from content separately (see `strip_leaked_tool_calls`).
+const GEMMA_TC_OPEN: &str = "<|tool_call>";
+const GEMMA_TC_CLOSE: &str = "<tool_call|>";
+const GEMMA_STR: &str = "<|\"|>";
+const GEMMA_CH_OPEN: &str = "<|channel>";
+const GEMMA_CH_CLOSE: &str = "<channel|>";
+
+// LFM2 / Fabliq NATIVE tool-call delimiters: `<|tool_call_start|>name(args)<|tool_call_end|>`.
+// Unlike the Gemma/Hermes dialects, llama.cpp's `peg-native` parser DOES handle a
+// WELL-FORMED native call (that's how the coder's calls round-trip). But a MALFORMED
+// one — missing its start token, wrapped in JSON junk — is what the reasoning-tuned
+// Fabliq emitted in the PLANNER role (`{ "read_file(path='…')]<|tool_call_end|>`).
+// The parser rejects it, so a stray `<|tool_call_end|>` leaks into content and, with
+// nothing here to strip it, poisons the pinned plan/redirect. We don't RECOVER these
+// (llama.cpp already handles the well-formed case); we only strip the leaked sentinels.
+const LFM2_TC_OPEN: &str = "<|tool_call_start|>";
+const LFM2_TC_CLOSE: &str = "<|tool_call_end|>";
+
+/// Parse every `<|tool_call>call:NAME{…}<tool_call|>` block into the wire shape
+/// (`{"function": {"name", "arguments": <json string>}}`). A block with no close
+/// token (truncated generation) is parsed up to the end.
+fn parse_gemma_tool_calls(content: &str) -> Vec<JsonValue> {
+    let mut out = Vec::new();
+    let mut rest = content;
+    while let Some(open) = rest.find(GEMMA_TC_OPEN) {
+        let after = &rest[open + GEMMA_TC_OPEN.len()..];
+        let (inner, next) = match after.find(GEMMA_TC_CLOSE) {
+            Some(close) => (&after[..close], &after[close + GEMMA_TC_CLOSE.len()..]),
+            None => (after, ""),
+        };
+        if let Some(call) = parse_one_gemma_call(inner.trim()) {
+            out.push(call);
+        }
+        if next.is_empty() {
+            break;
+        }
+        rest = next;
+    }
+    out
+}
+
+/// Parse the `call:NAME{…}` body of one Gemma tool call.
+fn parse_one_gemma_call(inner: &str) -> Option<JsonValue> {
+    let body = inner.strip_prefix("call:").unwrap_or(inner).trim_start();
+    let brace = body.find('{')?;
+    let name = body[..brace].trim();
+    if name.is_empty() {
+        return None;
+    }
+    let (args, _) = parse_gemma_object(&body[brace..])?;
+    let args_string = serde_json::to_string(&args).ok()?;
+    Some(serde_json::json!({
+        "function": { "name": name, "arguments": args_string }
+    }))
+}
+
+/// Parse a `{key:value,…}` object at `s[0] == '{'`. Returns the value and the byte
+/// count consumed (including the closing `}`). All byte indices land on ASCII
+/// delimiters, so the `&str` slicing stays on char boundaries. An unterminated
+/// object (truncation) returns what was parsed so far.
+fn parse_gemma_object(s: &str) -> Option<(JsonValue, usize)> {
+    let b = s.as_bytes();
+    if b.first() != Some(&b'{') {
+        return None;
+    }
+    let mut map = serde_json::Map::new();
+    let mut i = 1;
+    loop {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= b.len() {
+            break;
+        }
+        if b[i] == b'}' {
+            return Some((JsonValue::Object(map), i + 1));
+        }
+        let Some(colon) = s[i..].find(':') else { break };
+        let key = s[i..i + colon].trim().to_string();
+        i += colon + 1;
+        // A value that fails to parse (truncation, junk) ends the object with
+        // whatever was recovered so far rather than dropping the whole call.
+        let Some((val, consumed)) = parse_gemma_value(&s[i..]) else {
+            break;
+        };
+        i += consumed;
+        if !key.is_empty() {
+            map.insert(key, val);
+        }
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= b.len() {
+            break;
+        }
+        match b[i] {
+            b',' => i += 1,
+            b'}' => return Some((JsonValue::Object(map), i + 1)),
+            _ => break,
+        }
+    }
+    Some((JsonValue::Object(map), s.len()))
+}
+
+/// Parse a `[value,…]` array at `s[0] == '['`.
+fn parse_gemma_array(s: &str) -> Option<(JsonValue, usize)> {
+    let b = s.as_bytes();
+    if b.first() != Some(&b'[') {
+        return None;
+    }
+    let mut arr = Vec::new();
+    let mut i = 1;
+    loop {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= b.len() {
+            break;
+        }
+        if b[i] == b']' {
+            return Some((JsonValue::Array(arr), i + 1));
+        }
+        let (val, consumed) = parse_gemma_value(&s[i..])?;
+        i += consumed;
+        arr.push(val);
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= b.len() {
+            break;
+        }
+        match b[i] {
+            b',' => i += 1,
+            b']' => return Some((JsonValue::Array(arr), i + 1)),
+            _ => break,
+        }
+    }
+    Some((JsonValue::Array(arr), s.len()))
+}
+
+/// Parse ONE Gemma value: a `<|"|>…<|"|>` string (opaque — may contain any char
+/// but the delimiter), a nested `{}`/`[]`, or a bare bool/number/scalar up to the
+/// next `,`/`}`/`]`. Returns the value + bytes consumed.
+fn parse_gemma_value(s: &str) -> Option<(JsonValue, usize)> {
+    let ws = s.len() - s.trim_start().len();
+    let t = &s[ws..];
+    if let Some(after) = t.strip_prefix(GEMMA_STR) {
+        return Some(match after.find(GEMMA_STR) {
+            Some(end) => (
+                JsonValue::String(after[..end].to_string()),
+                ws + GEMMA_STR.len() + end + GEMMA_STR.len(),
+            ),
+            // Truncated string (generation cut off mid-value) — take the
+            // remainder so we still recover the call + its earlier args.
+            None => (
+                JsonValue::String(after.to_string()),
+                ws + GEMMA_STR.len() + after.len(),
+            ),
+        });
+    }
+    if t.starts_with('{') {
+        return parse_gemma_object(t).map(|(v, c)| (v, ws + c));
+    }
+    if t.starts_with('[') {
+        return parse_gemma_array(t).map(|(v, c)| (v, ws + c));
+    }
+    let end = t
+        .find(|c| c == ',' || c == '}' || c == ']')
+        .unwrap_or(t.len());
+    Some((parse_param_value(t[..end].trim()), ws + end))
+}
+
+/// Remove leaked `<tool_call>…</tool_call>` (Hermes/XML), `<|tool_call>…<tool_call|>`
+/// (Gemma), `<|tool_call_start|>…<|tool_call_end|>` (LFM2/Fabliq native), and
+/// `<|channel>…<channel|>` (Gemma thinking) blocks from `content`, plus any stray
+/// `<|"|>` delimiters and orphan LFM2 sentinels, so recovered calls / thinking
+/// channels don't also show up as prose.
 pub fn strip_leaked_tool_calls(content: &str) -> String {
+    let out = strip_delimited(content, TOOL_CALL_OPEN, TOOL_CALL_CLOSE);
+    let out = strip_delimited(&out, GEMMA_TC_OPEN, GEMMA_TC_CLOSE);
+    let out = strip_delimited(&out, LFM2_TC_OPEN, LFM2_TC_CLOSE);
+    let out = strip_delimited(&out, GEMMA_CH_OPEN, GEMMA_CH_CLOSE);
+    // A well-formed LFM2 pair is gone above; a MALFORMED call leaves an orphan
+    // start/end sentinel with no partner — nuke those too (the planner-leak shape).
+    out.replace(GEMMA_STR, "")
+        .replace(LFM2_TC_OPEN, "")
+        .replace(LFM2_TC_CLOSE, "")
+        .trim()
+        .to_string()
+}
+
+/// Remove every `open … close` block from `content`. An unterminated final block
+/// (no close) is dropped to the end.
+fn strip_delimited(content: &str, open: &str, close: &str) -> String {
     let mut out = String::new();
     let mut rest = content;
-    while let Some(open) = rest.find(TOOL_CALL_OPEN) {
-        out.push_str(&rest[..open]);
-        let after = &rest[open + TOOL_CALL_OPEN.len()..];
-        match after.find(TOOL_CALL_CLOSE) {
-            Some(close) => rest = &after[close + TOOL_CALL_CLOSE.len()..],
+    while let Some(o) = rest.find(open) {
+        out.push_str(&rest[..o]);
+        let after = &rest[o + open.len()..];
+        match after.find(close) {
+            Some(c) => rest = &after[c + close.len()..],
             None => {
                 rest = "";
                 break;
@@ -1678,7 +2106,7 @@ pub fn strip_leaked_tool_calls(content: &str) -> String {
         }
     }
     out.push_str(rest);
-    out.trim().to_string()
+    out
 }
 
 #[cfg(test)]
@@ -1730,6 +2158,127 @@ mod tests {
     fn parse_shephard_write_ignores_other_shell_commands() {
         assert!(parse_shephard_write("pytest -q && ls -la").is_none());
         assert!(parse_shephard_write("printf %s 'aGk=' | base64 -d > x").is_none()); // no sentinel
+    }
+
+    #[test]
+    fn repair_fixes_fabliqs_double_escaped_newlines() {
+        // The EXACT shape Fabliq emits: literal backslash-n between every line, no
+        // real newlines → the whole file is one physical line.
+        let fabliq = "#!/usr/bin/env python3\\nimport unittest\\n\\ndef test_x():\\n    assert True";
+        assert!(!fabliq.contains('\n'), "precondition: no real newlines");
+        let fixed = repair_double_escaped_content(fabliq);
+        assert_eq!(
+            fixed,
+            "#!/usr/bin/env python3\nimport unittest\n\ndef test_x():\n    assert True"
+        );
+        assert_eq!(fixed.lines().count(), 5, "now a real 5-line file");
+    }
+
+    #[test]
+    fn repair_leaves_correctly_escaped_content_untouched() {
+        // Real newlines present → a model that escapes properly (Qwythos/Gemma). Must
+        // NOT be altered, even though it also contains a literal `\n` in a string.
+        let good = "import os\nx = \"a\\nb\"\nprint(x)\n";
+        assert_eq!(repair_double_escaped_content(good), good);
+        // No literal `\n` at all → untouched.
+        let plain = "x = 1\ny = 2\n";
+        assert_eq!(repair_double_escaped_content(plain), plain);
+        // A genuine one-liner with no newline of any kind → untouched.
+        assert_eq!(repair_double_escaped_content("x = 1"), "x = 1");
+    }
+
+    #[test]
+    fn repair_preserves_intended_literal_backslash_n() {
+        // `\\n` (double-backslash-n) = an intended literal `\n`; C-style pass keeps it.
+        let src = "s = \"col1\\\\ncol2\""; // in the file: s = "col1\\ncol2"
+        assert_eq!(repair_double_escaped_content(src), "s = \"col1\\ncol2\"");
+    }
+
+    #[test]
+    fn collapsed_update_reconstructs_full_file_parts() {
+        // The EXACT shape from session 019f359b: whole old file on one `-` line and
+        // whole new file on one `+` line, separated by LITERAL `\n`.
+        let input = "*** Begin Patch\n*** Update File: /work/lambda_handler.py\n\
+-import requests\\nimport json\\n\\ndef handler(e):\\n    return e\n\
++import requests\\nimport json\\nfrom typing import Any\\n\\ndef handler(e: Any):\\n    return e\n\
+*** End Patch";
+        let (path, old, new) = collapsed_update_patch_parts(input).expect("collapsed shape");
+        assert_eq!(path, "/work/lambda_handler.py");
+        assert_eq!(old, "import requests\nimport json\n\ndef handler(e):\n    return e");
+        assert_eq!(
+            new,
+            "import requests\nimport json\nfrom typing import Any\n\ndef handler(e: Any):\n    return e"
+        );
+    }
+
+    #[test]
+    fn collapsed_update_ignores_well_formed_patch() {
+        // A normal multi-line Update with real newlines and NO literal `\n` is not the
+        // double-escape pathology — leave it to normal apply_patch normalization.
+        let input = "*** Begin Patch\n*** Update File: a.py\n-x = 1\n+x = 2\n*** End Patch";
+        assert!(collapsed_update_patch_parts(input).is_none());
+    }
+
+    #[test]
+    fn collapsed_update_rejects_add_delete_and_multifile() {
+        let add = "*** Begin Patch\n*** Add File: a.py\n+print(1)\\nprint(2)\n*** End Patch";
+        assert!(collapsed_update_patch_parts(add).is_none());
+        let del = "*** Begin Patch\n*** Delete File: a.py\n*** End Patch";
+        assert!(collapsed_update_patch_parts(del).is_none());
+        let multi = "*** Begin Patch\n*** Update File: a.py\n-a\\nb\n+c\\nd\n\
+*** Update File: b.py\n-e\\nf\n+g\\nh\n*** End Patch";
+        assert!(collapsed_update_patch_parts(multi).is_none());
+    }
+
+    #[test]
+    fn expand_collapsed_patch_splits_crammed_hunk_verified() {
+        // THE dominant apply_patch failure (session-observed): three import lines crammed
+        // onto ONE `-` line with literal `\n`, which can never match the file's real
+        // newlines. A PARTIAL hunk (not whole-file), so collapsed_update_patch_parts skips
+        // it — this expands it in place.
+        let file = "import json\nimport requests\nfrom functools import wraps\n\ndef handler():\n    pass\n";
+        let patch = "*** Begin Patch\n*** Update File: lambda_handler.py\n\
+-import json\\nimport requests\\nfrom functools import wraps\n\
++import json\\nimport os\\nimport requests\\nfrom functools import wraps\n\
+*** End Patch";
+        let expanded =
+            expand_collapsed_patch(patch, file).expect("collapsed hunk expands (verified vs disk)");
+        assert!(
+            expanded.contains("-import json\n-import requests\n-from functools import wraps"),
+            "the `-` block became real lines that match the file:\n{expanded}"
+        );
+        assert!(expanded.contains("+import os"));
+        assert!(!expanded.contains("\\n"), "no crammed literal newlines remain:\n{expanded}");
+    }
+
+    #[test]
+    fn expand_collapsed_patch_bails_when_old_block_not_on_disk() {
+        // Wrong split (a genuine `"\n"` string literal, or an imagined edit) → the
+        // expanded OLD block isn't in the file → leave the patch untouched (fall through).
+        let file = "def f():\n    return 1\n";
+        let patch = "*** Begin Patch\n*** Update File: a.py\n-x = \"a\\nb\"\n+x = \"c\"\n*** End Patch";
+        assert!(expand_collapsed_patch(patch, file).is_none());
+    }
+
+    #[test]
+    fn expand_collapsed_patch_none_for_normal_patch() {
+        // A normal (already real-newline) patch has nothing to expand.
+        let file = "a = 1\nb = 2\n";
+        let patch = "*** Begin Patch\n*** Update File: a.py\n-a = 1\n+a = 9\n*** End Patch";
+        assert!(expand_collapsed_patch(patch, file).is_none());
+    }
+
+    #[test]
+    fn base64_write_lands_real_newlines_for_double_escaped_input() {
+        // End-to-end: a double-escaped write_file now base64-encodes REAL newlines,
+        // so the file on disk is multi-line, not one comment.
+        let t = write_file_to_base64_shell(
+            &serde_json::json!({ "path": "t.py", "content": "import os\\nprint(os.getcwd())" }),
+        )
+        .expect("translates");
+        let (_p, content) = parse_shephard_write(&shell_cmd_of(&t)).expect("parses back");
+        assert_eq!(content, "import os\nprint(os.getcwd())");
+        assert!(content.contains('\n') && !content.contains("\\n"));
     }
 
     #[test]
@@ -1810,6 +2359,43 @@ mod tests {
     }
 
     #[test]
+    fn recover_write_file_truncated_write_is_not_double_truncated() {
+        // THE FOOTGUN (session 019f387d class): a truncated write — generation cut
+        // mid-content, no closing quote — whose code has internal quotes. The old
+        // `rfind('"')` dropped everything after the last internal quote (the `"` after
+        // `body` in `result["body"]`), a SECOND truncation on top of the model's that
+        // produced ~217-byte unterminated fragments. The fix keeps the model's content
+        // to the END instead.
+        let raw = "{\"path\":\"live_test.py\",\"content\":\"import json\n    data = json.loads(result[\"body\"])\n    # more code that got cut o";
+        assert!(
+            serde_json::from_str::<JsonValue>(raw).is_err(),
+            "precondition: truncated/invalid JSON"
+        );
+        let content = recover_write_file_args(raw).expect("recovers the partial content")["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            content.ends_with("# more code that got cut o"),
+            "the model's tail is KEPT, not chopped at an internal quote: {content:?}"
+        );
+        assert!(content.contains("data = json.loads(result[\"body\"])"));
+    }
+
+    #[test]
+    fn recover_write_file_complete_write_finds_real_close_past_internal_quotes() {
+        // A COMPLETE write whose content ends with an internal quote then the JSON close.
+        // The REAL close (the `"` before the final `}`) must be used — not an earlier
+        // internal quote, and not the whole tail.
+        let raw = "{\"path\":\"a.py\",\"content\":\"assert x[\"k\"] == 1\"}";
+        let content = recover_write_file_args(raw).expect("recovers")["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(content, "assert x[\"k\"] == 1", "closes at the real terminator");
+    }
+
+    #[test]
     fn recovers_leaked_hermes_tool_call() {
         // The exact shape that leaked in a real session: the model wrote its
         // pytest call as text instead of a structured call.
@@ -1845,6 +2431,97 @@ mod tests {
         assert_eq!(args["max_output_tokens"], 5000); // numeric, not "5000"
         // The block is stripped from the visible content.
         assert!(strip_leaked_tool_calls(leaked).is_empty());
+    }
+
+    #[test]
+    fn recovers_leaked_gemma_tool_call() {
+        // The EXACT dialect Gemma-fable leaked into the reasoner's plan (session
+        // 019f2e45): `<|tool_call>call:NAME{key:<|"|>str<|"|>}<tool_call|>` — neither
+        // Hermes JSON nor XML, so the old parser skipped it entirely.
+        let leaked = "[PLAN]\n<|tool_call>call:Bash{command:<|\"|>curl -s https://api.handle.me/help | grep -i handle<|\"|>,description:<|\"|>Inspect the API<|\"|>}<tool_call|>";
+        assert!(has_leaked_tool_call(leaked));
+        let calls = parse_leaked_tool_calls(leaked);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "Bash");
+        let args: JsonValue =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        // The `|`, `//`, and spaces inside the <|"|>-delimited value survive intact
+        // (a single `|` must NOT be mistaken for the `<|"|>` delimiter).
+        assert_eq!(
+            args["command"],
+            "curl -s https://api.handle.me/help | grep -i handle"
+        );
+        assert_eq!(args["description"], "Inspect the API");
+        let stripped = strip_leaked_tool_calls(leaked);
+        assert!(!stripped.contains("tool_call"));
+        assert!(stripped.contains("[PLAN]"));
+    }
+
+    #[test]
+    fn gemma_tool_call_parses_array_and_scalar_values() {
+        let leaked = "<|tool_call>call:exec{command:[<|\"|>bash<|\"|>,<|\"|>-lc<|\"|>,<|\"|>ls -la<|\"|>],timeout:30,quiet:true}<tool_call|>";
+        let calls = parse_leaked_tool_calls(leaked);
+        assert_eq!(calls.len(), 1);
+        let args: JsonValue =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["command"], serde_json::json!(["bash", "-lc", "ls -la"]));
+        assert_eq!(args["timeout"], 30); // bare number → int
+        assert_eq!(args["quiet"], true); // bare bool
+    }
+
+    #[test]
+    fn gemma_strip_removes_thinking_channel_and_calls() {
+        let content = "before<|channel>thought\nlet me think\n<channel|>after<|tool_call>call:x{}<tool_call|>tail";
+        let stripped = strip_leaked_tool_calls(content);
+        assert!(!stripped.contains("channel"), "channel gone: {stripped}");
+        assert!(!stripped.contains("tool_call"), "call gone: {stripped}");
+        assert!(!stripped.contains("let me think"), "thought gone: {stripped}");
+        assert!(stripped.contains("before") && stripped.contains("after") && stripped.contains("tail"));
+    }
+
+    #[test]
+    fn gemma_truncated_call_recovers_partial_content() {
+        // Generation cut off mid-string (no closing <|"|> and no <tool_call|>).
+        let leaked = "<|tool_call>call:write_file{path:<|\"|>foo.py<|\"|>,content:<|\"|>print(1)";
+        let calls = parse_leaked_tool_calls(leaked);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "write_file");
+        let args: JsonValue =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["path"], "foo.py");
+        assert_eq!(args["content"], "print(1)"); // partial value still recovered
+    }
+
+    #[test]
+    fn gemma_open_does_not_cross_match_hermes() {
+        // `<|tool_call>` must NOT trigger the Hermes `<tool_call>` path, and vice versa.
+        assert!(!"<|tool_call>call:x{}<tool_call|>".contains(TOOL_CALL_OPEN));
+        assert!(!"<tool_call>{}</tool_call>".contains(GEMMA_TC_OPEN));
+    }
+
+    #[test]
+    fn strips_lfm2_native_tool_call_sentinels() {
+        // A WELL-FORMED LFM2/Fabliq native pair is removed wholesale, prose kept.
+        let paired = "Step 1.<|tool_call_start|>read_file(path='x.py')<|tool_call_end|>Step 2.";
+        let s = strip_leaked_tool_calls(paired);
+        assert!(!s.contains("tool_call"), "pair gone: {s}");
+        assert!(s.contains("Step 1.") && s.contains("Step 2."));
+
+        // The EXACT planner-leak shape from session 019f359b: the start token was
+        // consumed by llama.cpp's parser, leaving a MALFORMED call wrapped in JSON
+        // junk with an orphan `<|tool_call_end|>`. It must not survive into the plan.
+        let leaked = "[PLAN]\n{\n  \"read_file(path='resolve_live.py')]<|tool_call_end|>";
+        let s = strip_leaked_tool_calls(leaked);
+        assert!(!s.contains("<|tool_call_end|>"), "orphan sentinel gone: {s}");
+        assert!(s.contains("[PLAN]"));
+    }
+
+    #[test]
+    fn lfm2_open_does_not_cross_match_gemma_or_hermes() {
+        // `<|tool_call_start|>` shares a prefix with `<|tool_call>` (Gemma) — make
+        // sure the two dialects stay distinct and don't mis-strip each other.
+        assert!(!"<|tool_call_start|>f()<|tool_call_end|>".contains(GEMMA_TC_CLOSE));
+        assert!(!"<|tool_call>call:x{}<tool_call|>".contains(LFM2_TC_CLOSE));
     }
 
     #[test]

@@ -382,11 +382,17 @@ fn translate_one_native_call(mut call: serde_json::Value) -> serde_json::Value {
             // fails — the 9B can't produce matching context). A pure Add File is
             // equivalent to writing the whole file, so route it to the robust
             // write_file handler (which overwrites, so it can't hit "Cannot add:
-            // already exists"). Update/Delete patches still normalize as before;
+            // already exists"). Next, a DOUBLE-ESCAPED whole-file Update (the
+            // reasoning-tuned Fabliq collapses the file onto one `-`/`+` line with
+            // literal `\n`) is rewritten to write_file — but ONLY after verifying the
+            // reconstructed old content matches the file on disk, so a partial patch
+            // can never silently truncate. Everything else normalizes as before;
             // failed Updates get steered to a write_file rewrite by the trim layer.
             "apply_patch" => codex_routing::tool_aliases::apply_patch_add_to_write_file(
                 &args_value,
             )
+            .or_else(|| collapsed_update_to_write_file(&args_value))
+            .or_else(|| expand_collapsed_update_patch(&args_value))
             .or_else(|| codex_routing::tool_aliases::normalize_apply_patch_call(&args_value)),
             _ => None,
         });
@@ -575,8 +581,8 @@ struct RoutingState {
     /// stuck turn, ~half the wall-clock).
     active_compact_cache: std::sync::Mutex<Option<ActiveCompactEntry>>,
     /// Pending local-model "nudge" notices — each time a guard intervenes
-    /// (repetition guard, rumination guard, quality gate, completion verifier)
-    /// it queues a one-line message here. The TUI drains these via
+    /// (repetition guard, rumination guard, quality gate, probe gate, completion
+    /// critic) it queues a one-line message here. The TUI drains these via
     /// [`drain_route_notices`] and renders them as history lines so guard
     /// interventions are visible to the user instead of buried in the logs.
     nudges: std::sync::Mutex<Vec<String>>,
@@ -913,6 +919,18 @@ fn local_only_env() -> bool {
     )
 }
 
+/// Effective `local_only` for callers OUTSIDE the routing layer (e.g. the
+/// auto-compaction fork). Prefers the resolved `RoutingState` config — which is
+/// `env OR .codex-multi/config.toml routing.local_only` — and falls back to the
+/// env var only if `RoutingState` hasn't loaded yet. This is why compaction can
+/// honor a config-file `local_only = true`, which [`local_only_env`] alone misses.
+pub(crate) async fn is_local_only() -> bool {
+    if let Some(state) = get_routing_state().await.as_ref() {
+        return state.config.local_only;
+    }
+    local_only_env()
+}
+
 /// Inside the failover loop, decide whether to surface a local-only error
 /// (when local_only is on) or fall through to the default cloud path.
 fn cloud_fallback_or_local_error(state: &RoutingState, reason: &str) -> RouteResult {
@@ -967,11 +985,35 @@ fn role_text_is_product(role: &str) -> bool {
     matches!(role, "light_reasoner" | "light_reasoner_backup")
 }
 
+/// True when `content` is essentially a bare JSON object rather than prose — a weak
+/// model leaking a structured tool call (commonly `update_plan`) into the content
+/// channel. Requires it to START with `{` after trimming AND carry a `"…":` key, so
+/// ordinary prose that merely mentions a brace isn't caught. Tolerant of truncation
+/// (the object may be cut off) — a partial leak is still a leak.
+fn looks_like_bare_json_object(content: &str) -> bool {
+    let t = content.trim();
+    t.starts_with('{') && t.contains("\":")
+}
+
+/// A bare-JSON `update_plan` the model dumped as CONTENT instead of calling the tool:
+/// `{"plan":[{"step":…,"status":…}], "explanation"?:…}`. Validates by deserializing as
+/// the real tool args (so a synthesized call can't fail downstream) and returns the
+/// arguments JSON to feed a genuine update_plan call. `None` when it isn't a well-formed
+/// plan object.
+fn recover_bare_update_plan(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    let args: codex_protocol::plan_tool::UpdatePlanArgs = serde_json::from_str(trimmed).ok()?;
+    if args.plan.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 /// Whether to force `tool_choice="required"` on a re-prompt retry.
 ///
-/// The local-coder massaging escalation (completion verifier / rumination /
-/// quality) re-prompts a model that gave us a no-tool-call response when we
-/// needed an action. By the retry the prose nudge has already failed, so we
+/// The local-coder massaging escalation (probe gate / completion critic /
+/// rumination / quality) re-prompts a model that gave us a no-tool-call response
+/// when we needed an action. By the retry the prose nudge has already failed, so we
 /// enforce the tool call at the sampler. Conditions:
 /// - `continuation_count > 0`: only on a retry, never the first call — so normal
 ///   text-completion and natural loop termination are never blocked.
@@ -1221,19 +1263,31 @@ pub(crate) async fn route_request(prompt: &Prompt) -> RouteResult {
                     items: &prompt.input,
                     system_prompt: &prompt.base_instructions.text,
                     user_instructions: project_instructions.as_deref(),
-                    // Compaction summarizes history, so pinning fresh file
-                    // content doesn't help the compactor and would inflate
-                    // the input. Skip the file-state injection here.
-                    current_files: None,
                     flavor: endpoint.flavor,
                     // Compaction summarizes history; leave its system prompt
                     // alone so the summary keeps full instruction fidelity.
                     system_budget_pct: 0,
+                    // Compaction has no loop-guard prelude to suppress.
+                    suppress_loop_alerts: false,
                 };
-                let trimmed =
-                    codex_routing::trim::trim_for_local(&trim_input, endpoint.trim_budget);
+                // Resolve the compactor's real window the SAME way the coder path
+                // does. The compactor's `trim_budget` is usually UNSET → 0, which
+                // means AUTO ("the budget logic resolves it"). Passing that 0 raw to
+                // `trim_for_local` gave it a 0-token budget, so it truncated ALL
+                // tool-output content to nothing — the compaction pipeline then saw
+                // "No compactable content" and returned an empty summary, and the
+                // model, told nothing had been done, restarted the task from scratch.
+                // Resolving to the true window feeds the pipeline the actual work.
+                let compact_server_ctx = resolve_server_ctx(&endpoint, state).await;
+                let compact_window = effective_window(
+                    endpoint.trim_budget,
+                    endpoint.output_reserve,
+                    compact_server_ctx,
+                );
+                let trimmed = codex_routing::trim::trim_for_local(&trim_input, compact_window);
                 info!(
                     trim_summary = %trimmed.summary.to_log_line(),
+                    compact_window,
                     "Trimmed transcript for compaction input"
                 );
                 // The compaction pipeline expects bare `{role, content}`
@@ -1246,11 +1300,15 @@ pub(crate) async fn route_request(prompt: &Prompt) -> RouteResult {
                     .cloned()
                     .collect();
 
-                let last_msg = extract_last_message(prompt);
-                let current_request = last_msg
-                    .replace("<<<LOCAL_COMPACT>>>", "")
-                    .trim()
-                    .to_string();
+                // The `# Current Request` anchor for the handoff must be the REAL
+                // prior user task — NOT the compaction directive. When the harness
+                // fires compaction, the newest user message IS the directive
+                // ("<<<LOCAL_COMPACT>>> Summarize the thread for continuation…");
+                // using it here hijacks the resuming model into "summarize" and
+                // abandons the real work (the observed session-break). Walk back to
+                // the last genuine user task instead; empty if none (the handoff
+                // then omits the section and the verbatim recent tail carries it).
+                let current_request = extract_real_user_task(prompt).unwrap_or_default();
 
                 let compaction_config = codex_routing::compaction::CompactionConfig::default();
 
@@ -1631,6 +1689,62 @@ pub(crate) async fn route_request(prompt: &Prompt) -> RouteResult {
     }
 }
 
+/// Build the "new response" digest handed to the course-change reasoner: the
+/// coder's reasoning plus the tool call it is about to make, each bounded so the
+/// check stays cheap. Char-boundary safe.
+fn summarize_new_action(reasoning: &str, tool_calls: &[serde_json::Value]) -> String {
+    fn clip(s: &str, max_chars: usize) -> String {
+        if s.chars().count() <= max_chars {
+            s.to_string()
+        } else {
+            let taken: String = s.chars().take(max_chars).collect();
+            format!("{taken}…")
+        }
+    }
+    let calls: Vec<String> = tool_calls
+        .iter()
+        .map(|c| {
+            let f = c.get("function");
+            let name = f
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("?");
+            let args = f
+                .and_then(|f| f.get("arguments"))
+                .map(|a| match a.as_str() {
+                    Some(s) => s.to_string(),
+                    None => a.to_string(),
+                })
+                .unwrap_or_default();
+            format!("{name}({})", clip(&args, 300))
+        })
+        .collect();
+    let flat: String = reasoning.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!(
+        "REASONING: {}\nTOOL CALL: {}",
+        clip(&flat, 1200),
+        calls.join("; ")
+    )
+}
+
+/// One-clause description of the loop the coder is stuck in, derived from which
+/// guard directive is present in the guidance — context for the course-change
+/// reasoner.
+fn loop_summary_from_guidance(guidance: &str) -> String {
+    let s = if guidance.contains("[GATHERING WITHOUT ACTING]") {
+        "reading/searching repeatedly without making any change"
+    } else if guidance.contains("[STUCK — CIRCLING THE SAME PLACES]") {
+        "circling the same files/URLs without progress"
+    } else if guidance.contains("[NO PROGRESS — DIAGNOSE") {
+        "retrying the same failing goal without diagnosing it"
+    } else if guidance.contains("[HARNESS — STUCK") {
+        "stuck in a loop it has repeatedly ignored"
+    } else {
+        "repeating the same action without progress"
+    };
+    s.to_string()
+}
+
 /// Try executing a request on a local Ollama model.
 /// Returns Ok(ResponseStream) on success, Err(FailureType) on failure.
 ///
@@ -1673,13 +1787,6 @@ async fn try_local_model(
     // also still preserved as a user message via the trim's user-message rule.
     let project_instructions = extract_project_instructions(prompt);
 
-    // Re-read every file the active turn has edited so the trimmer can pin
-    // fresh content into the prelude. Without this the model works from
-    // its memory of the pre-patch state and writes patches with stale `-`
-    // lines — the same failure mode that caused multi-turn patch loops in
-    // early local-model sessions (see docs/spec/local-coder-massaging.md).
-    let current_files = load_active_turn_files(&prompt.input);
-
     // Trim the transcript with role-aware semantic compression.
     // Build the tool set up front so we can reserve its token budget: the
     // schemas are sent to the model but added *after* trimming, so the trimmer
@@ -1718,13 +1825,20 @@ async fn try_local_model(
     // before trim consumes the transcript.
     let represented_input = represent_web_search_names(represent_shell_writes(&prompt.input));
 
+    // Post-course-change grace: if the reasoner confirmed a genuine pivot on a
+    // recent turn, spend one turn of grace now — trim will drop this turn's loop
+    // nudges so the new approach can run unobstructed. Consumed ONCE per model
+    // return (here, before the retry loop), keyed by the task text.
+    let grace_task = extract_last_message(prompt);
+    let suppress_loop = codex_routing::reasoned_guidance::consume_loop_grace(&grace_task);
+
     let trim_input = codex_routing::trim::TrimInput {
         items: &represented_input,
         system_prompt: system_prompt_ref,
         user_instructions: project_instructions.as_deref(),
-        current_files: current_files.as_ref(),
         flavor: endpoint.flavor,
         system_budget_pct: state.project_config.routing.system_budget_pct,
+        suppress_loop_alerts: suppress_loop,
     };
     // Size the budget from the server's REAL context window (detected from
     // /props, cached) minus reserves — not the hand-set trim_budget. Then scale by
@@ -1732,7 +1846,12 @@ async fn try_local_model(
     // dense content ~1.8–2.8×). trim_budget is now an optional cap (0 = full
     // window). Falls back to trim_budget if the window can't be detected.
     let server_ctx = resolve_server_ctx(endpoint, state).await;
-    let window = effective_window(endpoint.trim_budget, endpoint.max_tokens, server_ctx);
+    // Publish the coder's real window so the harness can override the model's
+    // (over-large) advertised context window and let native auto-compaction fire.
+    if let Some(n) = server_ctx {
+        CODER_CONTEXT_WINDOW.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+    let window = effective_window(endpoint.trim_budget, endpoint.output_reserve, server_ctx);
     // Tool schemas tokenize at the model's learned ratio and are NOT part of
     // trim's chars/4 estimate. Reserve them in REAL tokens out of the real window
     // FIRST, then calibrate the remainder to estimate space. The old path
@@ -1758,7 +1877,56 @@ async fn try_local_model(
     // (older prelude or the active turn's own middle) via the compaction pipeline
     // and replace it with a single summary message. Cached by hash so we don't
     // recompact identical history each turn.
-    let trimmed = maybe_inline_compact(trimmed, fit_budget, endpoint, state).await;
+    let trimmed = maybe_inline_compact(trimmed, fit_budget, state).await;
+
+    // ── End-of-prompt guidance ────────────────────────────────────────────────
+    // Everything the harness wants the model to DO or KNOW this turn is assembled
+    // into `guidance_parts` and injected as the FINAL message below — NOT the system
+    // prompt — because a small model attends to the END of the context far more than
+    // the beginning (recency). The base prompt stays as the stable system frame.
+    let mut guidance_parts: Vec<String> = Vec::new();
+    // The trim's prelude — now just the loop directive, the AGENTS.md pin, and the
+    // patch-rewrite nudge. (World-state + file/manifest pins were dropped; the LLM
+    // summary and the verbatim transcript carry file state now.)
+    if !trimmed.guidance.trim().is_empty() {
+        guidance_parts.push(trimmed.guidance.clone());
+    }
+
+    // Reasoned guidance (assist #1 — PLAN FIRST): on a new user task, engage the
+    // light reasoner FIRST to draft a small-step plan for this low-context model,
+    // and pin it at the very top of the coder's prompt for the whole turn. The
+    // plan is cached per task, so the reasoner runs ONCE per user turn (not per
+    // step) — the deliberate ceiling, since it shares the local GPU with the
+    // coder. Coder routes only: a reasoner's own text IS its product, so we never
+    // plan for the planner.
+    // `fresh_plan` carries the plan out to the stream builder so it's persisted to
+    // the rollout (as a Reasoning item) once per task, alongside the coder's own
+    // per-turn reasoning — see `ollama_tool_response_to_stream`.
+    let mut fresh_plan: Option<String> = None;
+    // How many times the completion critic (assist #2) has sent the model back
+    // this turn — bounds it so it can't block a "done" claim forever.
+    let mut critic_blocks: u32 = 0;
+    if !text_is_product && state.config.reasoner.enabled {
+        let task = extract_last_message(prompt);
+        if let Some((plan, fresh)) = codex_routing::reasoned_guidance::plan_for_task(
+            state.pool.as_ref(),
+            &state.config.reasoner,
+            &task,
+            &state.project_config.search.brave_api_key,
+        )
+        .await
+        {
+            // Surface the reasoner's plan in the TUI once per task (the same
+            // push_nudge channel the loop guards use), so plan-first is visible
+            // instead of hiding in the system prompt. `fresh` is only true on the
+            // draft step, not the cached reuses across the rest of the turn.
+            if fresh {
+                state.push_nudge(format!("Reasoned guidance — plan-first:\n{plan}"));
+                fresh_plan = Some(plan.clone());
+            }
+            guidance_parts.push(plan);
+        }
+    }
 
     // Surface the loop guards so the user sees the coaching happen, in
     // escalation order:
@@ -1772,7 +1940,12 @@ async fn try_local_model(
     // a real misdiagnosis: a loop where context-reset WAS firing repeatedly read as
     // "escalation never fires" because we were grepping the log for TUI-only text.)
     let rep_count = trimmed.repetition_count.map(|c| c as i64).unwrap_or(-1);
-    if trimmed.system.contains("[HARNESS — STUCK; LOOP REMOVED") {
+    // Set to a short human description of the loop when a repetition/loop guard
+    // fires. When set, thrash → probe → reasoned guidance kicks off below: run the
+    // read-only lint probe and hand its result to the reasoner to author the
+    // coder's next step, grounded in the ACTUAL workspace errors.
+    let mut loop_summary: Option<&str> = None;
+    if trimmed.guidance.contains("[HARNESS — STUCK; LOOP REMOVED") {
         warn!(
             guard = "context_reset",
             repetition_count = rep_count,
@@ -1781,7 +1954,9 @@ async fn try_local_model(
         state.push_nudge(
             "Context-reset guard fired — model ignored the nudges and the hard block; excised the loop from its context and reframed it to the unsolved step".to_string(),
         );
-    } else if trimmed.system.contains("[STOP — REPETITION DETECTED]") {
+        loop_summary =
+            Some("repeating a loop it was already warned about and had excised from context");
+    } else if trimmed.guidance.contains("[STOP — REPETITION DETECTED]") {
         info!(
             guard = "repetition_stop",
             repetition_count = rep_count,
@@ -1790,7 +1965,8 @@ async fn try_local_model(
         state.push_nudge(
             "Repetition guard fired — model was repeating an identical tool call; injected a stop directive".to_string(),
         );
-    } else if trimmed.system.contains("[NO PROGRESS — DIAGNOSE") {
+        loop_summary = Some("repeating the exact same tool call with the same arguments");
+    } else if trimmed.guidance.contains("[NO PROGRESS — DIAGNOSE") {
         warn!(
             guard = "forced_diagnosis",
             repetition_count = rep_count,
@@ -1799,31 +1975,162 @@ async fn try_local_model(
         state.push_nudge(
             "Forced-diagnosis guard fired — model was thrashing; requiring it to read the failure and state the root cause before acting".to_string(),
         );
+        loop_summary = Some("thrashing on the same goal with different commands, and still failing");
+    } else if trimmed
+        .guidance
+        .contains("[STUCK — CIRCLING THE SAME PLACES]")
+    {
+        warn!(
+            guard = "tunnel_vision",
+            repetition_count = rep_count,
+            "Loop guard fired: footprint stopped expanding (circling a fixed set of targets)"
+        );
+        state.push_nudge(
+            "Tunnel-vision guard fired — model was circling the same targets without touching anything new; forced a step-back".to_string(),
+        );
+        loop_summary = Some("circling the same files/targets without touching anything new");
+    } else if trimmed.guidance.contains("[GATHERING WITHOUT ACTING]") {
+        info!(
+            guard = "read_without_write",
+            repetition_count = rep_count,
+            "Loop guard fired: many reads, no writes — nudged to act on what it has"
+        );
+        state.push_nudge(
+            "Read-without-write guard fired — model was searching/fetching/reading without ever acting; nudged it to make a concrete change".to_string(),
+        );
+        loop_summary =
+            Some("reading, searching, and fetching repeatedly without making any concrete change");
     }
-    // A failed apply_patch steers the model to a write_file rewrite (prelude
-    // directive). When the target file is small enough to safely emit in full,
-    // FORCE the write_file tool too, so the model can't keep re-patching — the
-    // decisive fix for the failed-write → bad-edit cycle. Big files get the
-    // directive only (a forced full rewrite of a huge file risks truncation).
-    const MAX_FORCED_REWRITE_BYTES: usize = 24 * 1024; // ~6k tokens
-    let force_write_file = trimmed.patch_rewrite_path.as_ref().is_some_and(|path| {
-        current_files
-            .as_ref()
-            .and_then(|m| {
-                m.get(path).or_else(|| {
-                    let base = path.rsplit('/').next().unwrap_or(path);
-                    m.iter()
-                        .find(|(k, _)| k.rsplit('/').next().unwrap_or(k) == base)
-                        .map(|(_, v)| v)
-                })
-            })
-            .is_some_and(|content| content.len() <= MAX_FORCED_REWRITE_BYTES)
-    });
+    // Reasoned Guidance — CONTEXT REBUILD ON FLAIL (the excise, done right). The excise
+    // is the TOP escalation: the model ignored every softer nudge, and the canned
+    // reframe points it back at the now-STALE transcript. Instead, rebuild a clean
+    // working context from FRESH ground truth — the repeated failing action (from the
+    // trim layer) + the files as they are on disk NOW — and let the reasoner author the
+    // one next step. On success this SUPERSEDES the generic dirty-only redirect below;
+    // on any failure (reasoner off / silent / no signal) the canned excise stands.
+    if trimmed.guidance.contains("[HARNESS — STUCK; LOOP REMOVED")
+        && state.config.reasoner.enabled
+    {
+        let task = extract_last_message(prompt);
+        let gt = gather_loop_ground_truth(prompt, trimmed.repeated_action.clone()).await;
+        if gt.has_signal()
+            && let Some(rebuild) = codex_routing::reasoned_guidance::rebuild_context_from_loop(
+                state.pool.as_ref(),
+                &state.config.reasoner,
+                &task,
+                &gt,
+            )
+            .await
+        {
+            warn!(
+                guard = "context_rebuild",
+                repetition_count = rep_count,
+                "Excise upgraded: reasoner rebuilt a clean working context from fresh ground truth (repeated action + live files)"
+            );
+            state.push_nudge(
+                "Context rebuild — the reasoner rebuilt your working context from the ACTUAL files on disk and chose the next step".to_string(),
+            );
+            guidance_parts.push(rebuild);
+            loop_summary = None; // supersede the generic dirty-only redirect this turn
+        }
+    }
+
+    // Reasoned Guidance assist #3 — THRASH → PROBE → REASONED GUIDANCE. A canned
+    // loop directive is soft prompt text a 9B routinely ignores. When ANY of the
+    // five loop guards fired, run the read-only lint/syntax PROBE for ground truth,
+    // then ask the reasoner to author the coder's NEXT INSTRUCTION grounded in the
+    // real errors — the exact file:line to fix, or (on a clean probe) reasoning past
+    // syntax toward the actual cause. Fallbacks in escalation order: reasoner output
+    // → raw probe grounding (dirty only) → the canned directive already in the
+    // prompt. Bounded per task inside `redirect_from_loop`.
+    if let Some(loop_summary) = loop_summary {
+        // THRASH → GROUND TRUTH → REASONED GUIDANCE. The reasoner is grounded on the
+        // FRESH bundle (`gather_loop_ground_truth`): the repeated failing action + the
+        // dirty-only lint + the actual files on disk. The repeated action is the signal
+        // the old dirty-only gate DROPPED — an action-loop (`cat` a directory,
+        // re-search the same query) has a CLEAN lint, so the reasoner was never called
+        // and only a bare nudge fired, which the model ignores. We now call the reasoner
+        // whenever there is ANY real signal (`has_signal()`), and NEVER on nothing (a
+        // groundless reasoner once hallucinated "add an X-API-Key header") or on the
+        // model's own claims.
+        let gt = gather_loop_ground_truth(prompt, trimmed.repeated_action.clone()).await;
+        let mut grounded = false;
+        if state.config.reasoner.enabled && gt.has_signal() {
+            let task = extract_last_message(prompt);
+            let evidence = recent_evidence(prompt, 2800);
+            if let Some(redirect) = codex_routing::reasoned_guidance::redirect_from_loop(
+                state.pool.as_ref(),
+                &state.config.reasoner,
+                &task,
+                loop_summary,
+                &gt,
+                &evidence,
+            )
+            .await
+            {
+                warn!(
+                    guard = "reasoner_redirect",
+                    "Loop redirect: reasoner authored the coder's next step from fresh ground truth (repeated action + lint + live files)"
+                );
+                state.push_nudge(format!(
+                    "Reasoner redirect — you're looping; the reasoner read the ground truth and chose your next step:\n{redirect}"
+                ));
+                guidance_parts.push(redirect);
+                grounded = true;
+            }
+        }
+        // Reasoner unavailable / silent: if the workspace fails its syntax floor, still
+        // hand over the exact file:line. A clean probe with no repeated signal → the
+        // detector's canned directive already in the prompt stands (we add nothing).
+        if !grounded
+            && let Some(lint_text) = gt.lint_digest.clone()
+        {
+            warn!(
+                guard = "stuck_grounding",
+                "Probe grounding (reasoner unavailable): workspace fails its syntax floor — attached the exact file:line"
+            );
+            state.push_nudge(
+                "Probe grounding fired — the workspace fails its own syntax check; handed the model the exact file:line to fix".to_string(),
+            );
+            guidance_parts.push(format!(
+                "[GROUND TRUTH — the repo's own checks fail] Fix these exact problems; go to the reported line, do not rewrite whole files:\n{lint_text}"
+            ));
+        }
+    }
+
+    // Assemble the final guidance block; injected as the LAST message before the
+    // coder generates (see the tool-capable send path below), so a recency-biased
+    // small model reads it right before it acts.
+    let end_guidance = guidance_parts.join("\n\n");
+    // Did a loop/repetition guard put a directive in the guidance this turn? If
+    // so, the coder's next response is a candidate for a course-change check: it
+    // saw a "you're looping" nudge, and if it now genuinely pivots we want to
+    // pause the guards rather than re-bury the pivot. (During an active grace
+    // window the alert is already suppressed, so this is false — we don't re-fire
+    // the check while the pivot is still running.)
+    let loop_guard_fired = [
+        "[STOP — REPETITION DETECTED]",
+        "[GATHERING WITHOUT ACTING]",
+        "[STUCK — CIRCLING THE SAME PLACES]",
+        "[NO PROGRESS — DIAGNOSE",
+        "[HARNESS — STUCK",
+    ]
+    .iter()
+    .any(|marker| end_guidance.contains(marker));
+    // A failed apply_patch means the model's edit never landed — usually because it
+    // patched a STALE view (the loop keeps rewriting the file, so the patch context no
+    // longer matches disk). Steering it to write_file with a prelude directive does NOT
+    // work — a weak model ignores prose. So we FORCE the write_file tool at the sampler
+    // whenever a patch failed: the model literally cannot emit another stale patch, and
+    // write_file OVERWRITES, so the edit lands regardless of how out-of-date its view is.
+    // No size gate: the old "big files get the directive only" fallback was exactly the
+    // steering that does nothing — i.e. no floor at all. A forced rewrite that truncates a
+    // huge file is caught by the output-truncation guard, strictly better than a no-op.
+    let force_write_file = trimmed.patch_rewrite_path.is_some();
     if let Some(path) = trimmed.patch_rewrite_path.as_ref() {
         state.push_nudge(format!(
-            "Patch failed to apply — steering the model to rewrite {} with write_file (the code it was editing was never actually written){}",
+            "Patch failed to apply — forcing a write_file rewrite of {} (the edit never landed; write_file overwrites regardless of how stale the patch was)",
             path.rsplit('/').next().unwrap_or(path),
-            if force_write_file { "; forcing write_file" } else { "" },
         ));
     }
 
@@ -1861,7 +2168,17 @@ async fn try_local_model(
             })
             .collect();
         let hint = build_tool_hint(&tool_names);
-        let mut system = Some(format!("{trimmed_system}\n\n{hint}"));
+        // Guidance goes in the SYSTEM prompt, not a trailing user message. Placing
+        // it at the end (its own turn) made the model over-attend to the static plan
+        // and RESTART step 1 every turn, stranding its real progress in the
+        // lost-in-the-middle zone it ignores (observed: identical "let me start by
+        // listing the directory" reasoning 67× in one turn). Kept at the front.
+        let guidance_block = if end_guidance.trim().is_empty() {
+            String::new()
+        } else {
+            format!("{end_guidance}\n\n")
+        };
+        let mut system = Some(format!("{guidance_block}{trimmed_system}\n\n{hint}"));
 
         let dropped_tool_names: Vec<&str> = match endpoint.tool_subset {
             codex_routing::config::ToolSubset::Focused => LIGHT_CODER_TOOL_NAMES
@@ -1882,8 +2199,8 @@ async fn try_local_model(
         );
 
         // Loop here so we can re-call the model up to MAX_BAIL_RETRIES times
-        // when the completion verifier flags a "bail" — see the body of the
-        // loop for details. Set to 3 so a model that's making genuine
+        // when it ends a turn with prose and no tool call (a "bail") — see the
+        // body of the loop for details. Set to 3 so a model that's making genuine
         // progress (e.g. ran a probe but hasn't applied the result yet)
         // gets enough nudges to land the change before we give up.
         const MAX_BAIL_RETRIES: usize = 3;
@@ -1971,7 +2288,13 @@ async fn try_local_model(
                     // far we actually overshot rather than trusting the estimate.
                     const OVERFLOW_MARGIN: u64 = 2048;
                     const MIN_CODER_BUDGET: usize = 4096;
-                    let reserve = endpoint.max_tokens.unwrap_or(0) as u64
+                    // Reserve output room the SAME way `effective_window` does —
+                    // the input-side `output_reserve` (NOT the hard-cap `max_tokens`,
+                    // which is usually unset). Missing this left 0 output room on
+                    // the retry → immediate re-truncation.
+                    let reserve = endpoint
+                        .output_reserve
+                        .unwrap_or(CTX_OUTPUT_RESERVE_DEFAULT) as u64
                         + real_tool_reserve as u64
                         + OVERFLOW_MARGIN;
                     // Aim for 80% of the window, not 100%. We scale the MESSAGE
@@ -2013,8 +2336,14 @@ async fn try_local_model(
                     // reserved separately in real tokens via `reserve` above), so
                     // don't subtract the tool estimate again here.
                     let re = codex_routing::trim::trim_for_local(&trim_input, coder_budget);
-                    let re = maybe_inline_compact(re, coder_budget, endpoint, state).await;
-                    system = Some(format!("{}\n\n{hint}", re.system));
+                    let re = maybe_inline_compact(re, coder_budget, state).await;
+                    let re_guidance = if re.guidance.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}\n\n", re.guidance)
+                    };
+                    let re_system = format!("{re_guidance}{}", re.system);
+                    system = Some(format!("{re_system}\n\n{hint}"));
                     effective_messages = re.messages;
                     continue;
                 }
@@ -2028,8 +2357,8 @@ async fn try_local_model(
             };
 
             let detector =
-                codex_routing::rumination_detector::RuminationDetector::from_endpoint_max_tokens(
-                    endpoint.max_tokens,
+                codex_routing::rumination_detector::RuminationDetector::from_reasoning_budget(
+                    endpoint.output_reserve,
                 );
 
             let mut content = String::new();
@@ -2048,6 +2377,10 @@ async fn try_local_model(
 
             let mut rumination_trigger: Option<(usize, usize)> = None;
             let mut stream_ended_cleanly = false;
+            // Set when the server stopped at the output-token cap (done_reason /
+            // finish_reason == "length"). A turn that truncated mid-write_file
+            // produced a cut-off file — see the output-truncation guard below.
+            let mut output_truncated = false;
 
             while let Some(chunk) = stream_rx.recv().await {
                 match chunk {
@@ -2113,12 +2446,14 @@ async fn try_local_model(
                         reasoning_tokens: rt,
                         prompt_ms: pm,
                         gen_ms: gm,
+                        truncated,
                     } => {
                         input_tokens = it;
                         output_tokens = ot;
                         reasoning_tokens_seen = rt;
                         prompt_ms = pm;
                         gen_ms = gm;
+                        output_truncated = truncated;
                         stream_ended_cleanly = true;
                         break;
                     }
@@ -2163,11 +2498,60 @@ async fn try_local_model(
                 return Err(FailureType::ModelUnavailable);
             }
 
+            // Output-truncation guard. The server stopped at the output-token cap
+            // (done_reason / finish_reason == "length"), not a natural stop. If the
+            // model was mid-way through a whole-file `write_file`, the file it would
+            // produce is cut off — the exact footgun where the model then re-reads an
+            // "incomplete" file and rewrites it forever, each rewrite truncating again
+            // at the same cap. Don't emit the partial write: abort it and steer the
+            // model to build the file incrementally (which stays under the cap). The
+            // model gets NO other signal that its output was cut — a plain
+            // "wrote N bytes" reads as success — so this is the only place it learns.
+            if output_truncated && continuation_count < MAX_BAIL_RETRIES {
+                if let Some(path) = truncated_write_path(&tool_call_acc) {
+                    warn!(
+                        %path,
+                        output_tokens,
+                        "Output truncated mid-write; re-prompting for incremental write"
+                    );
+                    let guard = format!(
+                        "[OUTPUT TRUNCATED — YOUR LAST WRITE WAS CUT OFF]\n\
+                         Your previous response hit the output token limit (~{output_tokens} tokens) partway through writing `{path}`, so the file's content was cut off mid-way. That is why re-reading the file shows it ending abruptly — it is NOT a corruption you can fix by rewriting the whole file: a full rewrite will hit the SAME limit and truncate at the same place.\n\
+                         Instead, build the file in SMALL pieces: write only the FIRST portion with write_file, then APPEND each remaining section with edit_file (one small edit at a time). Keep every single tool call well under the output limit."
+                    );
+                    effective_messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": guard,
+                    }));
+                    state.push_nudge(format!(
+                        "Output-truncation guard fired — the write to {path} was cut off at the token limit (~{output_tokens} tok); steering to incremental writes"
+                    ));
+                    continuation_count += 1;
+                    continue;
+                }
+            }
+
             if !reasoning.is_empty() {
-                tracing::debug!(
+                // INFO (not debug) so it survives the default `codex_core=info`
+                // filter, and flattened to a single line so the tail parser can
+                // pick it up. This log is the ONLY window into the model's
+                // thinking: reasoning is deliberately never recorded to the rollout
+                // or fed back into the model's context, so without this it's
+                // invisible even though it drives every decision.
+                let flat: String = reasoning.split_whitespace().collect::<Vec<_>>().join(" ");
+                let shown = if flat.len() > 4000 {
+                    let mut end = 4000;
+                    while end > 0 && !flat.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}… [{} chars total]", &flat[..end], flat.len())
+                } else {
+                    flat
+                };
+                tracing::info!(
                     reasoning_len = reasoning.len(),
                     reasoning_tokens = reasoning_tokens_seen,
-                    reasoning = %reasoning,
+                    reasoning = %shown,
                     "Local coder reasoning channel"
                 );
             }
@@ -2206,6 +2590,26 @@ async fn try_local_model(
                     native_tool_calls = translate_native_tool_calls(wire);
                     content = recovered.content;
                 }
+            }
+
+            // Bare-JSON `update_plan` leak: the model dumps `{"plan":[{"step","status"}]}`
+            // as content instead of calling the tool. It's raw JSON with no dialect
+            // wrapper, so `recover_tool_calls` above misses it — and re-prompting it does
+            // NOT work: the model repeats the same JSON until the bail budget is gone and
+            // the turn dies empty (session 019f38a5). Convert it to a REAL update_plan call
+            // so the plan updates, the turn makes progress, and the retry budget survives
+            // for the completion critic instead of being burned on a leak it can't escape.
+            if native_tool_calls.is_empty()
+                && looks_like_bare_json_object(&content)
+                && let Some(args) = recover_bare_update_plan(&content)
+            {
+                warn!(
+                    "Recovered a bare-JSON update_plan (leaked as content) into a real update_plan call"
+                );
+                native_tool_calls = translate_native_tool_calls(vec![serde_json::json!({
+                    "function": { "name": "update_plan", "arguments": args }
+                })]);
+                content = String::new();
             }
 
             info!(
@@ -2262,12 +2666,40 @@ async fn try_local_model(
                 continue;
             }
 
+            // COURSE-CHANGE RESET (Reasoned Guidance #4). A loop guard fired this
+            // turn, yet the coder just produced a real tool call. Ask the reasoner
+            // whether this is a GENUINE pivot (not the same approach reworded); if
+            // so, grant a short grace window so the transcript-derived guards don't
+            // instantly re-bury the new approach next turn — the exact failure
+            // where the coder worked out "drop the /v1" but never got an
+            // unobstructed turn to try it. Strict + bounded inside `course_change`.
+            if loop_guard_fired
+                && !native_tool_calls.is_empty()
+                && state.config.reasoner.enabled
+                && codex_routing::reasoned_guidance::course_change(
+                    &state.pool,
+                    &state.config.reasoner,
+                    &last_user_message,
+                    &loop_summary_from_guidance(&end_guidance),
+                    &summarize_new_action(&reasoning, &native_tool_calls),
+                )
+                .await
+            {
+                codex_routing::reasoned_guidance::grant_loop_grace(&last_user_message);
+                codex_routing::reasoned_guidance::reset_redirect_budget(&last_user_message);
+                state.push_nudge(
+                    "Reasoner confirmed a genuine course change — loop guards paused for a few \
+                     turns so the new approach can run"
+                        .to_string(),
+                );
+            }
+
             // Deterministic quality gate: discard obviously-broken text-only
             // responses (empty, too short, prompt echo, model refusal, empty
             // code fence, degenerate repetition) and re-prompt. Cheap and runs
-            // before the LLM-based completion verifier so we don't spend a
-            // verifier call judging garbage. Only applies to text-only
-            // responses — a tool call is the model making progress.
+            // before the reasoner completion critic so we don't spend a reasoner
+            // call judging garbage. Only applies to text-only responses — a tool
+            // call is the model making progress.
             if native_tool_calls.is_empty()
                 && continuation_count < MAX_BAIL_RETRIES
                 && let Some(reason) =
@@ -2290,18 +2722,21 @@ async fn try_local_model(
 
             // No-tool-call handling, gated on GROUND TRUTH. The quality gate
             // above catches broken output; this catches "produced prose instead
-            // of acting". We combine what the model *did* (files actually
-            // modified this task, witnessed in the transcript — not timestamps)
-            // with what it *says* (the completion verifier):
+            // of acting". The decision rests on what the model *did* — files
+            // actually modified this task, witnessed in the transcript, not
+            // timestamps:
             //
             //  - A coder that changed nothing is bailing/bluffing no matter how
-            //    confident it sounds. Nudge it without spending a verifier call,
-            //    and NEVER let it finish on an unbacked "done". This is the hard
-            //    guard against "claimed done but wrote nothing".
-            //  - Otherwise consult the verifier. A coder may only FINISH on an
-            //    explicit `Complete` (and here its claim is ground-truth-backed);
-            //    a reasoner (text-only by design) finishes unless it's an
-            //    explicit `Bail`. Anything else re-prompts.
+            //    confident it sounds. Nudge it to act, and NEVER let it finish on
+            //    an unbacked "done". This is the hard guard against "claimed done
+            //    but wrote nothing".
+            //  - A coder that DID change files may finish — but only if its code
+            //    passes the repo's own diagnostics (probe gate) AND the reasoner
+            //    completion critic finds the work actually complete. A reasoner
+            //    (text-only by design) finishes here. Anything blocked re-prompts.
+            //    (There is no small-model text-shape "verifier" anymore — it
+            //    false-negatived on finished work and trapped a done coder in a
+            //    done→act→`ls` loop; ground truth + probe + critic replace it.)
             // A `<tool_call>` block still present here means recovery above
             // couldn't parse it — the model tried to call a tool but emitted
             // MALFORMED JSON (commonly a heredoc / multi-line command whose
@@ -2332,12 +2767,56 @@ async fn try_local_model(
                 continue;
             }
 
+            // Bare-JSON tool-call leak. A weak model (Fabliq) emits a STRUCTURED tool
+            // call — commonly `update_plan` — as a JSON object in the CONTENT channel
+            // instead of a real tool call. It isn't one of the recognized leaked-call
+            // dialects (`<tool_call>`/XML/Gemma), so it leaks to the TUI raw (a `{` and
+            // JSON-escaped `\n`) AND gets mistaken for the final answer (a plan-as-JSON
+            // masquerading as completed work → false `task_complete`). A bare JSON
+            // object is NEVER a valid deliverable for EITHER role — a coder should call
+            // the tool, a reasoner should write prose — so this fires regardless of
+            // `text_is_product`. Gating it on `!text_is_product` let a `light_reasoner`
+            // turn emit `{ "plan": …}` and have it ACCEPTED as the final answer (the
+            // false completion that ended session 019f35d3, since the completion gate is
+            // also skipped for a text-product role). Bounded by MAX_BAIL_RETRIES.
             if native_tool_calls.is_empty()
-                && !content.trim().is_empty()
                 && continuation_count < MAX_BAIL_RETRIES
+                && looks_like_bare_json_object(&content)
             {
+                warn!(
+                    text_is_product,
+                    "Local model emitted a bare JSON object as content (leaked tool call / plan-as-JSON); re-prompting"
+                );
+                state.push_nudge(
+                    "Bare-JSON leak — the model dumped a JSON object as text instead of a real action or answer; re-prompting".to_string(),
+                );
+                let continuation = "Your last turn was a raw JSON object, not a real action or answer — \
+                    it was NOT executed and nothing happened. A bare `{...}` is never a valid response. \
+                    Either make a REAL tool call (e.g. `update_plan`, `write_file`, `exec_command`), or \
+                    write your actual answer in plain prose. Never output a JSON object as your response.";
+                effective_messages.push(serde_json::json!({"role": "assistant", "content": content}));
+                effective_messages.push(serde_json::json!({"role": "user", "content": continuation}));
+                continuation_count += 1;
+                continue;
+            }
+
+            // The completion gate (probe + critic) below runs on EVERY text-only
+            // completion candidate — NOT only while re-prompt budget remains. Gating
+            // the CHECK on `continuation_count < MAX_BAIL_RETRIES` was a real bug: a
+            // turn that thrashed enough to exhaust its budget had its (often FALSE)
+            // "done" accepted with no probe and no critic — the more a model flailed,
+            // the more likely its false completion sailed through unchecked. The budget
+            // now bounds only the RE-PROMPT action (below), never the verification.
+            if native_tool_calls.is_empty() && !content.trim().is_empty() {
                 let did_real_work =
                     !codex_routing::trim::files_modified_in_active_turn(&prompt.input).is_empty();
+
+                // Set by the linter Probe below when the code on disk doesn't pass
+                // its own checker; used as the (more specific) re-prompt text.
+                let mut probe_nudge: Option<String> = None;
+                // Set by the completion critic (assist #2) when the reasoner judges a
+                // passed-the-gates "done" claim not actually complete.
+                let mut critique_nudge: Option<String> = None;
 
                 let reprompt: Option<&str> = if !text_is_product && !did_real_work {
                     Some(
@@ -2346,65 +2825,176 @@ async fn try_local_model(
                 } else if last_user_message.trim().is_empty() {
                     None
                 } else {
-                    let verifier_endpoint = if state.config.classifier.enabled {
-                        &state.config.classifier
-                    } else {
-                        &state.config.light_coder
-                    };
-                    let verdict = codex_routing::completion_verifier::verify_completion(
-                        &last_user_message,
-                        &content,
-                        verifier_endpoint,
-                        &state.pool,
-                    )
-                    .await;
-                    info!(
-                        verdict = ?verdict,
-                        did_real_work,
-                        "Completion verifier judged a no-tool-call response"
-                    );
-                    use codex_routing::completion_verifier::CompletionVerdict;
-                    let finish = if text_is_product {
-                        // Reasoner: text is its product; finish unless it bailed.
-                        !matches!(verdict, CompletionVerdict::Bail)
-                    } else {
-                        // Coder/actor: only a confident completion ends the turn,
-                        // and its work is already ground-truth-backed here.
-                        matches!(verdict, CompletionVerdict::Complete)
-                    };
+                    // No small-model text-shape verifier here. A coder that DID real
+                    // work (ground truth, checked above) and stopped is a completion
+                    // CANDIDATE; the real gates are the probe gate (its code passes the
+                    // repo's own checks) and the reasoner completion critic (the work
+                    // is actually done — no shortcuts). A reasoner's text IS its
+                    // product, so it finishes here; empty/broken text was already
+                    // rejected by the quality gate. Removing the verifier kills the loop
+                    // it caused: a FINISHED coder whose phrasing ("let me verify") read
+                    // as a bail could never escape — it kept being told "you did
+                    // nothing, act" and answered with pointless `ls` forever. The
+                    // smarter reasoner critic below now owns the "is it really done?"
+                    // judgment.
+                    let mut finish = true;
+                    // Fresh lint/test probe results, captured for the completion critic
+                    // below EVEN WHEN the deterministic gate passes — so a "done" claim
+                    // whose tests never ran (no file:line findings, so the gate is silent)
+                    // reaches the critic as ground truth instead of a blind judgment.
+                    let mut probe_digest = String::new();
+                    // Ground-truth completion gate (the Probe system): a coder is not
+                    // "done" while its code fails the repo's OWN diagnostics. Runs the
+                    // top-ranked SAFE probe AND the top TEST probe (discovery ranks
+                    // typecheck/lint above tests, so a top-1 run would green-light a repo
+                    // whose tests fail — a false completion sailed through exactly that
+                    // way) plus the always-available syntax floor, only when we were
+                    // about to accept completion. The exact file:line becomes the
+                    // re-prompt, so the model fixes the reported line, not blind rewrites.
+                    if finish && !text_is_product {
+                        if let Ok(dir) = std::env::current_dir() {
+                            let checked = tokio::task::spawn_blocking(move || {
+                                let report = codex_routing::probe_run::run_completion_probes(
+                                    &dir,
+                                    std::time::Duration::from_secs(45),
+                                );
+                                let floor = codex_routing::linter_probe::run_linter_probe(&dir);
+                                (report, floor)
+                            })
+                            .await;
+                            if let Ok((report, floor)) = checked {
+                                // TRUTH CAPTURE: which probes ran + how many findings +
+                                // whether the syntax floor was clean — so a completion
+                                // that passed the gate is auditable, not a silent event.
+                                info!(
+                                    probes_run = report.results.len(),
+                                    commands = ?report.selected.iter().map(|c| c.command.join(" ")).collect::<Vec<_>>(),
+                                    findings = report.results.iter().map(|r| r.findings.len()).sum::<usize>(),
+                                    floor_clean = floor.is_clean(),
+                                    "Completion probe gate ran (truth capture)"
+                                );
+                                // Capture the digest regardless of the block outcome — the
+                                // critic needs "ran clean" vs "did not run" even when the
+                                // gate found nothing structured to block on.
+                                probe_digest = codex_routing::probe_run::completion_probe_digest(
+                                    &report, &floor,
+                                );
+                                if let Some(n) = codex_routing::probe_run::completion_block_nudge(
+                                    &report, &floor,
+                                ) {
+                                    warn!(
+                                        probes = report.results.len(),
+                                        "Probe gate blocked completion — repo diagnostics failed"
+                                    );
+                                    probe_nudge = Some(n);
+                                    finish = false;
+                                }
+                            }
+                        }
+                    }
+                    // Reasoned Guidance assist #2 — COMPLETION CRITIC. The gates above
+                    // are deterministic and cannot catch semantic shortcuts: tests
+                    // passing for the wrong reason, an error accepted as success, a
+                    // skipped requirement. On a "done" claim that passed them, spend ONE
+                    // reasoner call to review the actual work against the task. Bounded by
+                    // `critic_blocks` so it can't nag forever.
+                    if finish
+                        && !text_is_product
+                        && state.config.reasoner.enabled
+                        && critic_blocks < COMPLETION_CRITIC_MAX_BLOCKS
+                    {
+                        let mut evidence = recent_evidence(prompt, 3200);
+                        if !content.trim().is_empty() {
+                            evidence.push_str(&format!(
+                                "\n\nFINAL CLAIM (model declared the task done): {}",
+                                truncate_ev(&content, 500)
+                            ));
+                        }
+                        if let Some(critique) =
+                            codex_routing::reasoned_guidance::critique_completion(
+                                state.pool.as_ref(),
+                                &state.config.reasoner,
+                                &last_user_message,
+                                &evidence,
+                                &probe_digest,
+                            )
+                            .await
+                        {
+                            warn!(
+                                "Completion critic (reasoner) blocked completion — shortcuts/assumptions/gaps"
+                            );
+                            state.push_nudge(
+                                "Completion critic — the reasoner found the task not fully done; sending it back with specifics".to_string(),
+                            );
+                            critique_nudge = Some(critique);
+                            critic_blocks += 1;
+                            finish = false;
+                        }
+                    }
                     if finish {
                         None
                     } else {
                         Some(
-                            "Completion check fired — task isn't shown as done; re-prompting to act",
+                            "Completion gate fired — repo diagnostics or the reviewer flagged it; re-prompting",
                         )
                     }
                 };
 
                 if let Some(notice) = reprompt {
-                    warn!("Re-prompting local model after a no-tool-call turn: {notice}");
-                    state.push_nudge(notice.to_string());
-                    let continuation = codex_routing::completion_verifier::continuation_prompt(
-                        &content,
-                        continuation_count,
-                    );
-                    effective_messages.push(serde_json::json!({
-                        "role": "assistant",
-                        "content": content,
-                    }));
-                    effective_messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": continuation,
-                    }));
-                    continuation_count += 1;
-                    continue;
+                    if continuation_count < MAX_BAIL_RETRIES {
+                        warn!("Re-prompting local model after a no-tool-call turn: {notice}");
+                        state.push_nudge(notice.to_string());
+                        // Prefer a GROUNDED re-prompt: the completion probe's exact
+                        // errors, else the completion critic's issues. Only if neither
+                        // fired do we use the no-action continuation — which is a
+                        // deliberately MECHANICAL protocol nudge (it states "no tool ran,
+                        // so nothing happened" and demands a tool call; it does not author
+                        // an approach), bounded by MAX_BAIL_RETRIES. See the Phase 4
+                        // reclassification in docs/spec/reasoned-guidance-refactor.md.
+                        let continuation = match probe_nudge.take().or_else(|| critique_nudge.take()) {
+                            Some(n) => n,
+                            None => codex_routing::no_action_prompt::continuation_prompt(
+                                &content,
+                                continuation_count,
+                            ),
+                        };
+                        effective_messages.push(serde_json::json!({
+                            "role": "assistant",
+                            "content": content,
+                        }));
+                        effective_messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": continuation,
+                        }));
+                        continuation_count += 1;
+                        continue;
+                    } else {
+                        // Re-prompt budget spent. The gate STILL ran (it is no longer
+                        // skipped on exhaustion — that was the bug). We can't re-prompt
+                        // forever, but we must NOT accept SILENTLY: surface the flagged
+                        // "done" so a false completion is visible, not mistaken for clean.
+                        let flagged = probe_nudge.take().or_else(|| critique_nudge.take());
+                        warn!(
+                            continuation_count,
+                            gate_flagged = flagged.is_some(),
+                            "Completion accepted despite the completion gate flagging it — re-prompt budget exhausted"
+                        );
+                        if let Some(f) = flagged {
+                            state.push_nudge(format!(
+                                "Completion gate flagged this 'done' but the re-prompt budget is spent — \
+                                 accepting with UNRESOLVED issues:\n{f}"
+                            ));
+                        }
+                        // Fall through to accept (the return below).
+                    }
                 }
             }
 
             return Ok(ollama_tool_response_to_stream(
                 content,
                 native_tool_calls,
-                model_name.clone(),
+                reasoning.clone(),
+                fresh_plan.clone(),
                 input_tokens,
                 output_tokens,
             ));
@@ -2581,11 +3171,10 @@ fn ollama_response_to_stream(response: OllamaTextResponse) -> ResponseStream {
         let _ = tx
             .send(Ok(ResponseEvent::Completed {
                 response_id: "local_response".to_string(),
-                token_usage: Some(TokenUsage {
-                    input_tokens: response.input_tokens as i64,
-                    output_tokens: response.output_tokens as i64,
-                    ..Default::default()
-                }),
+                token_usage: Some(local_token_usage(
+                    response.input_tokens as i64,
+                    response.output_tokens as i64,
+                )),
             }))
             .await;
     });
@@ -2595,17 +3184,75 @@ fn ollama_response_to_stream(response: OllamaTextResponse) -> ResponseStream {
 
 /// Convert an Ollama response with native tool_calls to a ResponseStream.
 /// Handles both native Ollama tool_calls and embedded JSON tool calls.
+/// Build a rollout `Reasoning` item. Used to persist the local model's thinking
+/// (and the plan-first block) to the rollout for observability — a tail script's
+/// `--reasoning`, after-the-fact audit — WITHOUT feeding it back to the model:
+/// the trim treats old reasoning as single-use exhaust and drops it from the next
+/// prompt (see `codex_routing::trim::rules`). `label` becomes the reasoning
+/// summary so the tail can tell a plan from ordinary thinking.
+fn reasoning_item(label: &str, text: &str) -> ResponseItem {
+    ResponseItem::Reasoning {
+        id: String::new(),
+        summary: vec![
+            codex_protocol::models::ReasoningItemReasoningSummary::SummaryText {
+                text: label.to_string(),
+            },
+        ],
+        content: Some(vec![
+            codex_protocol::models::ReasoningItemContent::ReasoningText {
+                text: text.to_string(),
+            },
+        ]),
+        encrypted_content: None,
+    }
+}
+
 fn ollama_tool_response_to_stream(
     content: String,
     native_tool_calls: Vec<serde_json::Value>,
-    model: String,
+    reasoning: String,
+    plan: Option<String>,
     input_tokens: u64,
     output_tokens: u64,
 ) -> ResponseStream {
+    // A bare-JSON blob — e.g. `update_plan` emitted as `{"plan":…}` — is NEVER prose,
+    // whether or not a real tool call rides alongside it. Blank it so it can't stream to
+    // the TUI as raw JSON with escaped `\n` (and can't be recorded as the final answer).
+    // The no-tool-call case is normally caught UPSTREAM by a re-prompt, but that is
+    // bounded by MAX_BAIL_RETRIES; this is the final safety net that keeps a stubborn
+    // model's exhausted-retry `{"plan":…}` off the screen (the false completion that
+    // ended session 019f35d3). A genuine answer never starts with a bare `{ "…":` — and
+    // if the model still emits one after 3 "write prose, not JSON" nudges, empty is
+    // strictly better than showing garbage as the answer.
+    let content = if looks_like_bare_json_object(&content) {
+        String::new()
+    } else {
+        content
+    };
+
     let (tx, rx) = mpsc::channel(16);
 
     tokio::spawn(async move {
         let _ = tx.send(Ok(ResponseEvent::Created)).await;
+
+        // Persist the plan-first block (once per task) and the model's reasoning
+        // to the rollout as Reasoning items — visible to a tail / audit, then
+        // dropped from the next prompt by the trim ("single-use exhaust"), so the
+        // model's context is unchanged. Plan first so it reads before the thinking.
+        if let Some(plan) = plan.filter(|p| !p.is_empty()) {
+            let item = reasoning_item("Plan-first (reasoned guidance)", &plan);
+            let _ = tx
+                .send(Ok(ResponseEvent::OutputItemAdded(item.clone())))
+                .await;
+            let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+        }
+        if !reasoning.is_empty() {
+            let item = reasoning_item("Reasoning", &reasoning);
+            let _ = tx
+                .send(Ok(ResponseEvent::OutputItemAdded(item.clone())))
+                .await;
+            let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+        }
 
         // Emit text content if any
         if !content.is_empty() {
@@ -2669,11 +3316,7 @@ fn ollama_tool_response_to_stream(
         let _ = tx
             .send(Ok(ResponseEvent::Completed {
                 response_id: "local_response".to_string(),
-                token_usage: Some(TokenUsage {
-                    input_tokens: input_tokens as i64,
-                    output_tokens: output_tokens as i64,
-                    ..Default::default()
-                }),
+                token_usage: Some(local_token_usage(input_tokens as i64, output_tokens as i64)),
             }))
             .await;
     });
@@ -2747,11 +3390,10 @@ fn ollama_response_to_stream_with_tools(response: OllamaTextResponse) -> Respons
         let _ = tx
             .send(Ok(ResponseEvent::Completed {
                 response_id: "local_response".to_string(),
-                token_usage: Some(TokenUsage {
-                    input_tokens: response.input_tokens as i64,
-                    output_tokens: response.output_tokens as i64,
-                    ..Default::default()
-                }),
+                token_usage: Some(local_token_usage(
+                    response.input_tokens as i64,
+                    response.output_tokens as i64,
+                )),
             }))
             .await;
     });
@@ -2784,6 +3426,72 @@ fn extract_last_message(prompt: &Prompt) -> String {
     String::new()
 }
 
+/// Max times the completion critic may block a single turn before it lets the
+/// model finish — a guard that fires forever is not a guard.
+const COMPLETION_CRITIC_MAX_BLOCKS: u32 = 2;
+
+/// Build a bounded, chronological digest of the recent transcript — tool calls,
+/// their outputs (with success/fail), and assistant messages — for the completion
+/// critic (`reasoned_guidance::critique_completion`) to review. Focused on tool
+/// OUTPUTS, where the real evidence lives (an API 404, a suspicious test pass).
+/// Collected newest-first up to `budget` chars, then reversed to read in order.
+fn recent_evidence(prompt: &Prompt, budget: usize) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    for item in prompt.input.iter().rev() {
+        if used >= budget {
+            break;
+        }
+        let line = match item {
+            ResponseItem::FunctionCall {
+                name, arguments, ..
+            } => format!("TOOL {name} {}", truncate_ev(arguments, 160)),
+            ResponseItem::FunctionCallOutput { output, .. } => {
+                let tag = if output.success == Some(false) {
+                    "[FAILED] "
+                } else {
+                    ""
+                };
+                format!(
+                    "  -> {tag}{}",
+                    truncate_ev(&output.body.to_text().unwrap_or_default(), 400)
+                )
+            }
+            ResponseItem::Message { role, content, .. } if role == "assistant" => {
+                let text: String = content
+                    .iter()
+                    .filter_map(|c| match c {
+                        ContentItem::OutputText { text } | ContentItem::InputText { text } => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if text.trim().is_empty() {
+                    continue;
+                }
+                format!("ASSISTANT: {}", truncate_ev(&text, 300))
+            }
+            _ => continue,
+        };
+        used += line.len();
+        lines.push(line);
+    }
+    lines.reverse();
+    lines.join("\n")
+}
+
+/// Trim to `n` chars with an ellipsis, on a char boundary.
+fn truncate_ev(s: &str, n: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    let end = s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len());
+    format!("{}…", &s[..end])
+}
+
 /// Count recent tool calls and turns from conversation history.
 fn count_recent_activity(prompt: &Prompt) -> (usize, usize) {
     let mut tool_calls = 0;
@@ -2803,35 +3511,266 @@ fn count_recent_activity(prompt: &Prompt) -> (usize, usize) {
     (tool_calls, turns)
 }
 
-/// Read every file the active turn has edited (via `apply_patch` Add/Update)
-/// and return a `path -> current_content` map. Missing files, unreadable
-/// files, and non-UTF-8 files are silently skipped. Returns `None` when the
-/// active turn hasn't modified any files, so the trimmer's file-state block
-/// is omitted entirely in the common case.
-///
-/// Paths are resolved against the process `cwd` — matching how every other
-/// local-coder tool handler in this crate resolves paths. The trimmer has
-/// no IO of its own by design; this function is the only place the routing
-/// layer reads from disk on behalf of the prelude builder.
-fn load_active_turn_files(
-    items: &[codex_protocol::models::ResponseItem],
-) -> Option<std::collections::HashMap<String, String>> {
-    let paths = codex_routing::trim::files_modified_in_active_turn(items);
-    if paths.is_empty() {
+/// If the accumulated stream tool calls include a whole-file write that was still
+/// being generated when the stream truncated, return the target path — used by the
+/// output-truncation guard to name the file and steer to incremental writes. The
+/// `path` field precedes `content` in the args, so it survives a mid-`content`
+/// truncation even when the JSON as a whole is left unterminated; a plain scan
+/// recovers it without needing valid JSON.
+fn truncated_write_path(
+    acc: &std::collections::BTreeMap<usize, StreamToolCallAcc>,
+) -> Option<String> {
+    for call in acc.values() {
+        if !matches!(call.name.as_deref(), Some("write_file") | Some("create_file")) {
+            continue;
+        }
+        let args = call.arguments.as_str();
+        for key in ["\"path\"", "\"file_path\"", "\"filename\""] {
+            let Some(i) = args.find(key) else { continue };
+            let Some((_, after_key)) = args[i..].split_once(':') else {
+                continue;
+            };
+            let Some(open) = after_key.find('"') else { continue };
+            let tail = &after_key[open + 1..];
+            if let Some(close) = tail.find('"') {
+                let p = tail[..close].trim();
+                if !p.is_empty() {
+                    return Some(p.to_string());
+                }
+            }
+        }
+        return Some("the file".to_string());
+    }
+    None
+}
+
+/// Verified collapsed-Update → `write_file`. The reasoning-tuned Fabliq emits an
+/// `apply_patch` Update whose hunk body is the whole file collapsed onto one `-`/`+`
+/// line with LITERAL `\n` separators (double-escaped), so apply_patch's context never
+/// matches and it fails every time. [`collapsed_update_patch_parts`] reconstructs
+/// `(path, old, new)` from that shape; here we PROVE it is a complete replacement by
+/// reading the file and checking the reconstructed OLD content equals what is on disk
+/// (exactly, or modulo a single trailing newline — files conventionally end in `\n`
+/// but the collapsed line often omits it). Only then do we rewrite to the robust
+/// `write_file` path. Any mismatch → `None`, and the call falls through to normal
+/// apply_patch normalization (failing as it does today, with no risk of truncation).
+fn collapsed_update_to_write_file(
+    args: &serde_json::Value,
+) -> Option<codex_routing::tool_aliases::TranslatedCall> {
+    let input = args
+        .get("input")
+        .or_else(|| args.get("patch"))
+        .and_then(|v| v.as_str())?;
+    let (path, old_content, new_content) =
+        codex_routing::tool_aliases::collapsed_update_patch_parts(input)?;
+
+    let candidate = match std::env::current_dir().ok() {
+        Some(base) => base.join(&path),
+        None => std::path::PathBuf::from(&path),
+    };
+    let disk = std::fs::read_to_string(&candidate).ok()?;
+
+    // The reconstructed OLD block must account for the ENTIRE file — exactly, or with
+    // exactly one trailing newline of slack on either side. That proves it is a full
+    // replacement, so writing `new` cannot drop content the patch never mentioned.
+    let full_match = disk == old_content
+        || disk.strip_suffix('\n') == Some(old_content.as_str())
+        || Some(disk.as_str()) == old_content.strip_suffix('\n');
+    if !full_match {
         return None;
     }
-    let cwd = std::env::current_dir().ok();
-    let mut out = std::collections::HashMap::with_capacity(paths.len());
-    for path in paths {
-        let candidate = match &cwd {
-            Some(base) => base.join(&path),
-            None => std::path::PathBuf::from(&path),
-        };
-        if let Ok(content) = std::fs::read_to_string(&candidate) {
-            out.insert(path, content);
+
+    // Preserve the file's trailing-newline convention across the rewrite.
+    let content = if disk.ends_with('\n') && !new_content.ends_with('\n') {
+        format!("{new_content}\n")
+    } else {
+        new_content
+    };
+
+    info!(
+        path = %path,
+        bytes = content.len(),
+        "apply_patch Update (double-escaped, verified full-file) -> write_file"
+    );
+    Some(codex_routing::tool_aliases::TranslatedCall {
+        name: "write_file",
+        args: serde_json::json!({ "path": path, "content": content }),
+        command_line: format!("apply_patch Update (verified full-file) -> write_file ({path})"),
+    })
+}
+
+/// Expand a COLLAPSED apply_patch — multi-line content crammed onto one `-`/`+` line with
+/// literal `\n` — into a real multi-line hunk apply_patch can match. This is the DOMINANT
+/// apply_patch failure (~2/3 of all failures observed: the `-` line can never match the
+/// file's real newlines). Reads the target file, hands it to
+/// [`codex_routing::tool_aliases::expand_collapsed_patch`] (which verifies the expanded
+/// OLD block appears on disk before trusting the split), and returns a normal apply_patch
+/// with the expanded body. `None` — fall through to normal normalization — when it isn't a
+/// collapsed patch, the file can't be read, or the expansion doesn't verify.
+fn expand_collapsed_update_patch(
+    args: &serde_json::Value,
+) -> Option<codex_routing::tool_aliases::TranslatedCall> {
+    let input = args
+        .get("input")
+        .or_else(|| args.get("patch"))
+        .and_then(|v| v.as_str())?;
+    let path = input
+        .lines()
+        .find_map(|l| l.strip_prefix("*** Update File: "))?
+        .trim()
+        .to_string();
+    if path.is_empty() || !input.contains("\\n") {
+        return None; // no literal `\n` → nothing to expand; skip the disk read
+    }
+    let candidate = match std::env::current_dir().ok() {
+        Some(base) => base.join(&path),
+        None => std::path::PathBuf::from(&path),
+    };
+    let disk = std::fs::read_to_string(&candidate).ok()?;
+    let expanded = codex_routing::tool_aliases::expand_collapsed_patch(input, &disk)?;
+    let mut new_args = args.as_object()?.clone();
+    new_args.insert("input".to_string(), serde_json::Value::String(expanded));
+    new_args.remove("patch");
+    info!(
+        path = %path,
+        "apply_patch: expanded a collapsed (literal-\\n) hunk into real lines, verified against disk"
+    );
+    Some(codex_routing::tool_aliases::TranslatedCall {
+        name: "apply_patch",
+        args: serde_json::Value::Object(new_args),
+        command_line: format!("apply_patch (expanded collapsed hunk, verified) ({path})"),
+    })
+}
+
+/// Assemble the fresh ground truth for a loop intervention — the single gatherer both
+/// the excise rebuild and the loop redirect use: the repeated failing action (from the
+/// trim layer), the files the model touched this turn re-read from disk, and the
+/// dirty-only lint. The fs reads + lint probe run off-thread (they block).
+async fn gather_loop_ground_truth(
+    prompt: &Prompt,
+    repeated: Option<codex_routing::ground_truth::RepeatedAction>,
+) -> codex_routing::ground_truth::GroundTruth {
+    let paths = files_touched_this_turn(prompt);
+    let gathered = tokio::task::spawn_blocking(move || {
+        std::env::current_dir().ok().map(|root| {
+            let files = codex_routing::ground_truth::file_snapshot(
+                &root,
+                &paths,
+                codex_routing::ground_truth::DEFAULT_FILE_CAP,
+            );
+            let lint = codex_routing::ground_truth::lint_digest(&root);
+            (files, lint)
+        })
+    })
+    .await
+    .ok()
+    .flatten();
+    let mut gt = codex_routing::ground_truth::GroundTruth {
+        repeated,
+        ..Default::default()
+    };
+    if let Some((files, lint)) = gathered {
+        gt.files = files;
+        gt.lint_digest = lint;
+    }
+    gt
+}
+
+/// The files the model touched this turn — write/edit/patch/read targets — most-recent
+/// first, deduped and capped. This is the set the ground-truth provider re-reads from
+/// disk so a reasoned rebuild reflects what's ACTUALLY there, not the transcript's
+/// echoes of what the model claimed it wrote.
+fn files_touched_this_turn(prompt: &Prompt) -> Vec<String> {
+    fn add(out: &mut Vec<String>, p: &str) {
+        let p = p.trim();
+        if !p.is_empty() && out.len() < 5 && !out.iter().any(|e| e == p) {
+            out.push(p.to_string());
         }
     }
-    if out.is_empty() { None } else { Some(out) }
+    let mut out: Vec<String> = Vec::new();
+    for item in prompt.input.iter().rev() {
+        if out.len() >= 5 {
+            break;
+        }
+        let ResponseItem::FunctionCall {
+            name, arguments, ..
+        } = item
+        else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(arguments) else {
+            continue;
+        };
+        match name.as_str() {
+            "write_file" | "create_file" | "edit_file" | "str_replace" | "read_file"
+            | "cat_file" => {
+                if let Some(p) = v.get("path").and_then(|p| p.as_str()) {
+                    add(&mut out, p);
+                }
+            }
+            "apply_patch" => {
+                let input = v
+                    .get("input")
+                    .or_else(|| v.get("patch"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                for line in input.lines() {
+                    for marker in ["*** Update File: ", "*** Add File: "] {
+                        if let Some(rest) = line.strip_prefix(marker) {
+                            add(&mut out, rest);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The real prior USER task for a compaction handoff's `# Current Request` — never
+/// the compaction directive itself. When the harness fires compaction, the newest
+/// user message is the directive (identified STRUCTURALLY by the sentinel the
+/// harness injects, so this holds regardless of the directive's configured prose).
+/// Walk user messages newest-first, skip the directive and the pinned project
+/// instructions (AGENTS.md), and return the first genuine task. `None` when there
+/// isn't one — the handoff then omits the section rather than surfacing the wrong
+/// request.
+fn extract_real_user_task(prompt: &Prompt) -> Option<String> {
+    for item in prompt.input.iter().rev() {
+        let ResponseItem::Message { role, content, .. } = item else {
+            continue;
+        };
+        if role != "user" {
+            continue;
+        }
+        let text: String = content
+            .iter()
+            .filter_map(|c| match c {
+                ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The compaction directive carries the sentinel `is_compaction_request`
+        // keys on — skip it structurally, so a reworded directive still can't
+        // become the resume request.
+        if text.contains("<<<LOCAL_COMPACT>>>") || text.contains("CONTEXT CHECKPOINT COMPACTION") {
+            continue;
+        }
+        // The AGENTS.md/CLAUDE.md pin is a user message too, but it's project
+        // context, not the task.
+        if is_project_instructions_message(&text) {
+            continue;
+        }
+        let cleaned = text.trim();
+        if !cleaned.is_empty() {
+            return Some(cleaned.to_string());
+        }
+    }
+    None
 }
 
 /// Extract the AGENTS.md / CLAUDE.md content from the conversation, if any.
@@ -2990,6 +3929,46 @@ const CTX_FALLBACK: usize = 8192;
 static SERVER_CTX: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// The real context window (`n_ctx`) of the active local CODER endpoint, as
+/// detected from `/props`. `0` = not yet known. Kept separate from [`SERVER_CTX`]
+/// (which is keyed by base_url and also holds classifier windows) so the
+/// harness can ask "what's the window of the model actually doing the work?"
+/// without knowing any URLs. Codex's NATIVE auto-compaction reads
+/// `model_info.context_window` (compact limit = 90% of it); a local model's
+/// default metadata advertises a far larger window than llama.cpp actually loaded,
+/// so native compaction never fires. Overriding it with this true value is what
+/// lets Codex compact the current turn on its own. See [`detected_coder_context_window`].
+static CODER_CONTEXT_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The real `n_ctx` of the local coder, if local routing has detected it yet.
+/// Read by the harness (`codex.rs`) to override the model's advertised window so
+/// native auto-compaction has a truthful threshold. `None` before the first coder
+/// call (the window falls back to the model's default until then).
+pub fn detected_coder_context_window() -> Option<i64> {
+    match CODER_CONTEXT_WINDOW.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => i64::try_from(n).ok(),
+    }
+}
+
+/// Probe the local coder endpoint's `/props` ONCE, up front, so
+/// [`detected_coder_context_window`] is populated BEFORE the first turn builds its
+/// `model_info`. Without this the very first (possibly long) turn would resolve
+/// the model's advertised default window and never compact. Cheap: a no-op once
+/// the window is known, when local routing isn't configured, or when the probe
+/// fails (the per-call path re-detects and the model default applies until then).
+pub async fn ensure_coder_context_window() {
+    if detected_coder_context_window().is_some() {
+        return;
+    }
+    let Some(state) = get_routing_state().await.as_ref() else {
+        return;
+    };
+    if let Some(n) = resolve_server_ctx(&state.config.light_coder, state).await {
+        CODER_CONTEXT_WINDOW.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Real context window for `endpoint`, cached per base URL. Probes `/props` once;
 /// also fed by the overflow handler. `None` if the server doesn't report it.
 async fn resolve_server_ctx(endpoint: &OllamaEndpoint, state: &RoutingState) -> Option<u64> {
@@ -3023,15 +4002,15 @@ fn record_server_ctx(base_url: &str, n_ctx: u64) {
 /// unknown, fall back to the configured `trim_budget` (today's behavior).
 fn effective_window(
     trim_budget: usize,
-    max_tokens: Option<usize>,
+    output_reserve: Option<usize>,
     server_ctx: Option<u64>,
 ) -> usize {
-    let output_reserve = max_tokens
+    let reserve = output_reserve
         .filter(|n| *n > 0)
         .unwrap_or(CTX_OUTPUT_RESERVE_DEFAULT);
     match server_ctx {
         Some(ctx) => {
-            let derived = (ctx as usize).saturating_sub(output_reserve + CTX_MARGIN);
+            let derived = (ctx as usize).saturating_sub(reserve + CTX_MARGIN);
             if trim_budget == 0 {
                 derived
             } else {
@@ -3049,10 +4028,24 @@ fn effective_window(
 ///
 /// Cached by hash of the older-turn message contents so repeated requests
 /// within a session reuse the same summary instead of recompacting.
+/// Build the per-response [`TokenUsage`] for a local model. Critically sets
+/// `total_tokens` (= input + output). Codex's NATIVE auto-compaction triggers on
+/// `total_tokens` (via [`TokenUsage::blended_total`]); leaving it 0 — which
+/// `..Default::default()` does — makes Codex believe the context is empty, so it
+/// never compacts no matter how full the real window is. One helper so the three
+/// local completion paths can't drift apart (which is how the field got missed).
+fn local_token_usage(input_tokens: i64, output_tokens: i64) -> TokenUsage {
+    TokenUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens: input_tokens + output_tokens,
+        ..Default::default()
+    }
+}
+
 async fn maybe_inline_compact(
     mut trimmed: codex_routing::trim::TrimResult,
     fit_budget: usize,
-    endpoint: &OllamaEndpoint,
     state: &RoutingState,
 ) -> codex_routing::trim::TrimResult {
     // Trigger in ESTIMATE space, relative to the budget that actually fits the
@@ -3082,9 +4075,9 @@ async fn maybe_inline_compact(
             let older_est = estimate_combined_tokens("", &trimmed.messages[..older_count]);
             let active_est = estimate_combined_tokens("", &trimmed.messages[older_count..]);
             trimmed = if active_est >= older_est {
-                compact_active_turn(trimmed, older_count, fit_budget, endpoint, state).await
+                compact_active_turn(trimmed, older_count, fit_budget, state).await
             } else {
-                compact_older_turns(trimmed, older_count, fit_budget, endpoint, state).await
+                compact_older_turns(trimmed, older_count, fit_budget, state).await
             };
         } else {
             warn!(
@@ -3116,7 +4109,6 @@ async fn compact_older_turns(
     mut trimmed: codex_routing::trim::TrimResult,
     older_count: usize,
     fit_budget: usize,
-    endpoint: &OllamaEndpoint,
     state: &RoutingState,
 ) -> codex_routing::trim::TrimResult {
     // Hash the older messages so we can reuse the summary if the conversation
@@ -3259,7 +4251,6 @@ async fn compact_active_turn(
     mut trimmed: codex_routing::trim::TrimResult,
     active_start: usize,
     fit_budget: usize,
-    endpoint: &OllamaEndpoint,
     state: &RoutingState,
 ) -> codex_routing::trim::TrimResult {
     let Some((request_idx, start, end)) =
@@ -3452,6 +4443,108 @@ fn estimate_prompt_tokens(prompt: &Prompt) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovers_bare_json_update_plan_leak() {
+        // The EXACT leak from session 019f38a5: update_plan dumped as content, which the
+        // model repeated until the turn died empty. Now recovered into a real call.
+        let leak = r#"{"plan":[{"status":"completed","step":"Write Lambda handler code"},{"status":"in_progress","step":"Create integration test"}]}"#;
+        assert!(recover_bare_update_plan(leak).is_some(), "the plan leak recovers");
+        // A bare JSON that isn't a plan → not recovered (left to the strip/re-prompt).
+        assert!(recover_bare_update_plan(r#"{"result": "done", "status": 200}"#).is_none());
+        // Prose isn't a plan either.
+        assert!(recover_bare_update_plan("I finished the task.").is_none());
+    }
+
+    #[test]
+    fn bare_json_leak_detected_prose_not() {
+        // The exact Fabliq leak: an update_plan call dumped as a JSON object.
+        assert!(looks_like_bare_json_object(
+            "\n\n{\n  \"plan\": \"1. List files.\\n2. Create handler.\",\n  \"update_plan\": {"
+        ));
+        assert!(looks_like_bare_json_object("{\"path\":\"a.py\",\"content\":\"x\"}"));
+        // Ordinary prose (even mentioning braces) is NOT a leak.
+        assert!(!looks_like_bare_json_object("I created the file. Done."));
+        assert!(!looks_like_bare_json_object("Use `{}` for an empty dict."));
+        assert!(!looks_like_bare_json_object("1. Do the thing\n2. Verify"));
+    }
+
+    #[test]
+    fn extract_real_user_task_skips_compaction_directive() {
+        let msg = |role: &str, text: &str| ResponseItem::Message {
+            id: None,
+            role: role.to_string(),
+            content: vec![ContentItem::InputText {
+                text: text.to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let prompt = Prompt {
+            input: vec![
+                msg("user", "Write a Python Lambda handler that resolves an Ada Handle."),
+                msg("assistant", "working on it"),
+                msg(
+                    "user",
+                    "<<<LOCAL_COMPACT>>> Summarize the thread for continuation. Preserve edits, unfinished work, blockers, decisions, and the latest real user intent.",
+                ),
+            ],
+            ..Default::default()
+        };
+        // The newest user message is the compaction directive; it must be skipped
+        // so the resuming model gets the REAL task, not "summarize the thread".
+        let task = extract_real_user_task(&prompt).expect("a real task is present");
+        assert!(task.contains("Ada Handle"), "got: {task}");
+        assert!(
+            !task.contains("Summarize the thread"),
+            "the compaction directive leaked into current_request: {task}"
+        );
+    }
+
+    #[test]
+    fn truncated_write_path_recovers_path_from_unterminated_args() {
+        use std::collections::BTreeMap;
+        // A write_file cut off mid-content: the JSON is unterminated, but `path`
+        // precedes `content` and is intact.
+        let mut acc: BTreeMap<usize, StreamToolCallAcc> = BTreeMap::new();
+        acc.insert(
+            0,
+            StreamToolCallAcc {
+                id: None,
+                name: Some("write_file".to_string()),
+                arguments: r##"{"path":"/home/x/test_lambda.py","content":"#!/usr/bin/env python3\ndef test_"##
+                    .to_string(),
+            },
+        );
+        assert_eq!(
+            truncated_write_path(&acc).as_deref(),
+            Some("/home/x/test_lambda.py")
+        );
+
+        // A non-write tool call is not a truncated-write footgun.
+        let mut acc2: BTreeMap<usize, StreamToolCallAcc> = BTreeMap::new();
+        acc2.insert(
+            0,
+            StreamToolCallAcc {
+                id: None,
+                name: Some("shell".to_string()),
+                arguments: "{}".to_string(),
+            },
+        );
+        assert_eq!(truncated_write_path(&acc2), None);
+    }
+
+    #[test]
+    fn detected_coder_context_window_maps_zero_to_none() {
+        use std::sync::atomic::Ordering;
+        // 0 (never detected) → None so the harness keeps the model's default window.
+        CODER_CONTEXT_WINDOW.store(0, Ordering::Relaxed);
+        assert_eq!(detected_coder_context_window(), None);
+        // A detected n_ctx is surfaced as the real window for native auto-compaction.
+        CODER_CONTEXT_WINDOW.store(49152, Ordering::Relaxed);
+        assert_eq!(detected_coder_context_window(), Some(49152));
+        CODER_CONTEXT_WINDOW.store(0, Ordering::Relaxed); // reset for other tests
+    }
 
     #[test]
     fn present_local_tools_renames_web_search_and_moves_shell_last() {

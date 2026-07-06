@@ -15,7 +15,6 @@
 
 mod items;
 mod render;
-mod rules;
 mod signatures;
 mod state_extract;
 
@@ -25,7 +24,6 @@ mod tests;
 use codex_protocol::models::ResponseItem;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
 
 pub use items::TrimItem;
 pub use signatures::signature_for_call;
@@ -42,13 +40,6 @@ pub struct TrimInput<'a> {
     /// Project-level user instructions (AGENTS.md / CLAUDE.md content), if any.
     /// These are pinned into the persistent context block.
     pub user_instructions: Option<&'a str>,
-    /// Fresh contents of files modified in the active turn, keyed by the
-    /// same normalized path that state_extract uses. Injected verbatim into
-    /// the prelude so small models can't work from a stale mental model of
-    /// a file they just edited. The caller (not the trim module itself) is
-    /// responsible for reading files — trim stays pure / no-IO. Use
-    /// [`files_modified_in_active_turn`] to figure out which paths to load.
-    pub current_files: Option<&'a HashMap<String, String>>,
     /// Wire-format flavor for the model the trimmed transcript will be sent
     /// to. Affects per-message rendering for tool calls / tool outputs:
     /// Ollama is lenient about message shapes (we wrap tool outputs in
@@ -64,14 +55,27 @@ pub struct TrimInput<'a> {
     /// preserving the legacy "system is never stubbed" behavior for callers that
     /// don't opt in. The generated state prelude is always preserved on top.
     pub system_budget_pct: u8,
+    /// When set, drop the transcript-derived loop/repetition alert for this
+    /// request. The caller sets it during a post-course-change **grace window**
+    /// (see `reasoned_guidance::consume_loop_grace`): the reasoner has confirmed
+    /// the coder genuinely changed approach, so the family-A guards — which
+    /// re-derive from the still-loopy history and would otherwise re-fire on the
+    /// pivot's own new reads/curls — are paused for a few turns so the new
+    /// approach gets an unobstructed chance to execute.
+    pub suppress_loop_alerts: bool,
 }
 
 /// Result of trimming, ready to send to a local model via the Ollama chat API.
 #[derive(Debug, Clone)]
 pub struct TrimResult {
-    /// Combined system prompt: original system prompt followed by the
-    /// synthesized state prelude. Sent as the chat `system` field.
+    /// The base system prompt (frame/role), bounded to its budget. Sent as the
+    /// chat `system` field, so it stays a STABLE prefix (good for prompt caching).
     pub system: String,
+    /// The synthesized per-turn state prelude — pinned files, world state, and any
+    /// loop-guard directive. Delivered by the caller as a FINAL message (end of the
+    /// prompt) rather than in `system`, because a small model attends to the END of
+    /// the context far more than the beginning (recency). Empty when there is none.
+    pub guidance: String,
     /// Chat messages in Ollama format. Older turns are collapsed into single
     /// summary messages; the active turn is preserved verbatim including any
     /// tool calls and tool outputs.
@@ -87,6 +91,12 @@ pub struct TrimResult {
     /// deep the loop is — the guard notices themselves only reach the TUI, so
     /// without this the logs make a firing guard look like it never fired.
     pub repetition_count: Option<usize>,
+    /// The STRUCTURED repeated call + its actual output behind the loop directive
+    /// (when one fired). This is the loop's ground truth — the exact command the
+    /// model keeps running and the result it keeps getting — surfaced so the caller
+    /// can hand it to the reasoner as fresh grounding (the repeat proves the output
+    /// is current) instead of only pasting canned prose the model ignores.
+    pub repeated_action: Option<crate::ground_truth::RepeatedAction>,
 }
 
 /// Diagnostics emitted by `trim_for_local`. Logged by the caller; not seen by
@@ -150,17 +160,17 @@ pub fn trim_for_local(input: &TrimInput, target_ctx: usize) -> TrimResult {
     let parsed = items::parse(input.items);
     let active_turn = parsed.active_turn_id();
 
-    let extracted = state_extract::extract(&parsed, active_turn);
-    let compressed_older = rules::compress_older_turns(&parsed, active_turn);
-
-    let prelude = render::render_prelude(
-        input.user_instructions,
-        &extracted,
-        active_turn,
-        input.current_files,
-    );
+    let mut extracted = state_extract::extract(&parsed, active_turn);
+    // Post-course-change grace: a reasoner confirmed the coder genuinely pivoted,
+    // so pause the transcript-derived loop nudges — they would re-fire on the new
+    // approach's own reads/curls and re-bury it before it can finish.
+    if input.suppress_loop_alerts {
+        extracted.repetition = None;
+    }
+    // No older-turn collapse: the transcript renders VERBATIM (pass-through). The
+    // stale/superseded/elided/collapsed stats go with it.
+    let prelude = render::render_prelude(input.user_instructions, &extracted);
     let (mut messages, older_turn_message_count) = render::render_messages(
-        &compressed_older,
         &parsed,
         active_turn,
         input.flavor,
@@ -171,10 +181,10 @@ pub fn trim_for_local(input: &TrimInput, target_ctx: usize) -> TrimResult {
     let mut summary = TrimSummary {
         original_items: input.items.len(),
         kept_items: messages.len(),
-        older_turns_collapsed: compressed_older.collapsed_turn_count,
-        stale_reads_dropped: compressed_older.stale_reads_dropped,
-        superseded_outputs_dropped: compressed_older.superseded_outputs_dropped,
-        elided_output_chars: compressed_older.elided_chars,
+        older_turns_collapsed: 0,
+        stale_reads_dropped: 0,
+        superseded_outputs_dropped: 0,
+        elided_output_chars: 0,
         estimated_input_tokens: 0,
         older_turn_message_count,
     };
@@ -191,8 +201,10 @@ pub fn trim_for_local(input: &TrimInput, target_ctx: usize) -> TrimResult {
         target_ctx.saturating_mul(input.system_budget_pct as usize) / 100
     };
     let system_prompt = compress_system_prompt(input.system_prompt, system_budget);
+    // Kept only for the budget math below; `system_prompt` and `prelude` are
+    // returned SEPARATELY (frame vs end-guidance), so don't consume them here.
     let combined_system = if prelude.is_empty() {
-        system_prompt
+        system_prompt.clone()
     } else {
         format!("{system_prompt}\n\n{prelude}")
     };
@@ -236,11 +248,20 @@ pub fn trim_for_local(input: &TrimInput, target_ctx: usize) -> TrimResult {
         crate::metrics::estimate_tokens(&combined_system) + estimate_messages_tokens(&messages);
 
     TrimResult {
-        system: combined_system,
+        // The base frame stays as `system` (stable prefix); the per-turn state
+        // prelude rides out as `guidance` for the caller to place at the END.
+        // `combined_system` above is kept only for the budget math.
+        system: system_prompt,
+        guidance: prelude,
         messages,
         summary,
         patch_rewrite_path: extracted.patch_failure.as_ref().map(|pf| pf.path.clone()),
         repetition_count: extracted.repetition.as_ref().map(|a| a.count),
+        repeated_action: extracted.repetition.as_ref().map(|a| crate::ground_truth::RepeatedAction {
+            command: a.command_summary.clone(),
+            output: a.last_output_excerpt.clone(),
+            count: a.count,
+        }),
     }
 }
 

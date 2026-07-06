@@ -1,28 +1,21 @@
 //! Block renderer.
 //!
 //! Composes the trimmer's two outputs:
-//!   - The synthesized prelude (persistent context + world state + open issues
-//!     + in-flight + tests). Concatenated onto the system prompt by `mod.rs`.
-//!   - The Ollama-format chat messages: per-turn collapsed summaries for older
-//!     turns, then verbatim items for the active turn.
+//!   - The synthesized prelude (persistent project context + any active loop
+//!     directive + the patch-rewrite nudge). Concatenated onto the system prompt
+//!     by `mod.rs`.
+//!   - The Ollama-format chat messages: every turn rendered VERBATIM (the LLM
+//!     summary carries older context; only the current turn's reasoning is kept).
 //!
 //! Pure formatting — no decisions about what to keep.
 
 use serde_json::Value as JsonValue;
-use std::collections::BTreeMap;
-use std::collections::HashMap;
 
 use super::items::ParsedTranscript;
 use super::items::TrimItem;
-use super::rules::CompressedOlder;
 use super::state_extract::ExtractedState;
-use super::state_extract::ModifyOp;
+use super::state_extract::LoopKind;
 use super::state_extract::RepetitionAlert;
-
-/// Cap applied to each injected current-file block. Large files get
-/// truncated with a notice so a single edit doesn't blow the whole context
-/// budget. 10 KB is enough for any normal source file.
-const CURRENT_FILE_MAX_BYTES: usize = 10_240;
 
 /// A single tool OUTPUT is "too large to show whole" once it exceeds this
 /// fraction of the trim budget — so the ceiling SCALES with the detected window
@@ -96,17 +89,12 @@ fn bound_tool_output(tool_name: &str, content: &str, max_chars: usize) -> Option
 }
 
 /// Render the full prelude block. Empty if there's nothing to say (e.g. an
-/// empty transcript with no user instructions). The `active_turn` is used to
-/// compute "turns since last modification" hints in the world-state block.
-/// `current_files` (if provided) supplies fresh disk content for files that
-/// were modified in the active turn so the model can't work from a stale
-/// mental model after its own edits land.
-pub fn render_prelude(
-    user_instructions: Option<&str>,
-    state: &ExtractedState,
-    active_turn: u32,
-    current_files: Option<&HashMap<String, String>>,
-) -> String {
+/// empty transcript with no user instructions). Contains only the loop
+/// directive, the persistent project context (AGENTS.md), and the patch-rewrite
+/// nudge — the world-state / actions / errors / in-flight / tests blocks and the
+/// current-file pin were dropped (the LLM summary + verbatim transcript carry
+/// that state now).
+pub fn render_prelude(user_instructions: Option<&str>, state: &ExtractedState) -> String {
     let mut sections: Vec<String> = Vec::new();
 
     // Repetition alert goes FIRST, before everything else, so the model can't
@@ -122,45 +110,15 @@ pub fn render_prelude(
         sections.push(format!("[Persistent project context]\n{}", inst.trim()));
     }
 
-    // Pin current on-disk contents of any files the active turn has edited.
-    // This block is right under the repetition alert because when a model
-    // is looping on stale patches, the authoritative remedy is "here is
-    // what the file ACTUALLY says right now."
-    if let Some(block) = render_current_files(state, current_files, active_turn) {
-        sections.push(block);
-    }
-
-    // If the model's last apply_patch failed, steer it to a full write_file
-    // rewrite right after the pinned file contents it should rewrite from.
+    // If the model's last apply_patch failed, steer it to a full write_file rewrite.
     if let Some(directive) = render_patch_rewrite_directive(state) {
         sections.push(directive);
     }
 
-    let world = render_world_state(state, active_turn);
-    if !world.is_empty() {
-        sections.push(world);
-    }
-
-    let actions = render_actions(state);
-    if !actions.is_empty() {
-        sections.push(actions);
-    }
-
-    let errors = render_errors(state);
-    if !errors.is_empty() {
-        sections.push(errors);
-    }
-
-    let in_flight = render_in_flight(state);
-    if !in_flight.is_empty() {
-        sections.push(in_flight);
-    }
-
-    let tests = render_tests(state);
-    if !tests.is_empty() {
-        sections.push(tests);
-    }
-
+    // The World-state / actions / errors / in-flight / tests blocks and the
+    // current-file pin were dropped: the LLM summary + the verbatim transcript now
+    // carry that state. Only the loop directive, the AGENTS.md pin, and the
+    // patch-rewrite nudge remain in the prelude.
     sections.join("\n\n")
 }
 
@@ -185,70 +143,6 @@ fn render_patch_rewrite_directive(state: &ExtractedState) -> Option<String> {
     ))
 }
 
-/// Render a `[Current file state]` block listing the verbatim on-disk
-/// contents of every file the active turn has modified (Add File / Update
-/// File, but not Delete). Returns `None` when there's nothing to inject.
-fn render_current_files(
-    state: &ExtractedState,
-    current_files: Option<&HashMap<String, String>>,
-    active_turn: u32,
-) -> Option<String> {
-    let current_files = current_files?;
-    let mut entries: Vec<String> = Vec::new();
-    for (path, modified) in &state.files_modified {
-        if modified.turn_id != active_turn {
-            continue;
-        }
-        if matches!(modified.op, ModifyOp::Deleted) {
-            continue;
-        }
-        let Some(content) = current_files.get(path) else {
-            continue;
-        };
-        let total = content.len();
-        let (body, truncated) = if total > CURRENT_FILE_MAX_BYTES {
-            let mut cut = CURRENT_FILE_MAX_BYTES;
-            while cut < total && !content.is_char_boundary(cut) {
-                cut += 1;
-            }
-            (&content[..cut], true)
-        } else {
-            (content.as_str(), false)
-        };
-        let hash = short_hash(content);
-        let line_count = content.lines().count();
-        let mut header = format!(
-            "--- Current content of {path} (hash {hash}, {line_count} lines, {total} bytes)"
-        );
-        if truncated {
-            header.push_str(" — TRUNCATED to first ");
-            header.push_str(&CURRENT_FILE_MAX_BYTES.to_string());
-            header.push_str(" bytes below");
-        }
-        entries.push(format!("{header}\n{body}\n--- End of {path}"));
-    }
-    if entries.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "[Current file state — authoritative. Work from this content, not from memory of earlier patches.]\n{}",
-        entries.join("\n\n")
-    ))
-}
-
-/// Tiny non-cryptographic hash for displaying content identity. Only needs
-/// to be stable within one render; collision resistance is not required.
-fn short_hash(s: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::Hash;
-    use std::hash::Hasher;
-    let mut hasher = DefaultHasher::new();
-    s.hash(&mut hasher);
-    let raw = hasher.finish();
-    // Take the first 8 hex chars for a compact, readable ID.
-    format!("{raw:016x}")[..8].to_string()
-}
-
 /// The SINGLE source of the "you're looping" directive. The TRIGGER and the
 /// escalation TIER differ — footprint stalled → CIRCLING; a literal repeat → STOP;
 /// same-goal thrash → DIAGNOSE; the loop ignored past threshold → EXCISE + reframe
@@ -264,6 +158,15 @@ fn render_loop_directive(alert: &RepetitionAlert, result: &str) -> String {
         alert.command_summary.as_str()
     };
     let n = alert.count;
+    // Read-without-write: many reads, no writes. Its own targeted framing — the
+    // problem isn't a repeat, it's the read/write imbalance, so name that.
+    if alert.kind == LoopKind::ReadWithoutWrite {
+        return format!(
+            "[GATHERING WITHOUT ACTING]\n\
+             You have made {n} reads in a row. It doesn't seem like you are finding what you want. Try another approach.\n\n\
+             Most recent result:\n{result}"
+        );
+    }
     // Footprint stalled — circling a fixed set of targets without expanding (see
     // `detect_tunnel_vision`). Checked FIRST because tunnel-vision also sets
     // `force_diagnosis`; this gives it its own specific, target-naming framing.
@@ -275,11 +178,7 @@ fn render_loop_directive(alert: &RepetitionAlert, result: &str) -> String {
         };
         return format!(
             "[STUCK — CIRCLING THE SAME PLACES]\n\
-             Your last {n} tool calls kept returning to {targets} without touching anything new — you are circling, not progressing. Another edit to the same place will not break the loop.\n\
-             Before your NEXT tool call, reply in PLAIN TEXT:\n\
-             1. What you are trying to make happen, and the EXACT evidence it isn't (quote the real output — do not assume).\n\
-             2. Why it isn't working — and look where you have NOT: the spot you keep returning to is apparently not the cause.\n\
-             3. ONE next step that is genuinely DIFFERENT — a new file, or a check that proves the actual state (print the real value / run the failing thing and read it) — NOT another pass over {targets}.\n\n\
+             You have made {n} edits/calls to {targets}. You are ruminating. Try something new. \n\n\
              Most recent result:\n{result}"
         );
     }
@@ -312,7 +211,7 @@ fn render_loop_directive(alert: &RepetitionAlert, result: &str) -> String {
     // Tier 1 — a literal repeat.
     format!(
         "[STOP — REPETITION DETECTED]\n\
-         You've called `{what}` {n} times in a row the same way and gotten the same result every time. Calling it again is a no-op — a wasted turn.\n\
+         You've called `{what}` {n} times in a row the same way with the same result every time. Calling it again is a no-op — a wasted turn.\n\
          Change approach now: different arguments, a different tool, or stop and tell the user what you've learned and what's blocking you.\n\n\
          The unchanged result:\n{result}"
     )
@@ -333,121 +232,16 @@ fn render_repetition_override(alert: &RepetitionAlert, content: &str) -> String 
     render_loop_directive(alert, content)
 }
 
-fn render_world_state(state: &ExtractedState, active_turn: u32) -> String {
-    if state.files_seen.is_empty() && state.files_modified.is_empty() {
-        return String::new();
-    }
-    let mut lines = vec!["[World state]".to_string()];
-    if !state.files_seen.is_empty() {
-        lines.push(format!(
-            "Files seen: {}",
-            state
-                .files_seen
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    let mut any_stale = false;
-    if !state.files_modified.is_empty() {
-        let mut by_op: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-        for (path, m) in &state.files_modified {
-            let label = match m.op {
-                ModifyOp::Created => "Created",
-                ModifyOp::Edited => "Edited",
-                ModifyOp::Deleted => "Deleted",
-            };
-            // Show modification turn so the model can judge freshness.
-            // Anything older than 2 turns from the active turn is likely
-            // stale in the model's working memory and should be re-read
-            // before further edits.
-            let turns_since = active_turn.saturating_sub(m.turn_id);
-            let entry = if turns_since >= 2 {
-                any_stale = true;
-                format!(
-                    "{path} (turn {}, {} turns ago — content likely stale)",
-                    m.turn_id, turns_since
-                )
-            } else {
-                format!("{path} (turn {})", m.turn_id)
-            };
-            by_op.entry(label).or_default().push(entry);
-        }
-        for (label, paths) in by_op {
-            lines.push(format!("{label}: {}", paths.join(", ")));
-        }
-    }
-    if any_stale {
-        lines.push(
-            "NOTE: Some files were edited multiple turns ago. Before patching them again, re-read with `cat <path>` (or `apply_patch` will likely fail with 'Failed to find context')."
-                .to_string(),
-        );
-    }
-    lines.join("\n")
+/// The Codex "developer" boilerplate (permissions / collaboration-mode / apps /
+/// skills / plugins) — ~3K tokens of cloud-oriented instructions the local model
+/// never uses. Detected so the verbatim renderer can drop it.
+fn is_codex_boilerplate(text: &str) -> bool {
+    text.contains("<permissions instructions>")
+        || text.contains("<apps_instructions>")
+        || text.contains("<skills_instructions>")
 }
 
-fn render_actions(state: &ExtractedState) -> String {
-    if state.actions.is_empty() {
-        return String::new();
-    }
-    let mut lines = vec!["[Actions taken]".to_string()];
-    for a in &state.actions {
-        lines.push(format!("- (turn {}) {}", a.turn_id, a.summary));
-    }
-    lines.join("\n")
-}
-
-fn render_errors(state: &ExtractedState) -> String {
-    if state.unresolved_errors.is_empty() {
-        return String::new();
-    }
-    let mut lines = vec!["[UNRESOLVED ERRORS]".to_string()];
-    for e in &state.unresolved_errors {
-        lines.push(format!(
-            "- (turn {}) {}: {}",
-            e.turn_id, e.tool_name, e.excerpt
-        ));
-    }
-    lines.join("\n")
-}
-
-fn render_in_flight(state: &ExtractedState) -> String {
-    if state.in_flight.is_empty() {
-        return String::new();
-    }
-    let mut lines = vec!["[In-flight]".to_string()];
-    for f in &state.in_flight {
-        lines.push(format!(
-            "- (turn {}) {} call_id={} args={}",
-            f.turn_id, f.tool_name, f.call_id, f.note
-        ));
-    }
-    lines.join("\n")
-}
-
-fn render_tests(state: &ExtractedState) -> String {
-    if state.test_runs.is_empty() {
-        return String::new();
-    }
-    let mut lines = vec!["[Tests]".to_string()];
-    for t in &state.test_runs {
-        let verdict = if t.passed { "PASS" } else { "FAIL" };
-        lines.push(format!(
-            "- (turn {}) {} `{}` → {}",
-            t.turn_id, verdict, t.command, t.summary
-        ));
-    }
-    lines.join("\n")
-}
-
-/// Build the chat messages and report how many of the leading messages
-/// represent older (collapsed) turns. Active-turn messages occupy
-/// `messages[older_turn_message_count..]`. Callers that need to summarize
-/// just the older portion (e.g. when even the trimmed transcript exceeds
-/// the local model's context budget) can use the count to slice cleanly.
 pub fn render_messages(
-    older: &CompressedOlder,
     parsed: &ParsedTranscript,
     active_turn: u32,
     flavor: crate::config::ClientFlavor,
@@ -456,71 +250,13 @@ pub fn render_messages(
 ) -> (Vec<JsonValue>, usize) {
     let mut messages: Vec<JsonValue> = Vec::new();
 
-    // Older turns: render a single user-message-shaped item per turn that
-    // contains the verbatim user message + a one-line action summary (already
-    // handled by the prelude's [Actions taken] block, so the per-turn message
-    // here just preserves the user's words and the call signatures from that
-    // turn that survived compression).
-    let mut older_by_turn: BTreeMap<u32, Vec<&TrimItem>> = BTreeMap::new();
-    for item in &older.items {
-        older_by_turn.entry(item.turn_id()).or_default().push(item);
-    }
-    for (turn, turn_items) in older_by_turn {
-        let mut user_text = String::new();
-        let mut tool_lines: Vec<String> = Vec::new();
-        for item in turn_items {
-            match item {
-                TrimItem::User { text, .. } => {
-                    if !user_text.is_empty() {
-                        user_text.push('\n');
-                    }
-                    user_text.push_str(text);
-                }
-                TrimItem::ToolCall {
-                    tool_name,
-                    args,
-                    signature,
-                    ..
-                } => {
-                    let _ = signature;
-                    tool_lines.push(format!("  - called {tool_name}({})", short(args, 80)));
-                }
-                TrimItem::ToolOutput {
-                    tool_name,
-                    success,
-                    content,
-                    ..
-                } => {
-                    if !*success {
-                        tool_lines.push(format!("  - {tool_name} ERROR: {}", short(content, 200)));
-                    } else {
-                        // Read-shaped tools (grep, list_dir, text_editor view)
-                        // survived older-turn compression — include the data
-                        // for the model to reference. Action-only tools were
-                        // already dropped by `rules::compress_older_turns`.
-                        tool_lines.push(format!("  - {tool_name} output:"));
-                        for line in content.lines() {
-                            tool_lines.push(format!("    {line}"));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut content = format!("[turn {turn} — user]\n{user_text}");
-        if !tool_lines.is_empty() {
-            content.push_str("\n[turn ");
-            content.push_str(&turn.to_string());
-            content.push_str(" — surviving tool activity]\n");
-            content.push_str(&tool_lines.join("\n"));
-        }
-        messages.push(serde_json::json!({
-            "role": "user",
-            "content": content,
-        }));
-    }
-
-    let older_turn_message_count = messages.len();
+    // Pass-through: the whole transcript renders VERBATIM in the loop below — no
+    // older-turn collapse. What the local model sees is exactly "the LLM summary +
+    // the raw turns since the last compaction." Loop DETECTION still runs upstream
+    // (state_extract) and its nudges still fire; escalated loops are still excised
+    // inline below (`pruned_loop`). Older reasoning is the one thing still dropped —
+    // it's single-use exhaust.
+    let older_turn_message_count = 0usize;
 
     // Context reset: once a repeat-loop has escalated (advisory nudge + hard
     // block both ignored), excise the loop's own calls + outputs from the
@@ -552,23 +288,29 @@ pub fn render_messages(
     // the first time we hit it rather than deleting into a gap — see the prune below.
     let mut loop_collapsed = false;
     for item in &parsed.items {
-        if item.turn_id() != active_turn {
-            continue;
-        }
         match item {
             TrimItem::User { text, .. } => {
                 messages.push(serde_json::json!({"role": "user", "content": text}));
             }
             TrimItem::AssistantText { text, .. } => {
-                messages.push(serde_json::json!({"role": "assistant", "content": text}));
+                // Drop the Codex developer boilerplate (permissions / apps / skills /
+                // plugins) — ~3K tokens the local model never uses. The older-turn
+                // collapse used to drop it implicitly; with the verbatim pass-through
+                // we drop it explicitly here so it isn't re-sent every turn.
+                if !is_codex_boilerplate(text) {
+                    messages.push(serde_json::json!({"role": "assistant", "content": text}));
+                }
             }
-            TrimItem::Reasoning { text, .. } => {
-                // Ollama doesn't have a dedicated reasoning role; tag it inline
-                // so the model knows it's its own prior thinking.
-                messages.push(serde_json::json!({
-                    "role": "assistant",
-                    "content": format!("<reasoning>{text}</reasoning>"),
-                }));
+            TrimItem::Reasoning { text, turn_id } => {
+                // Keep only the CURRENT turn's reasoning verbatim; older reasoning
+                // is single-use exhaust. Ollama has no reasoning role, so tag it
+                // inline so the model knows it's its own prior thinking.
+                if *turn_id == active_turn {
+                    messages.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": format!("<reasoning>{text}</reasoning>"),
+                    }));
+                }
             }
             TrimItem::ToolCall {
                 tool_name,
@@ -732,20 +474,6 @@ pub fn render_messages(
     }
 
     (messages, older_turn_message_count)
-}
-
-fn short(s: &str, n: usize) -> String {
-    let cleaned = s.replace(['\n', '\r'], " ");
-    if cleaned.len() <= n {
-        return cleaned;
-    }
-    // Char-boundary-safe: a raw `&cleaned[..n]` panics if `n` splits a multibyte
-    // char (tool outputs are arbitrary UTF-8 — e.g. a `·` in web-search results).
-    let mut end = n;
-    while end > 0 && !cleaned.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &cleaned[..end])
 }
 
 /// Produce a follow-up hint for a failed tool output, matched on tool name

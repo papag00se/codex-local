@@ -47,8 +47,15 @@ pub(crate) enum InitialContextInjection {
     DoNotInject,
 }
 
-pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bool {
-    provider.is_openai()
+pub(crate) async fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bool {
+    // Under local_only, never take the cloud remote-compaction API: it bypasses
+    // the routing layer (so it hits the cloud despite local_only) AND emits a
+    // provider-encrypted summary the LOCAL model can't read on resume — which made
+    // a resumed local session lose all context and rebuild every file. The inline
+    // path instead flows through `route_request`'s local compaction failover chain
+    // (compactor → light_reasoner, cloud-stripped) and produces a plaintext summary
+    // any model can read.
+    provider.is_openai() && !crate::local_routing::is_local_only().await
 }
 
 pub(crate) async fn run_inline_auto_compact_task(

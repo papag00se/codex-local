@@ -2,9 +2,11 @@
 
 [< Spec Index](index.md) | [Product Index](../product/index.md)
 
+> **⚠️ Historical — this describes the DETERMINISTIC pipeline that the local-coder implementation REPLACED.** The shipped compaction produces a **model-written, free-form** handoff (chunk → LLM-summarize each chunk → final unifying pass → verbatim recent tail), not the `ChunkExtraction` → `merge_states` → `DurableMemorySet` extraction below. The rigid schema, deterministic merge, and 5 markdown docs were removed after the free-form path measurably outperformed them on real sessions. For the implemented design see [local-coder-massaging.md §35](local-coder-massaging.md) and `codex-rs/routing/src/compaction/`. This document is retained as the **algorithm-history reference** for the original `coding-agent-router` port — the chunking/normalize/token-budget mechanics still inform the current pipeline, and the extraction/merge rules record *why* the deterministic approach was tried.
+>
 > **Migration source:** `coding-agent-router/app/compaction/` (service.py, extractor.py, refiner.py, chunking.py, merger.py, normalize.py, storage.py, handoff.py, models.py, structured_output.py, durable_memory.py, prompts.py) plus `app/prompts/compaction_extraction_system.md` and `app/prompts/compaction_refinement_system.md`
 >
-> This document preserves the complete compaction pipeline — every algorithm step, threshold, data model, prompt, and merge rule. The compaction system was heavily tested and mostly successful. Nothing here should be discarded during implementation.
+> This document preserves the complete *original* compaction pipeline — every algorithm step, threshold, data model, prompt, and merge rule.
 
 ---
 

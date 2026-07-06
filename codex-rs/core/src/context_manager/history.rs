@@ -11,6 +11,7 @@ use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
+use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -118,6 +119,26 @@ impl ContextManager {
         self.normalize_history(input_modalities);
         self.items
             .retain(|item| !matches!(item, ResponseItem::GhostSnapshot { .. }));
+        // Drop LOCAL reasoning items — a local model's private chain-of-thought,
+        // carried as plaintext `ReasoningText` with NO provider `encrypted_content`.
+        // It is single-use exhaust and must never be replayed to a provider: the
+        // Responses API rejects reasoning input whose `content` is non-empty
+        // ("array_above_max_length ... maximum length 0"), which broke remote
+        // compaction. Provider reasoning (with `encrypted_content`) is left intact
+        // and still round-trips. The full item stays in the rollout — this only
+        // shapes what we SEND.
+        self.items.retain(|item| {
+            !matches!(
+                item,
+                ResponseItem::Reasoning {
+                    encrypted_content: None,
+                    content: Some(content),
+                    ..
+                } if content
+                    .iter()
+                    .any(|c| matches!(c, ReasoningItemContent::ReasoningText { .. }))
+            )
+        });
         self.items
     }
 

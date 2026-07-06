@@ -65,6 +65,22 @@ impl ToolHandler for WebFetchHandler {
             ));
         }
 
+        // Exact-repeat gate BEFORE touching the network: an external fetch of the
+        // identical (url, find, cursor) already made this turn can only return what
+        // the model already has, so refuse it as a 400 (the real cost is the
+        // inference spent re-deciding to fetch). Internal hosts (a dev server it
+        // may be polling) are always allowed. Session-keyed, reset each turn.
+        let session_id = session.conversation_id.to_string();
+        if let web_fetch::FetchGate::Block { message } = web_fetch::gate_fetch(
+            &session_id,
+            &turn.sub_id,
+            url,
+            args.find.as_deref(),
+            args.cursor.as_deref(),
+        ) {
+            return Err(FunctionCallError::RespondToModel(message));
+        }
+
         // Surface the fetch in the UI as an "open page" cell (reusing the
         // web-search cell), so the user can see when the model reaches the
         // network. A live cell shows during the await; it completes on return.

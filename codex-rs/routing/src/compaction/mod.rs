@@ -1,15 +1,14 @@
-//! Compaction pipeline — compress long conversations into durable state.
+//! Compaction pipeline — summarize a long transcript into a model-written handoff.
 //!
-//! Ported from coding-agent-router's compaction subsystem.
-//! See docs/spec/compaction-reference.md.
+//! Flow (see `pipeline::compact_transcript`): strip boilerplate -> normalize ->
+//! split off a verbatim recent tail -> chunk the rest -> summarize each chunk with
+//! the compactor LLM -> one final unifying pass -> assemble handoff.
 
 pub mod chunking;
 pub mod extract;
-pub mod merger;
 pub mod models;
 pub mod normalize;
 pub mod pipeline;
-pub mod render;
 
-pub use models::{ChunkExtraction, DurableMemorySet, MergedState, SessionHandoff, TranscriptChunk};
+pub use models::TranscriptChunk;
 pub use pipeline::{CompactionConfig, compact_transcript};

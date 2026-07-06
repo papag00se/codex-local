@@ -64,6 +64,18 @@ impl ToolHandler for LocalWebSearchHandler {
             ));
         }
 
+        // Rumination gate BEFORE touching the network: if this search is
+        // essentially one already made THIS turn (similar stripped word-set),
+        // refuse it as a 400 — return the refusal as the result and never hit the
+        // API (no phantom search cell either). Keyed by session so sessions don't
+        // cross-contaminate; reset each user turn.
+        let session_id = session.conversation_id.to_string();
+        if let local_web_search::SearchGate::Block { message } =
+            local_web_search::gate_search(&session_id, &turn.sub_id, query)
+        {
+            return Err(FunctionCallError::RespondToModel(message));
+        }
+
         let cwd = std::env::current_dir().unwrap_or_default();
         let project_config = ProjectConfig::load(&cwd);
         let api_key = project_config.search.brave_api_key.clone();
@@ -98,10 +110,21 @@ impl ToolHandler for LocalWebSearchHandler {
             .await;
 
         match result {
-            Ok(results) => Ok(FunctionToolOutput::from_text(
-                local_web_search::format_results(query, &results),
-                Some(true),
-            )),
+            Ok(results) => {
+                let mut text = local_web_search::format_results(query, &results);
+                // If the query names a domain, nudge toward fetching it directly.
+                // This fires on the FIRST (executed) search — repeats are refused
+                // upstream by the rumination gate, which carries the same steer.
+                if let Some(domain) = local_web_search::first_domain_in(query) {
+                    text.push_str(&format!(
+                        "\n\n[hint] Your query names a domain. If you need site-specific data, \
+                         fetching it directly is usually faster and more reliable than searching \
+                         about it: web_fetch https://{domain} , then parse the response for what \
+                         you need."
+                    ));
+                }
+                Ok(FunctionToolOutput::from_text(text, Some(true)))
+            }
             Err(e) => Err(FunctionCallError::RespondToModel(e.to_string())),
         }
     }

@@ -181,22 +181,6 @@ fn short_hash(s: &str) -> String {
     format!("{:x}", hasher.finish())
 }
 
-/// Extract the file path from a tool call's signature, if it has one.
-/// Used by stale-after-modify detection in `rules.rs`.
-pub fn path_from_signature(signature: &str) -> Option<&str> {
-    // Signatures look like "tool_name::key=value,key=value". Find the
-    // first `path=` segment after the `::`.
-    let Some((_tool, kv)) = signature.split_once("::") else {
-        return None;
-    };
-    for pair in kv.split(',') {
-        if let Some(rest) = pair.strip_prefix("path=") {
-            return Some(rest);
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

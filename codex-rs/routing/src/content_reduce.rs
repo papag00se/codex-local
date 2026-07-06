@@ -444,6 +444,16 @@ pub fn find_in(
     query: &str,
     cap_tokens: usize,
 ) -> String {
+    // Models routinely wrap the find term in quotes (`"Handle"`) as natural
+    // emphasis, but matching is a literal substring — so the quote characters make
+    // it miss every time on content that has no literal quotes (parsed JSON keys,
+    // reduced text). Strip surrounding quotes/whitespace so the bare keyword is
+    // what's matched. (Observed: a model looped a dozen fetches re-quoting terms
+    // against a doc it had already fetched, each returning "no match".)
+    let query = query
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+        .trim();
     let ct = content_type.unwrap_or("").to_ascii_lowercase();
     if ct.contains("json")
         && let Ok(root) = serde_json::from_str::<JsonValue>(content)
@@ -767,6 +777,23 @@ mod tests {
         let out = super::find_in(spec, Some("application/json"), "zzzznope", 4000);
         assert!(out.contains("no match"));
         assert!(out.contains("paths") && out.contains("components") && out.contains("info"));
+    }
+
+    #[test]
+    fn find_strips_surrounding_quotes_so_a_quoted_term_matches() {
+        let spec = r#"{"components":{"schemas":{"Holder":{"type":"object"}}}}"#;
+        // The bare term matches...
+        let bare = super::find_in(spec, Some("application/json"), "Holder", 4000);
+        assert!(!bare.contains("no match"), "bare should match: {bare}");
+        // ...and the quoted term (the model's emphasis) must match identically,
+        // not be defeated by the literal quote characters.
+        for q in [r#""Holder""#, r#"'Holder'"#, r#"  "Holder"  "#] {
+            let out = super::find_in(spec, Some("application/json"), q, 4000);
+            assert!(
+                !out.contains("no match"),
+                "quoted {q:?} should match: {out}"
+            );
+        }
     }
 
     #[test]

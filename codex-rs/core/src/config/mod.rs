@@ -707,7 +707,16 @@ impl ConfigBuilder {
 impl Config {
     pub fn to_models_manager_config(&self) -> ModelsManagerConfig {
         ModelsManagerConfig {
-            model_context_window: self.model_context_window,
+            // Prefer an explicit operator override; otherwise, when local routing
+            // is active, use the coder's REAL detected `n_ctx` (from `/props`) so
+            // the model's advertised (far larger) default window doesn't keep
+            // Codex's native auto-compaction from ever firing. This flows through
+            // `with_config_overrides` into `model_info.context_window` exactly like
+            // a hand-set `model_context_window` would — the stock compaction path,
+            // just auto-filled. See `local_routing::detected_coder_context_window`.
+            model_context_window: self
+                .model_context_window
+                .or_else(crate::local_routing::detected_coder_context_window),
             model_auto_compact_token_limit: self.model_auto_compact_token_limit,
             tool_output_token_limit: self.tool_output_token_limit,
             base_instructions: self.base_instructions.clone(),

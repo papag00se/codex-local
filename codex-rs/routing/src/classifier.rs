@@ -161,7 +161,7 @@ pub async fn classify_with_endpoint(
     let mut classifier_override = classifier_ep.clone();
     classifier_override.temperature = 0.0; // Deterministic
     classifier_override.timeout_seconds = classify_timeout;
-    classifier_override.think = false; // Never reason on classify
+    classifier_override.think = Some(false); // Never reason on classify
     let classify_future = pool.chat(
         &classifier_override,
         vec![serde_json::json!({"role": "user", "content": user_content})],
@@ -325,10 +325,11 @@ mod tests {
             temperature: 0.0,
             timeout_seconds: 1,
             enabled: false,
-            think: false,
+            think: Some(false),
             tool_subset: ToolSubset::Focused,
             flavor: ClientFlavor::OpenAICompat,
             max_tokens: None,
+            output_reserve: None,
             top_p: None,
             top_k: None,
             repeat_penalty: None,

@@ -110,12 +110,13 @@ impl RuminationDetector {
         Self { budget, threshold }
     }
 
-    /// Build a detector from the endpoint's `max_tokens` config. `None`
-    /// means "unlimited" upstream, which for our purposes means "use the
-    /// default budget."
-    pub fn from_endpoint_max_tokens(max_tokens: Option<usize>) -> Self {
+    /// Build a detector from a reasoning-token budget (the caller passes the
+    /// endpoint's `output_reserve` — a sane proxy for "expected output
+    /// magnitude"). `None` → the built-in default budget. Deliberately NOT tied
+    /// to `max_tokens` (the hard output cap), which is usually unset.
+    pub fn from_reasoning_budget(budget: Option<usize>) -> Self {
         Self::new(
-            max_tokens.unwrap_or(DEFAULT_REASONING_BUDGET),
+            budget.unwrap_or(DEFAULT_REASONING_BUDGET),
             DEFAULT_MARKER_THRESHOLD,
         )
     }
@@ -138,7 +139,13 @@ impl RuminationDetector {
             return RuminationVerdict::Ok;
         }
         let hits = count_rumination_markers(reasoning_so_far);
-        if hits >= self.threshold {
+        // Two independent triggers: (1) repetition — enough rumination markers; and
+        // (2) raw length — reasoning that consumes the ENTIRE budget (2x the marker
+        // gate). A model can ramble novel-but-useless reasoning for thousands of
+        // tokens without ever repeating a marker phrase (observed: 6k+ reasoning
+        // tokens, marker_count=2, then it gave up and pasted a file), so the marker
+        // count alone can't catch a length runaway.
+        if reasoning_tokens >= self.budget || hits >= self.threshold {
             RuminationVerdict::Ruminating {
                 hits,
                 reasoning_tokens,
@@ -257,15 +264,15 @@ mod tests {
     }
 
     #[test]
-    fn from_endpoint_max_tokens_none_uses_default() {
-        let det = RuminationDetector::from_endpoint_max_tokens(None);
+    fn from_reasoning_budget_none_uses_default() {
+        let det = RuminationDetector::from_reasoning_budget(None);
         assert_eq!(det.budget_gate(), DEFAULT_REASONING_BUDGET / 2);
         assert_eq!(det.threshold(), DEFAULT_MARKER_THRESHOLD);
     }
 
     #[test]
-    fn from_endpoint_max_tokens_some_uses_value() {
-        let det = RuminationDetector::from_endpoint_max_tokens(Some(8000));
+    fn from_reasoning_budget_some_uses_value() {
+        let det = RuminationDetector::from_reasoning_budget(Some(8000));
         assert_eq!(det.budget_gate(), 4000);
     }
 
@@ -273,6 +280,19 @@ mod tests {
     fn estimate_reasoning_tokens_approximates() {
         // 16 chars / 4 = 4 tokens
         assert_eq!(estimate_reasoning_tokens("abcd abcd abcd a"), 4);
+    }
+
+    #[test]
+    fn raw_length_backstop_fires_without_markers() {
+        // budget 8192 → gate 4096. Non-repetitive prose (no markers) that blows the
+        // FULL budget must flag on length alone; the same length under budget must not.
+        let det = RuminationDetector::new(8192, 6);
+        let prose = "The handler accepts an event and returns a mapping of fields. ".repeat(60);
+        assert_eq!(count_rumination_markers(&prose), 0, "no markers in this prose");
+        // Over the full budget → flagged on length even with 0 markers.
+        assert!(matches!(det.check(&prose, 8200), RuminationVerdict::Ruminating { .. }));
+        // Past the gate but under the full budget, no markers → still OK.
+        assert_eq!(det.check(&prose, 5000), RuminationVerdict::Ok);
     }
 
     #[test]

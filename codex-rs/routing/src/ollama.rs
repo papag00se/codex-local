@@ -445,6 +445,35 @@ fn tool_choice_payload(tc: &str) -> JsonValue {
     }
 }
 
+/// Mirror the role's reasoning flag onto an OpenAI-compatible payload.
+///
+/// OpenAI-compat servers (llama.cpp, vLLM) have no top-level `think` field like
+/// Ollama's. The per-request reasoning toggle instead rides in
+/// `chat_template_kwargs`, which the server injects into the chat template's
+/// Jinja context. A template that gates on `enable_thinking` (the standard
+/// Qwen3 pattern) then renders think-on vs think-off from this single flag — so
+/// ONE server instance can serve both a coder role (reasoning off) and a
+/// reasoner role (reasoning on), chosen per request.
+///
+/// Config-driven and tri-state (`endpoint.think`, from the role's `reasoning`):
+/// `Some(true)` → `enable_thinking: true`, `Some(false)` → `enable_thinking:
+/// false`, `None` ("auto") → omit the kwarg entirely so the model's own chat
+/// template default stands. Harmless on servers/templates that don't read it.
+fn apply_reasoning_kwargs(payload: &mut JsonValue, endpoint: &OllamaEndpoint) {
+    if let Some(enable_thinking) = endpoint.think {
+        payload["chat_template_kwargs"] = json!({ "enable_thinking": enable_thinking });
+    }
+}
+
+/// Apply the tri-state thinking preference to an Ollama payload's top-level
+/// `think` field. Omitted when the preference is `None` ("auto"), so Ollama
+/// falls back to the model's own default rather than being forced either way.
+fn apply_ollama_think(payload: &mut JsonValue, endpoint: &OllamaEndpoint) {
+    if let Some(think) = endpoint.think {
+        payload["think"] = json!(think);
+    }
+}
+
 fn build_stream_payload(
     endpoint: &OllamaEndpoint,
     messages: Vec<JsonValue>,
@@ -457,17 +486,22 @@ fn build_stream_payload(
                 "temperature": endpoint.temperature,
                 "num_ctx": endpoint.trim_budget,
             });
-            if let Some(n) = endpoint.max_tokens {
-                options["num_predict"] = json!(n);
-            }
+            // Output cap = the conventional `max_tokens`, but ONLY when a user
+            // opts in; unset → -1 = uncapped, so a large `write_file` isn't
+            // chopped mid-content (that truncation drove a rewrite loop). This is
+            // a HARD ceiling, distinct from the input-side `output_reserve` in
+            // `effective_window`. Runaway is caught live by the streaming
+            // rumination detector; wall-clock is the user's `timeout_seconds`
+            // (slow boxes set it high, by design).
+            options["num_predict"] = json!(endpoint.max_tokens.map(|n| n as i64).unwrap_or(-1));
             apply_sampler_overrides(&mut options, endpoint);
             let mut payload = json!({
                 "model": &endpoint.model,
                 "messages": messages,
                 "stream": true,
                 "options": options,
-                "think": endpoint.think,
             });
+            apply_ollama_think(&mut payload, endpoint);
             if let Some(t) = tools {
                 payload["tools"] = json!(t);
             }
@@ -482,6 +516,10 @@ fn build_stream_payload(
                 "stream_options": {"include_usage": true},
             });
             apply_sampler_overrides(&mut payload, endpoint);
+            apply_reasoning_kwargs(&mut payload, endpoint);
+            // Output cap = the conventional `max_tokens`, only when a user opts
+            // in; unset → omitted = uncapped (llama.cpp defaults to `n_predict =
+            // -1`). Distinct from the input-side `output_reserve`.
             if let Some(n) = endpoint.max_tokens {
                 payload["max_tokens"] = json!(n);
             }
@@ -584,6 +622,10 @@ fn spawn_ollama_stream_reader(
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
                     let output_tokens = obj.get("eval_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                    // `done_reason == "length"` means the generation was cut off at
+                    // the `num_predict` cap, not a natural stop — the tool call it
+                    // was emitting (e.g. a write_file) is truncated mid-content.
+                    let truncated = obj.get("done_reason").and_then(|v| v.as_str()) == Some("length");
                     // Ollama reports durations in nanoseconds; convert to ms.
                     // These are exact model-side times (exclude network).
                     let ns_to_ms =
@@ -595,6 +637,7 @@ fn spawn_ollama_stream_reader(
                             reasoning_tokens: 0, // Ollama doesn't break out reasoning tokens
                             prompt_ms: ns_to_ms("prompt_eval_duration"),
                             gen_ms: ns_to_ms("eval_duration"),
+                            truncated,
                         })
                         .await;
                     return;
@@ -615,6 +658,8 @@ fn spawn_openai_sse_reader(
         let mut input_tokens: u64 = 0;
         let mut output_tokens: u64 = 0;
         let mut reasoning_tokens: u64 = 0;
+        // `choices[0].finish_reason == "length"` marks an output-cap truncation.
+        let mut finish_reason: Option<String> = None;
         // OpenAI-compat servers don't report eval durations, so measure
         // throughput by wall clock: `start` (reader spawn, ~response headers)
         // to first generated token approximates prompt-ingest; first token to
@@ -660,6 +705,7 @@ fn spawn_openai_sse_reader(
                             reasoning_tokens,
                             prompt_ms,
                             gen_ms,
+                            truncated: finish_reason.as_deref() == Some("length"),
                         })
                         .await;
                     return;
@@ -689,11 +735,17 @@ fn spawn_openai_sse_reader(
                     }
                 }
 
-                let delta = obj
+                let first_choice = obj
                     .get("choices")
                     .and_then(|c| c.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|first| first.get("delta"));
+                    .and_then(|arr| arr.first());
+                if let Some(fr) = first_choice
+                    .and_then(|c| c.get("finish_reason"))
+                    .and_then(|v| v.as_str())
+                {
+                    finish_reason = Some(fr.to_string());
+                }
+                let delta = first_choice.and_then(|first| first.get("delta"));
 
                 let delta_content = delta
                     .and_then(|d| d.get("content"))
@@ -763,6 +815,7 @@ fn spawn_openai_sse_reader(
                 reasoning_tokens,
                 prompt_ms,
                 gen_ms,
+                truncated: finish_reason.as_deref() == Some("length"),
             })
             .await;
     });
@@ -808,12 +861,19 @@ pub enum StreamChunk {
     /// reader: `prompt_ms` is time-to-first-token and `gen_ms` is
     /// first-token-to-done (so they include some network overhead). Either
     /// is 0 when the duration is unknown.
+    ///
+    /// `truncated` is `true` when the server stopped generation because it hit
+    /// the output-token cap (Ollama `done_reason == "length"`, OpenAI-compat
+    /// `finish_reason == "length"`) rather than the model finishing naturally.
+    /// A truncated turn's tool call (notably a `write_file`) is cut off mid-way,
+    /// so the caller must NOT treat it as a clean completion.
     Done {
         input_tokens: u64,
         output_tokens: u64,
         reasoning_tokens: u64,
         prompt_ms: u64,
         gen_ms: u64,
+        truncated: bool,
     },
 }
 
@@ -860,8 +920,8 @@ pub(crate) fn build_chat_payload(
                 "messages": messages,
                 "stream": false,
                 "options": options,
-                "think": endpoint.think,
             });
+            apply_ollama_think(&mut payload, endpoint);
             if response_format == Some("json") {
                 payload["format"] = json!("json");
             }
@@ -873,8 +933,10 @@ pub(crate) fn build_chat_payload(
         ClientFlavor::OpenAICompat => {
             // OpenAI puts `temperature` at the top level. Our `trim_budget` is
             // client-side only — this API has no context-size field (the
-            // window is fixed on the server), so it is intentionally not sent. `think` is Ollama-specific and is silently
-            // dropped. `response_format: json` is intentionally NOT
+            // window is fixed on the server), so it is intentionally not sent.
+            // Ollama's top-level `think` has no OpenAI equivalent; the reasoning
+            // toggle rides in `chat_template_kwargs` instead (applied below).
+            // `response_format: json` is intentionally NOT
             // forwarded — LM Studio (and some other OpenAI-compat servers)
             // reject the older `{"type": "json_object"}` shape, accepting
             // only `"text"` or `"json_schema"` (the latter requires a
@@ -889,6 +951,7 @@ pub(crate) fn build_chat_payload(
                 "temperature": endpoint.temperature,
             });
             apply_sampler_overrides(&mut payload, endpoint);
+            apply_reasoning_kwargs(&mut payload, endpoint);
             if let Some(n) = endpoint.max_tokens {
                 payload["max_tokens"] = json!(n);
             }
@@ -1069,6 +1132,30 @@ mod tests {
     }
 
     #[test]
+    fn stream_payload_output_cap_is_opt_in_via_max_tokens() {
+        // Unset `max_tokens` (the default) → UNCAPPED, so a big write_file isn't
+        // chopped mid-content: Ollama `num_predict = -1`, OpenAI omits the field.
+        let ep = endpoint(ClientFlavor::Ollama); // helper sets max_tokens = None
+        let p = build_stream_payload(&ep, vec![json!({"role": "user", "content": "hi"})], None);
+        assert_eq!(p["options"]["num_predict"], -1);
+
+        let oai = endpoint(ClientFlavor::OpenAICompat);
+        let p2 = build_stream_payload(&oai, vec![json!({"role": "user", "content": "hi"})], None);
+        assert!(p2.get("max_tokens").is_none());
+
+        // Set `max_tokens` → the conventional hard cap IS honored on streaming too.
+        let mut cap = endpoint(ClientFlavor::Ollama);
+        cap.max_tokens = Some(4096);
+        let p3 = build_stream_payload(&cap, vec![json!({"role": "user", "content": "hi"})], None);
+        assert_eq!(p3["options"]["num_predict"], 4096);
+
+        let mut ocap = endpoint(ClientFlavor::OpenAICompat);
+        ocap.max_tokens = Some(4096);
+        let p4 = build_stream_payload(&ocap, vec![json!({"role": "user", "content": "hi"})], None);
+        assert_eq!(p4["max_tokens"], 4096);
+    }
+
+    #[test]
     fn classify_send_error_parses_context_overflow() {
         // The exact body llama.cpp returned in session 019f05ae.
         let body = r#"{"error":{"code":400,"message":"request (32946 tokens) exceeds the available context size (32768 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":32946,"n_ctx":32768}}"#;
@@ -1095,10 +1182,11 @@ mod tests {
             temperature: 0.1,
             timeout_seconds: 10,
             enabled: true,
-            think: true,
+            think: Some(true),
             tool_subset: ToolSubset::Focused,
             flavor,
             max_tokens: None,
+            output_reserve: None,
             top_p: None,
             top_k: None,
             repeat_penalty: None,
@@ -1194,6 +1282,52 @@ mod tests {
         assert!(payload.get("options").is_none());
         assert!(payload.get("think").is_none());
         assert!(payload.get("num_ctx").is_none());
+    }
+
+    #[test]
+    fn openai_payload_carries_enable_thinking_from_config() {
+        // The reasoning toggle rides in `chat_template_kwargs.enable_thinking`,
+        // driven by config (`endpoint.think`, derived from the role's
+        // `reasoning = "on"/"off"`) with conventional semantics: on -> true,
+        // off -> false. This is what lets a single llama.cpp instance serve both
+        // a coder role (off) and a reasoner role (on), chosen per request.
+        let mut on = endpoint(ClientFlavor::OpenAICompat);
+        on.think = Some(true);
+        let p = build_chat_payload(&on, vec![], None, None);
+        assert_eq!(p["chat_template_kwargs"]["enable_thinking"], true);
+        // The streaming path carries it too.
+        let ps = build_stream_payload(&on, vec![], None);
+        assert_eq!(ps["chat_template_kwargs"]["enable_thinking"], true);
+
+        let mut off = endpoint(ClientFlavor::OpenAICompat);
+        off.think = Some(false);
+        let p = build_chat_payload(&off, vec![], None, None);
+        assert_eq!(p["chat_template_kwargs"]["enable_thinking"], false);
+
+        // "auto" (None) omits the kwarg entirely, so the model's template
+        // default decides — neither forced on nor off.
+        let mut auto = endpoint(ClientFlavor::OpenAICompat);
+        auto.think = None;
+        let p = build_chat_payload(&auto, vec![], None, None);
+        assert!(p.get("chat_template_kwargs").is_none());
+        let ps = build_stream_payload(&auto, vec![], None);
+        assert!(ps.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn ollama_payload_uses_think_not_chat_template_kwargs() {
+        // Ollama has a native top-level `think`; it must NOT also receive the
+        // OpenAI-compat `chat_template_kwargs` form.
+        let ep = endpoint(ClientFlavor::Ollama);
+        let p = build_chat_payload(&ep, vec![], None, None);
+        assert_eq!(p["think"], true);
+        assert!(p.get("chat_template_kwargs").is_none());
+
+        // "auto" (None) omits `think` so Ollama falls back to its own default.
+        let mut auto = endpoint(ClientFlavor::Ollama);
+        auto.think = None;
+        let p2 = build_chat_payload(&auto, vec![], None, None);
+        assert!(p2.get("think").is_none());
     }
 
     #[test]

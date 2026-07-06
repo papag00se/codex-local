@@ -69,10 +69,6 @@ impl TrimItem {
 #[derive(Debug, Clone, Default)]
 pub struct ParsedTranscript {
     pub items: Vec<TrimItem>,
-    /// Original index in the input slice for each item; same length as `items`.
-    /// Used by the renderer to preserve order when interleaving compressed and
-    /// active-turn items.
-    pub original_indices: Vec<usize>,
     pub max_turn_id: u32,
 }
 
@@ -94,7 +90,6 @@ impl ParsedTranscript {
 /// can carry the tool name and signature onto the output.
 pub fn parse(items: &[ResponseItem]) -> ParsedTranscript {
     let mut out = Vec::with_capacity(items.len());
-    let mut indices = Vec::with_capacity(items.len());
     let mut current_turn: u32 = 0;
     let mut user_seen = false;
 
@@ -102,7 +97,7 @@ pub fn parse(items: &[ResponseItem]) -> ParsedTranscript {
     let mut call_table: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
 
-    for (idx, item) in items.iter().enumerate() {
+    for item in items.iter() {
         match item {
             ResponseItem::Message { role, content, .. } => {
                 let text = collect_message_text(content);
@@ -116,7 +111,6 @@ pub fn parse(items: &[ResponseItem]) -> ParsedTranscript {
                             turn_id: current_turn,
                             text,
                         });
-                        indices.push(idx);
                     }
                 } else if role == "assistant" || role == "system" || role == "developer" {
                     if !text.is_empty() {
@@ -124,7 +118,6 @@ pub fn parse(items: &[ResponseItem]) -> ParsedTranscript {
                             turn_id: current_turn,
                             text,
                         });
-                        indices.push(idx);
                     }
                 }
             }
@@ -137,7 +130,6 @@ pub fn parse(items: &[ResponseItem]) -> ParsedTranscript {
                         turn_id: current_turn,
                         text,
                     });
-                    indices.push(idx);
                 }
             }
             ResponseItem::FunctionCall {
@@ -155,7 +147,6 @@ pub fn parse(items: &[ResponseItem]) -> ParsedTranscript {
                     args: arguments.clone(),
                     signature,
                 });
-                indices.push(idx);
             }
             ResponseItem::CustomToolCall {
                 name,
@@ -172,7 +163,6 @@ pub fn parse(items: &[ResponseItem]) -> ParsedTranscript {
                     args: input.clone(),
                     signature,
                 });
-                indices.push(idx);
             }
             ResponseItem::LocalShellCall {
                 call_id,
@@ -191,7 +181,6 @@ pub fn parse(items: &[ResponseItem]) -> ParsedTranscript {
                     args,
                     signature,
                 });
-                indices.push(idx);
             }
             ResponseItem::FunctionCallOutput { call_id, output } => {
                 let (tool_name, signature) = call_table
@@ -208,7 +197,6 @@ pub fn parse(items: &[ResponseItem]) -> ParsedTranscript {
                     success,
                     content,
                 });
-                indices.push(idx);
             }
             ResponseItem::CustomToolCallOutput {
                 call_id, output, ..
@@ -227,21 +215,18 @@ pub fn parse(items: &[ResponseItem]) -> ParsedTranscript {
                     success,
                     content,
                 });
-                indices.push(idx);
             }
             other => {
                 out.push(TrimItem::Other {
                     turn_id: current_turn,
                     original: other.clone(),
                 });
-                indices.push(idx);
             }
         }
     }
 
     ParsedTranscript {
         items: out,
-        original_indices: indices,
         max_turn_id: current_turn,
     }
 }

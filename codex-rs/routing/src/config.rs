@@ -71,13 +71,19 @@ pub struct OllamaEndpoint {
     /// a missing key defaults to 300s; an explicit `0` means "wait forever".
     pub timeout_seconds: u64,
     pub enabled: bool,
-    /// Whether to enable Ollama's reasoning/`think` mode. Derived from the
-    /// model role's `reasoning` config (`"on"`/`"off"`); defaults to `false`.
-    /// Models that support thinking (qwen3.5, deepseek-r1, …) produce better
-    /// multi-step plans when this is on, at the cost of extra latency from
-    /// the thinking tokens. Ignored for [`ClientFlavor::OpenAICompat`].
+    /// Reasoning/thinking preference for this endpoint — tri-state, with the
+    /// conventional meaning of a thinking flag. Derived from the role's
+    /// `reasoning` config: `"off"` → `Some(false)` (never think), `"on"` →
+    /// `Some(true)` (always think), `"auto"` (or unset/unrecognized) → `None`
+    /// (don't override — let the model's own chat-template default stand).
+    ///
+    /// Applied per wire flavor: Ollama's top-level `"think"` field and
+    /// OpenAI-compat's `chat_template_kwargs.enable_thinking` (llama.cpp). When
+    /// `None`, neither is sent. Models that support thinking (qwen3.5,
+    /// deepseek-r1, …) plan better with it on, at the cost of thinking-token
+    /// latency.
     #[serde(default)]
-    pub think: bool,
+    pub think: Option<bool>,
     /// How many tools to expose. See [`ToolSubset`]. Derived from the role's
     /// `tool_subset` config field; defaults to `Focused`.
     #[serde(default)]
@@ -88,13 +94,20 @@ pub struct OllamaEndpoint {
     /// / `"lmstudio"` → `OpenAICompat`.
     #[serde(default)]
     pub flavor: ClientFlavor,
-    /// Hard ceiling on output tokens per response. `None` = no cap, let
-    /// the server decide. Maps to `max_tokens` for OpenAI-compat and
-    /// `options.num_predict` for Ollama. Normalized from config: a
-    /// `max_tokens = 0` in the TOML file is treated the same as omitting
-    /// the key (unlimited), which is the ergonomic convention.
+    /// Hard ceiling on output tokens per response — the CONVENTIONAL `max_tokens`
+    /// meaning. `None` = no cap (default), let the model use the whole window;
+    /// this is what avoids truncating a big `write_file`. Maps to OpenAI
+    /// `max_tokens` and Ollama `options.num_predict` when set. Normalized from
+    /// config: `max_tokens = 0` reads the same as omitting it (uncapped).
     #[serde(default)]
     pub max_tokens: Option<usize>,
+    /// Tokens of the context window RESERVED for output when sizing the input
+    /// budget (`effective_window` trims input to `n_ctx − output_reserve −
+    /// margin`). NOT a hard cap — the input/output split of a fixed window, so
+    /// the model is guaranteed ≥ this much room to generate. `None` → a built-in
+    /// default. Distinct from `max_tokens` on purpose (that one is the hard cap).
+    #[serde(default)]
+    pub output_reserve: Option<usize>,
     /// Optional sampler overrides. `None` = omit from the request so the
     /// server default applies. Set per-role for models that need non-stock
     /// sampling (e.g. Gemma 4: `top_p=0.95`, `top_k=64`, `repeat_penalty=1.1`).
@@ -123,15 +136,34 @@ impl OllamaEndpoint {
             temperature: 0.1,
             timeout_seconds: 300,
             enabled: true,
-            think: false,
+            think: Some(false),
             tool_subset: ToolSubset::Focused,
             flavor: ClientFlavor::Ollama,
             max_tokens: None,
+            output_reserve: None,
             top_p: None,
             top_k: None,
             repeat_penalty: None,
             tool_choice: None,
         }
+    }
+}
+
+/// Map a role's `reasoning` config string to an explicit thinking preference.
+///
+/// Conventional thinking-flag semantics, tri-state:
+/// - `"off"` (also `false`/`no`/`0`) → `Some(false)` — never think.
+/// - `"on"`  (also `true`/`yes`/`1`) → `Some(true)`  — always think.
+/// - `"auto"` → `None` — don't override; let the model's chat-template default decide.
+///
+/// Anything unrecognized is treated as `auto` (`None`) so a typo can't silently
+/// force reasoning on or off. Cloud effort levels (`low`/`high`/…) never reach
+/// here — those route through the provider-entry path, not a local endpoint.
+fn thinking_from_reasoning(reasoning: &str) -> Option<bool> {
+    match reasoning.trim().to_ascii_lowercase().as_str() {
+        "off" | "false" | "no" | "0" => Some(false),
+        "on" | "true" | "yes" | "1" => Some(true),
+        _ => None,
     }
 }
 
@@ -200,14 +232,14 @@ impl RoutingConfig {
             "OLLAMA_REASONER_MODEL",
             ("http://localhost:11435", "qwen3.5:9b"),
         );
-        reasoner.think = true;
+        reasoner.think = Some(true);
 
         let mut reasoner_backup = OllamaEndpoint::from_env(
             "OLLAMA_REASONER_BACKUP_URL",
             "OLLAMA_REASONER_BACKUP_MODEL",
             ("http://localhost:11434", "qwen3.5:9b"),
         );
-        reasoner_backup.think = true;
+        reasoner_backup.think = Some(true);
 
         let mut light_coder = OllamaEndpoint::from_env(
             "OLLAMA_CODER_URL",
@@ -217,7 +249,7 @@ impl RoutingConfig {
                 "qwen3.5-9b-opus-openclaw-distilled:tools",
             ),
         );
-        light_coder.think = true;
+        light_coder.think = Some(true);
 
         let compactor = OllamaEndpoint::from_env(
             "OLLAMA_COMPACTOR_URL",
@@ -315,6 +347,7 @@ fn endpoint_from_role(role: &crate::project_config::ModelRole) -> Option<OllamaE
             trim_budget,
             tool_subset,
             max_tokens,
+            output_reserve,
             timeout_seconds,
             temperature,
             top_p,
@@ -328,10 +361,10 @@ fn endpoint_from_role(role: &crate::project_config::ModelRole) -> Option<OllamaE
                 | "openai" => ClientFlavor::OpenAICompat,
                 _ => return None,
             };
-            // Normalize 0 → None so `max_tokens = 0` reads as "unlimited"
-            // (the convention for "disabled") rather than actually clamping
-            // output to zero tokens.
+            // Normalize 0 → None so `= 0` reads as "unset" (the convention for
+            // "disabled") rather than a literal zero.
             let max_tokens = max_tokens.filter(|&n| n > 0);
+            let output_reserve = output_reserve.filter(|&n| n > 0);
             Some(OllamaEndpoint {
                 base_url: endpoint
                     .clone()
@@ -345,13 +378,14 @@ fn endpoint_from_role(role: &crate::project_config::ModelRole) -> Option<OllamaE
                 temperature: (*temperature).unwrap_or(if reasoning == "off" { 0.0 } else { 0.1 }),
                 timeout_seconds: timeout_seconds.unwrap_or(300),
                 enabled: true,
-                think: reasoning != "off",
+                think: thinking_from_reasoning(reasoning),
                 tool_subset: tool_subset
                     .as_deref()
                     .map(ToolSubset::from_config_str)
                     .unwrap_or_default(),
                 flavor,
                 max_tokens,
+                output_reserve,
                 top_p: *top_p,
                 top_k: *top_k,
                 repeat_penalty: *repeat_penalty,

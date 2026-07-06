@@ -226,12 +226,12 @@ const STOPWORDS: &[&str] = &[
     "have", "has", "do", "does", "my", "we", "us",
 ];
 
-fn is_stopword(t: &str) -> bool {
+pub(crate) fn is_stopword(t: &str) -> bool {
     STOPWORDS.contains(&t)
 }
 
 /// Naive suffix stem so tense/plural variants collapse (fixing/fixed → fix).
-fn stem(t: &str) -> &str {
+pub(crate) fn stem(t: &str) -> &str {
     for suf in ["ing", "ed", "es", "s"] {
         if t.len() > suf.len() + 2 && t.ends_with(suf) {
             return &t[..t.len() - suf.len()];

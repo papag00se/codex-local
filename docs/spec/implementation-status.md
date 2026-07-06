@@ -20,12 +20,12 @@ Core routing:
 
 Context and compaction:
 - **Context stripping** (`context_strip.rs`): two strip levels (Reasoner: 2 turns/2K, Coder: 3 turns/4K). Removes binary blobs, think blocks, encrypted_content. Collapses poll patterns. 8 tests
-- **Full compaction pipeline** (`compaction/`): normalize → split_recent_raw → chunk → extract (LLM) → merge (deterministic) → render. Runs entirely on local Ollama — no proxy needed
+- **Compaction pipeline** (`compaction/`): boilerplate-strip → normalize → split_recent_raw → chunk → summarize each chunk (LLM, **free-form prose**) → final unifying pass → assemble handoff. Model-written, not deterministic extraction. Runs entirely on local Ollama — no proxy needed
   - `normalize.rs`: strips encrypted_content, attachments, tool_result blocks; detects precompacted summaries
   - `chunking.rs`: token-budget chunking at item boundaries with overlap
-  - `extract.rs`: calls Ollama compactor with structured JSON extraction prompt
-  - `merger.rs`: latest-non-empty for scalars, shallow-merge for dicts, deduplicated-reverse for lists
-  - `render.rs`: builds SessionHandoff and DurableMemorySet (5 markdown documents)
+  - `extract.rs`: `summarize_chunk` / `summarize_final` — free-form prose summaries via the Ollama compactor (`think=false`, 90 s per-chunk timeout)
+  - `pipeline.rs`: `compact_transcript` — orchestrates the above and assembles `[post-compaction warning + summary + verbatim recent tail + current request]`
+  - `models.rs`: `TranscriptChunk` only — the deterministic `ChunkExtraction` / `merge_states` / `DurableMemorySet` (5 markdown docs) were **removed** (see [compaction-reference.md](compaction-reference.md), now historical)
 
 Failover and reliability:
 - **Failover executor** (`failover.rs`): classifies failures into F1-F8 types, decides retry-same vs walk-chain vs hard-fail. 15 tests

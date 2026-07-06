@@ -159,6 +159,12 @@ fn is_precompacted_text(text: &str) -> bool {
     trimmed.starts_with("Another language model started to solve this problem")
         || (trimmed.contains("## Thread Summary for Continuation")
             && trimmed.contains("Latest Real User Intent"))
+        // Our OWN handoff wrappers (see `pipeline::assemble_handoff`). Without
+        // these, a second compaction re-summarizes a prior local summary
+        // (summary-of-a-summary), nesting the handoff. Recognizing them carries
+        // the prior summary forward verbatim instead of re-chunking it.
+        || trimmed.starts_with("[COMPACTED SUMMARY")
+        || trimmed.starts_with("[RECENT TURNS")
 }
 
 #[cfg(test)]
@@ -195,5 +201,18 @@ mod tests {
         ];
         let result = normalize_transcript(&items, 10000);
         assert_eq!(result.precompacted_items.len(), 1);
+    }
+
+    #[test]
+    fn test_detects_our_own_handoff_wrapper_as_precompacted() {
+        // A prior LOCAL compaction summary re-entering compaction must be carried
+        // forward, NOT re-summarized (summary-of-a-summary nesting).
+        let items = vec![
+            serde_json::json!({"role": "user", "content": "[COMPACTED SUMMARY of the work so far. NOTE: this is a post-compaction summary…]\n\nOBJECTIVE: build X"}),
+            serde_json::json!({"role": "user", "content": "keep going"}),
+        ];
+        let result = normalize_transcript(&items, 10000);
+        assert_eq!(result.precompacted_items.len(), 1);
+        assert!(is_precompacted_text("[RECENT TURNS — verbatim and exact]\n\n[user]\nhi"));
     }
 }

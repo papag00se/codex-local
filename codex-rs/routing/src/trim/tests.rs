@@ -18,9 +18,9 @@ fn empty_transcript_produces_only_system_prompt() {
             items: &[],
             system_prompt: "You are Codex.",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
@@ -36,18 +36,18 @@ fn user_instructions_appear_in_prelude() {
             items: &[user_msg("hello")],
             system_prompt: "SYS",
             user_instructions: Some("Don't use mocks."),
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
     assert!(
-        result.system.contains("[Persistent project context]"),
+        result.guidance.contains("[Persistent project context]"),
         "system: {}",
         result.system
     );
-    assert!(result.system.contains("Don't use mocks."));
+    assert!(result.guidance.contains("Don't use mocks."));
     assert!(result.system.contains("SYS"));
 }
 
@@ -59,9 +59,9 @@ fn system_prompt_is_never_stubbed_or_truncated() {
             items: &[user_msg("hi")],
             system_prompt: &long,
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
@@ -76,9 +76,9 @@ fn active_turn_user_message_kept_verbatim() {
             items: &[user_msg(prompt)],
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
@@ -106,9 +106,9 @@ fn tool_calls_and_outputs_in_active_turn_are_preserved() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
@@ -130,7 +130,7 @@ fn tool_calls_and_outputs_in_active_turn_are_preserved() {
 }
 
 #[test]
-fn old_read_then_patch_drops_old_read_output() {
+fn old_read_output_kept_verbatim_no_collapse() {
     let items = vec![
         user_msg("turn 1: read"),
         function_call("c1", "text_editor", r#"{"command":"view","path":"foo.py"}"#),
@@ -149,32 +149,29 @@ fn old_read_then_patch_drops_old_read_output() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
-    assert!(
-        result.summary.stale_reads_dropped >= 1,
-        "expected stale read drop, got summary {:?}",
-        result.summary
-    );
-    // The OLD CONTENT string must not appear anywhere in the rendered output.
+    // Pass-through: nothing is stale-dropped anymore.
+    assert_eq!(result.summary.stale_reads_dropped, 0);
     let combined: String = result
         .messages
         .iter()
         .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
         .collect::<Vec<_>>()
         .join("\n");
+    // The old read output is now KEPT verbatim (no stale-read collapse).
     assert!(
-        !combined.contains("OLD CONTENT"),
-        "stale read content leaked into messages:\n{combined}"
+        combined.contains("OLD CONTENT"),
+        "verbatim pass-through must keep the old read output:\n{combined}"
     );
 }
 
 #[test]
-fn duplicate_grep_supersedes_older_output() {
+fn old_grep_output_kept_verbatim_no_supersession() {
     let args = r#"{"query":"foo","path":"."}"#;
     let items = vec![
         user_msg("turn 1: grep"),
@@ -190,24 +187,23 @@ fn duplicate_grep_supersedes_older_output() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
-    assert!(
-        result.summary.superseded_outputs_dropped >= 1,
-        "expected supersession, got summary {:?}",
-        result.summary
-    );
+    // Pass-through: no supersession dropping.
+    assert_eq!(result.summary.superseded_outputs_dropped, 0);
     let combined: String = result
         .messages
         .iter()
         .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(!combined.contains("OLD MATCHES"));
+    // Both grep outputs are now kept verbatim.
+    assert!(combined.contains("OLD MATCHES"));
+    assert!(combined.contains("NEW MATCHES"));
 }
 
 #[test]
@@ -234,17 +230,14 @@ fn shell_output_with_nonzero_exit_recognized_as_failure() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
-    assert!(
-        result.system.contains("[UNRESOLVED ERRORS]"),
-        "exit_code 2 should surface as unresolved error:\n{}",
-        result.system
-    );
+    // Failure detection surfaces the nonzero exit as a <tool_error> tag in the
+    // verbatim messages (the [UNRESOLVED ERRORS] prelude block was removed).
     let combined: String = result
         .messages
         .iter()
@@ -271,18 +264,24 @@ fn failed_shell_output_kept_even_in_old_turn() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
+    // The failed output is kept VERBATIM in the messages — error stickiness now
+    // comes from the pass-through, not the removed [UNRESOLVED ERRORS] block.
+    let combined: String = result
+        .messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        result.system.contains("[UNRESOLVED ERRORS]"),
-        "system block missing unresolved errors header:\n{}",
-        result.system
+        combined.contains("pip not found"),
+        "failed output must be kept verbatim:\n{combined}"
     );
-    assert!(result.system.contains("pip not found"));
 }
 
 #[test]
@@ -306,25 +305,25 @@ fn repetition_detected_after_three_identical_calls() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
     assert!(
-        result.system.contains("[STOP — REPETITION DETECTED]"),
+        result.guidance.contains("[STOP — REPETITION DETECTED]"),
         "should surface repetition alert:\n{}",
         result.system
     );
     assert!(
-        result.system.contains("3 times"),
+        result.guidance.contains("3 times"),
         "should mention the count:\n{}",
         result.system
     );
     // Alert should be at the top of the system prompt, before other blocks.
-    let stop_idx = result.system.find("[STOP").unwrap();
-    if let Some(world_idx) = result.system.find("[World state]") {
+    let stop_idx = result.guidance.find("[STOP").unwrap();
+    if let Some(world_idx) = result.guidance.find("[World state]") {
         assert!(
             stop_idx < world_idx,
             "[STOP] alert should come before [World state]"
@@ -358,14 +357,14 @@ fn repetition_detected_with_short_assistant_text_interleaved() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
     assert!(
-        result.system.contains("[STOP — REPETITION DETECTED]"),
+        result.guidance.contains("[STOP — REPETITION DETECTED]"),
         "should fire despite short assistant narration between calls:\n{}",
         result.system
     );
@@ -387,14 +386,14 @@ fn no_repetition_alert_after_only_two_identical_calls() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
     assert!(
-        !result.system.contains("[STOP — REPETITION DETECTED]"),
+        !result.guidance.contains("[STOP — REPETITION DETECTED]"),
         "two calls shouldn't trigger the alert:\n{}",
         result.system
     );
@@ -428,14 +427,14 @@ fn no_repetition_alert_when_calls_have_different_args() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
     assert!(
-        !result.system.contains("[STOP — REPETITION DETECTED]"),
+        !result.guidance.contains("[STOP — REPETITION DETECTED]"),
         "different args shouldn't trigger the alert"
     );
 }
@@ -461,14 +460,14 @@ fn repetition_injects_synthetic_tool_result_on_most_recent_call() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
     // Reinforcing prelude alert still present.
-    assert!(result.system.contains("[STOP — REPETITION DETECTED]"));
+    assert!(result.guidance.contains("[STOP — REPETITION DETECTED]"));
     let joined = result
         .messages
         .iter()
@@ -511,9 +510,9 @@ fn enforces_token_budget_by_truncating_bulky_tool_output() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         target,
     );
@@ -545,49 +544,6 @@ fn enforces_token_budget_by_truncating_bulky_tool_output() {
         "bulky tool output should be bounded with a marker"
     );
 }
-
-#[test]
-fn world_state_includes_stale_warning_for_old_modifications() {
-    // Active turn is 5; file modified at turn 1 (4 turns ago) — should warn.
-    let items = vec![
-        user_msg("turn 0"),
-        user_msg("turn 1: edit"),
-        function_call(
-            "p1",
-            "apply_patch",
-            r#"{"input":"*** Add File: foo.py\n+x\n"}"#,
-        ),
-        function_output("p1", "ok", true),
-        user_msg("turn 2"),
-        user_msg("turn 3"),
-        user_msg("turn 4"),
-        user_msg("turn 5: active"),
-    ];
-    let result = trim_for_local(
-        &TrimInput {
-            items: &items,
-            system_prompt: "SYS",
-            user_instructions: None,
-            current_files: None,
-            flavor: super::super::config::ClientFlavor::Ollama,
-            system_budget_pct: 0,
-        },
-        16384,
-    );
-    assert!(
-        result.system.contains("turns ago"),
-        "should annotate turns_since on stale modifications:\n{}",
-        result.system
-    );
-    assert!(
-        result.system.contains("re-read with `cat <path>`")
-            || result.system.contains("re-read with `cat <path>`")
-            || result.system.to_lowercase().contains("re-read"),
-        "should suggest re-reading stale files:\n{}",
-        result.system
-    );
-}
-
 #[test]
 fn apply_patch_failure_gets_recovery_hint() {
     let items = vec![
@@ -608,9 +564,9 @@ fn apply_patch_failure_gets_recovery_hint() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
@@ -625,7 +581,7 @@ fn apply_patch_failure_gets_recovery_hint() {
     // model's own vocabulary — it called `edit_file`, never `apply_patch` — and it
     // steers to a whole-file `write_file` rewrite, not a re-read.
     assert!(
-        result.system.contains("[EDIT DID NOT APPLY") && result.system.contains("write_file"),
+        result.guidance.contains("[EDIT DID NOT APPLY") && result.guidance.contains("write_file"),
         "failed edit should steer to a write_file rewrite via the prelude directive:\n{}",
         result.system
     );
@@ -634,7 +590,7 @@ fn apply_patch_failure_gets_recovery_hint() {
     // "apply_patch" — that's the executor's factual output, which we don't scrub —
     // so we assert on the directive line, not all of `result.system`.
     let directive_line = result
-        .system
+        .guidance
         .lines()
         .find(|l| l.contains("could not be applied"))
         .unwrap_or_default();
@@ -665,19 +621,19 @@ fn tunnel_vision_fires_when_footprint_stops_expanding() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
     assert!(
-        result.system.contains("[STUCK — CIRCLING THE SAME PLACES]"),
+        result.guidance.contains("[STUCK — CIRCLING THE SAME PLACES]"),
         "tunnel-vision directive should fire:\n{}",
         result.system
     );
     assert!(
-        result.system.contains("foo.py"),
+        result.guidance.contains("foo.py"),
         "the directive should name the cycled file:\n{}",
         result.system
     );
@@ -703,15 +659,95 @@ fn tunnel_vision_does_not_fire_when_footprint_keeps_expanding() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
     assert!(
-        !result.system.contains("[STUCK — CIRCLING THE SAME PLACES]"),
+        !result.guidance.contains("[STUCK — CIRCLING THE SAME PLACES]"),
         "expanding footprint must not fire tunnel-vision:\n{}",
+        result.system
+    );
+}
+
+#[test]
+fn read_without_write_fires_after_many_reads_no_write() {
+    // Twelve reads, each a DIFFERENT target (so the footprint keeps expanding and
+    // tunnel-vision resets every call, and args vary so exact-repeat is silent),
+    // with not one write. Only the read-without-write backstop catches this.
+    let mut items = vec![user_msg("figure out the API")];
+    for i in 0..12 {
+        let cid = format!("r{i}");
+        items.push(function_call(
+            &cid,
+            "web_fetch",
+            &format!(r#"{{"url":"https://example.com/doc/{i}"}}"#),
+        ));
+        items.push(function_output(&cid, "HTTP 200 OK · some content", true));
+    }
+    let result = trim_for_local(
+        &TrimInput {
+            items: &items,
+            system_prompt: "SYS",
+            user_instructions: None,
+            flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
+            suppress_loop_alerts: false,
+        },
+        16384,
+    );
+    assert!(
+        result.guidance.contains("[GATHERING WITHOUT ACTING]"),
+        "read-without-write directive should fire:\n{}",
+        result.system
+    );
+}
+
+#[test]
+fn read_without_write_resets_on_a_write() {
+    // Eight reads, a WRITE, then eight more reads. The write resets the counter,
+    // so the longest read run is 8 < 12 — no nudge. A write is real progress.
+    let mut items = vec![user_msg("build the client")];
+    for i in 0..8 {
+        let cid = format!("a{i}");
+        items.push(function_call(
+            &cid,
+            "read_file",
+            &format!(r#"{{"path":"src/f{i}.rs"}}"#),
+        ));
+        items.push(function_output(&cid, "…file…", true));
+    }
+    items.push(function_call(
+        "w",
+        "write_file",
+        r#"{"path":"src/client.rs","content":"fn main(){}"}"#,
+    ));
+    items.push(function_output("w", "wrote 12 bytes", true));
+    for i in 0..8 {
+        let cid = format!("b{i}");
+        items.push(function_call(
+            &cid,
+            "read_file",
+            &format!(r#"{{"path":"src/g{i}.rs"}}"#),
+        ));
+        items.push(function_output(&cid, "…file…", true));
+    }
+    let result = trim_for_local(
+        &TrimInput {
+            items: &items,
+            system_prompt: "SYS",
+            user_instructions: None,
+            flavor: super::super::config::ClientFlavor::Ollama,
+            system_budget_pct: 0,
+            suppress_loop_alerts: false,
+        },
+        16384,
+    );
+    assert!(
+        !result.guidance.contains("[GATHERING WITHOUT ACTING]"),
+        "a write between read runs must reset the counter:\n{}",
         result.system
     );
 }
@@ -735,9 +771,9 @@ fn oversized_tool_output_is_bounded() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
@@ -784,9 +820,9 @@ fn failed_patch_steers_to_write_file_rewrite() {
                 items,
                 system_prompt: "SYS",
                 user_instructions: None,
-                current_files: None,
                 flavor: super::super::config::ClientFlavor::Ollama,
                 system_budget_pct: 0,
+                suppress_loop_alerts: false,
             },
             16384,
         )
@@ -800,7 +836,7 @@ fn failed_patch_steers_to_write_file_rewrite() {
     );
     assert!(
         result
-            .system
+            .guidance
             .contains("[EDIT DID NOT APPLY — REWRITE THE WHOLE FILE]"),
         "prelude should carry the rewrite directive:\n{}",
         result.system
@@ -837,9 +873,9 @@ fn shell_regex_failure_gets_glob_hint() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
@@ -854,39 +890,8 @@ fn shell_regex_failure_gets_glob_hint() {
         "rg regex failure should suggest --files -g:\n{combined}"
     );
 }
-
 #[test]
-fn world_state_lists_modified_files() {
-    let items = vec![
-        user_msg("turn 1: create"),
-        function_call(
-            "c1",
-            "apply_patch",
-            r#"{"input":"*** Add File: src/lambda.py\n+import json\n"}"#,
-        ),
-        function_output("c1", "ok", true),
-        user_msg("turn 2"),
-    ];
-    let result = trim_for_local(
-        &TrimInput {
-            items: &items,
-            system_prompt: "SYS",
-            user_instructions: None,
-            current_files: None,
-            flavor: super::super::config::ClientFlavor::Ollama,
-            system_budget_pct: 0,
-        },
-        16384,
-    );
-    assert!(
-        result.system.contains("Created: src/lambda.py"),
-        "expected created file in world state:\n{}",
-        result.system
-    );
-}
-
-#[test]
-fn old_assistant_text_dropped_from_messages_but_actions_recorded() {
+fn old_assistant_text_kept_verbatim() {
     let items = vec![
         user_msg("turn 1: do it"),
         assistant_msg("I'll do it."),
@@ -903,9 +908,9 @@ fn old_assistant_text_dropped_from_messages_but_actions_recorded() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
@@ -916,22 +921,14 @@ fn old_assistant_text_dropped_from_messages_but_actions_recorded() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        !combined.contains("I'll do it."),
-        "old assistant narration leaked:\n{combined}"
+        combined.contains("I'll do it."),
+        "verbatim pass-through must keep assistant narration:\n{combined}"
     );
-    assert!(
-        result.system.contains("[Actions taken]"),
-        "actions block missing:\n{}",
-        result.system
-    );
-    assert!(result.system.contains("Created foo.py"));
 }
 
 #[test]
-fn old_successful_shell_output_dropped_action_receipt_kept() {
-    // Shell, apply_patch, etc. are "action-only" tools: once we have an
-    // [Actions taken] entry in the prelude, the raw output bytes are dead
-    // weight. Drop them entirely from older turns.
+fn old_shell_output_kept_verbatim() {
+    // Pass-through: older shell output is kept verbatim (no action-only drop).
     let mut long = String::new();
     for i in 0..500 {
         long.push_str(&format!("line {i}\n"));
@@ -947,9 +944,9 @@ fn old_successful_shell_output_dropped_action_receipt_kept() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
@@ -960,24 +957,14 @@ fn old_successful_shell_output_dropped_action_receipt_kept() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        !combined.contains("line 0") && !combined.contains("line 499"),
-        "old shell output bytes leaked into messages:\n{}",
+        combined.contains("line 499"),
+        "verbatim pass-through must keep the shell output:\n{}",
         &combined.chars().take(2000).collect::<String>()
-    );
-    assert!(
-        result.system.contains("[Actions taken]"),
-        "actions block missing:\n{}",
-        result.system
-    );
-    assert!(
-        result.system.contains("Ran `ls -R /`"),
-        "shell action receipt missing:\n{}",
-        result.system
     );
 }
 
 #[test]
-fn old_grep_output_kept_with_match_cap() {
+fn old_grep_output_kept_verbatim_no_cap() {
     // Read-shaped tools (grep, list_dir, text_editor view) keep their data
     // because the model may still reference it. Long match lists get capped.
     let mut matches = String::new();
@@ -995,9 +982,9 @@ fn old_grep_output_kept_with_match_cap() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
@@ -1009,12 +996,13 @@ fn old_grep_output_kept_with_match_cap() {
         .join("\n");
     assert!(
         combined.contains("file_0.rs"),
-        "head matches not preserved:\n{}",
+        "matches not preserved:\n{}",
         &combined.chars().take(2000).collect::<String>()
     );
+    // The older-turn grep match cap is gone — no collapse marker.
     assert!(
-        combined.contains("more matches elided"),
-        "missing grep cap marker"
+        !combined.contains("more matches elided"),
+        "grep collapse cap should be gone with the verbatim pass-through"
     );
 }
 
@@ -1036,153 +1024,6 @@ fn turn_id_increments_only_on_user_messages() {
     assert_eq!(parsed.items[1].turn_id(), 0); // assistant in turn 0
     assert_eq!(parsed.items[2].turn_id(), 1); // second user
 }
-
-#[test]
-fn current_file_state_block_injects_modified_file_contents() {
-    use std::collections::HashMap;
-    // Active turn contains an apply_patch that edits handler.py.
-    let patch = "*** Begin Patch\n*** Update File: handler.py\n@@\n-old\n+new\n*** End Patch\n";
-    let items = vec![
-        user_msg("please edit"),
-        function_call(
-            "c1",
-            "apply_patch",
-            &format!(
-                "{{\"input\":{}}}",
-                serde_json::Value::String(patch.to_string())
-            ),
-        ),
-        function_output("c1", "Success", true),
-    ];
-    // Caller has re-read the file and passed the current disk content.
-    let mut current_files = HashMap::new();
-    current_files.insert(
-        "handler.py".to_string(),
-        "line1\nline2\nline3\n".to_string(),
-    );
-    let result = trim_for_local(
-        &TrimInput {
-            items: &items,
-            system_prompt: "SYS",
-            user_instructions: None,
-            current_files: Some(&current_files),
-            flavor: super::super::config::ClientFlavor::Ollama,
-            system_budget_pct: 0,
-        },
-        16384,
-    );
-    assert!(
-        result.system.contains("[Current file state"),
-        "missing current-file block:\n{}",
-        result.system
-    );
-    assert!(
-        result.system.contains("--- Current content of handler.py"),
-        "missing file header:\n{}",
-        result.system
-    );
-    assert!(
-        result.system.contains("line1\nline2\nline3"),
-        "missing file content:\n{}",
-        result.system
-    );
-    assert!(result.system.contains("--- End of handler.py"));
-}
-
-#[test]
-fn current_file_state_block_omitted_when_no_files_modified() {
-    use std::collections::HashMap;
-    let current_files: HashMap<String, String> = HashMap::new();
-    let result = trim_for_local(
-        &TrimInput {
-            items: &[user_msg("hi")],
-            system_prompt: "SYS",
-            user_instructions: None,
-            current_files: Some(&current_files),
-            flavor: super::super::config::ClientFlavor::Ollama,
-            system_budget_pct: 0,
-        },
-        16384,
-    );
-    assert!(!result.system.contains("[Current file state"));
-}
-
-#[test]
-fn same_target_failure_repetition_detected_despite_different_args() {
-    // 3 consecutive apply_patch FAILURES on handler.py with different args
-    // (different `-` lines each time) should still fire the repetition
-    // alert. The exact-signature detector misses this because the
-    // signature hashes differ; the same-target-failure detector catches it.
-    let mk_patch = |marker: &str| -> String {
-        format!(
-            "*** Begin Patch\n*** Update File: handler.py\n@@\n-{marker}\n+replacement\n*** End Patch\n"
-        )
-    };
-    let items = vec![
-        user_msg("fix it"),
-        function_call(
-            "c1",
-            "apply_patch",
-            &format!(
-                "{{\"input\":{}}}",
-                serde_json::Value::String(mk_patch("foo"))
-            ),
-        ),
-        function_output(
-            "c1",
-            "apply_patch verification failed: Failed to find expected lines",
-            false,
-        ),
-        function_call(
-            "c2",
-            "apply_patch",
-            &format!(
-                "{{\"input\":{}}}",
-                serde_json::Value::String(mk_patch("bar"))
-            ),
-        ),
-        function_output(
-            "c2",
-            "apply_patch verification failed: Failed to find expected lines",
-            false,
-        ),
-        function_call(
-            "c3",
-            "apply_patch",
-            &format!(
-                "{{\"input\":{}}}",
-                serde_json::Value::String(mk_patch("baz"))
-            ),
-        ),
-        function_output(
-            "c3",
-            "apply_patch verification failed: Failed to find expected lines",
-            false,
-        ),
-    ];
-    let result = trim_for_local(
-        &TrimInput {
-            items: &items,
-            system_prompt: "SYS",
-            user_instructions: None,
-            current_files: None,
-            flavor: super::super::config::ClientFlavor::Ollama,
-            system_budget_pct: 0,
-        },
-        16384,
-    );
-    assert!(
-        result.system.contains("[NO PROGRESS — DIAGNOSE"),
-        "expected forced-diagnosis alert (same-target thrash):\n{}",
-        result.system
-    );
-    assert!(
-        result.system.contains("consecutive failures on handler.py"),
-        "expected failure-streak summary:\n{}",
-        result.system
-    );
-}
-
 #[test]
 fn unproductive_recurrence_forces_diagnosis_on_interleaved_thrash() {
     // The model re-runs the SAME failing test 3x with DIFFERENT edits between
@@ -1212,19 +1053,19 @@ fn unproductive_recurrence_forces_diagnosis_on_interleaved_thrash() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
     assert!(
-        result.system.contains("[NO PROGRESS — DIAGNOSE"),
+        result.guidance.contains("[NO PROGRESS — DIAGNOSE"),
         "expected forced-diagnosis on interleaved thrash:\n{}",
         result.system
     );
     // Not a byte-identical consecutive loop, so the plain STOP banner must NOT fire.
-    assert!(!result.system.contains("[STOP — REPETITION DETECTED]"));
+    assert!(!result.guidance.contains("[STOP — REPETITION DETECTED]"));
 }
 
 #[test]
@@ -1256,18 +1097,18 @@ fn productive_recurrence_does_not_force_diagnosis() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
     assert!(
-        !result.system.contains("[NO PROGRESS — DIAGNOSE"),
+        !result.guidance.contains("[NO PROGRESS — DIAGNOSE"),
         "successful repeats must not force diagnosis:\n{}",
         result.system
     );
-    assert!(!result.system.contains("[STOP — REPETITION DETECTED]"));
+    assert!(!result.guidance.contains("[STOP — REPETITION DETECTED]"));
 }
 
 #[test]
@@ -1286,15 +1127,15 @@ fn escalation_excises_the_loop_and_reframes() {
             items: &items,
             system_prompt: "SYS",
             user_instructions: None,
-            current_files: None,
             flavor: super::super::config::ClientFlavor::Ollama,
             system_budget_pct: 0,
+            suppress_loop_alerts: false,
         },
         16384,
     );
     // The reframe fired.
     assert!(
-        result.system.contains("[HARNESS — STUCK; LOOP REMOVED"),
+        result.guidance.contains("[HARNESS — STUCK; LOOP REMOVED"),
         "expected context-reset reframe:\n{}",
         result.system
     );
@@ -1328,6 +1169,20 @@ fn escalation_excises_the_loop_and_reframes() {
     assert_eq!(
         collapse_markers, 1,
         "excised loop must leave exactly one inline collapse marker:\n{result:#?}"
+    );
+    // Phase 2: the STRUCTURED repeated action is surfaced (command + actual output +
+    // count) so the caller can ground a reasoner rebuild on it instead of the stale
+    // transcript. Without this the excise can only paste canned prose.
+    let ra = result
+        .repeated_action
+        .as_ref()
+        .expect("excise must surface the repeated action for grounding");
+    assert!(ra.count >= 5, "repeat count reflects the loop depth: {}", ra.count);
+    assert!(!ra.command.trim().is_empty(), "repeated command is summarized");
+    assert!(
+        ra.output.contains('1'),
+        "the actual repeated output is captured: {:?}",
+        ra.output
     );
 }
 
